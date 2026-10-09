@@ -748,6 +748,11 @@ int setup_ns3_simulation(string network_configuration) {
                     "PACKET_TRIM_MODE ftd in the network configuration\n";
             return -1;
         }
+        if (load_balancing != "ecmp") {
+            cerr << "Recovery domain and LOAD_BALANCING " << load_balancing
+                 << " are mutually exclusive\n";
+            return -1;
+        }
     }
     // The step stop is on exactly when the profile asked for it, and the
     // callback being null is what tells the transport it is off.
