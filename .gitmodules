@@ -15,7 +15,7 @@
 	url = https://github.com/gabime/spdlog.git
 [submodule "extern/network_backend/ns-3"]
 	path = extern/network_backend/ns-3
-	url = git@github.com:BTreeMap/astra-network-ns3.git
+	url = https://github.com/Radonux/asteria-ns3.git
 	branch = astra-sim
 [submodule "extern/network_backend/csg-htsim"]
 	path = extern/network_backend/csg-htsim
