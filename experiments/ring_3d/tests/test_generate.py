@@ -1656,6 +1656,121 @@ class Ring3DGeneratorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unknown network keys"):
                 load_profile(invalid_profile)
 
+    def test_load_balancing_defaults_to_ecmp_and_writes_no_key(self) -> None:
+        """An explicit ``ecmp`` generates exactly what the absent knob does."""
+        document = json.loads(self.profile_path.read_text(encoding="utf-8"))
+        document["network"]["load_balancing"] = {"mode": "ecmp"}
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            profile_path.write_text(json.dumps(document), encoding="utf-8")
+            outputs = {}
+            for arm, path in (("absent", self.profile_path), ("ecmp", profile_path)):
+                output = Path(temporary_directory) / arm
+                manifest = materialize(path, output)
+                self.assertEqual(manifest["load_balancing"], {"mode": "ecmp"})
+                outputs[arm] = {
+                    name: (output / name).read_bytes().replace(
+                        str(output).encode(), b"<output>"
+                    )
+                    for name in (
+                        "network_config.txt",
+                        "topology.txt",
+                        "experiment.json",
+                    )
+                }
+
+        self.assertEqual(outputs["absent"], outputs["ecmp"])
+        self.assertNotIn(b"LOAD_BALANCING", outputs["ecmp"]["network_config.txt"])
+
+    def test_load_balancing_modes_reach_the_configuration(self) -> None:
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            for mode in ("ev_hash", "spray_uniform"):
+                document["network"]["load_balancing"] = {"mode": mode}
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                output = Path(temporary_directory) / mode
+                manifest = materialize(profile_path, output)
+                config = (output / "network_config.txt").read_text(encoding="utf-8")
+                with self.subTest(mode=mode):
+                    self.assertEqual(manifest["load_balancing"], {"mode": mode})
+                    self.assertIn(f"\nLOAD_BALANCING {mode}\n", config)
+
+    def test_load_balancing_refuses_a_transport_that_cannot_carry_it(self) -> None:
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        document["network"]["load_balancing"] = {"mode": "spray_uniform"}
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+
+            def refused(variant: dict[str, object], message: str) -> None:
+                profile_path.write_text(json.dumps(variant), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, message):
+                    load_profile(profile_path)
+
+            without_repair = json.loads(json.dumps(document))
+            del without_repair["network"]["transport_recovery"]["selective_repair"]
+            refused(without_repair, "selective_repair")
+
+            without_ftd = json.loads(json.dumps(document))
+            without_ftd["network"]["packet_trimming"]["mode"] = "bts"
+            refused(without_ftd, "ftd")
+
+            without_trimming = json.loads(json.dumps(document))
+            del without_trimming["network"]["packet_trimming"]
+            refused(without_trimming, "ftd")
+
+            for balancing in ({"mode": "spray_policy"}, {"mode": 2}):
+                unknown_mode = json.loads(json.dumps(document))
+                unknown_mode["network"]["load_balancing"] = balancing
+                with self.subTest(balancing=balancing):
+                    refused(unknown_mode, "load_balancing.mode")
+
+            extra_key = json.loads(json.dumps(document))
+            extra_key["network"]["load_balancing"]["selector"] = "ops"
+            refused(extra_key, "exactly 'mode'")
+
+        ring = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/model_100b_256_ring.json"
+            ).read_text(encoding="utf-8")
+        )
+        ring["network"]["load_balancing"] = {"mode": "ecmp"}
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            profile_path.write_text(json.dumps(ring), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unknown network keys"):
+                load_profile(profile_path)
+
+    def test_load_balancing_and_recovery_domain_are_mutually_exclusive(self) -> None:
+        document = json.loads(
+            (
+                REPOSITORY_ROOT
+                / "experiments/ring_3d/profiles/forgiveness_smoke_8.json"
+            ).read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            for mode in ("ev_hash", "spray_uniform"):
+                document["network"]["load_balancing"] = {"mode": mode}
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                with self.subTest(mode=mode):
+                    with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                        load_profile(profile_path)
+
+            document["network"]["load_balancing"] = {"mode": "ecmp"}
+            profile_path.write_text(json.dumps(document), encoding="utf-8")
+            self.assertEqual(
+                load_profile(profile_path).network.load_balancing.mode, "ecmp"
+            )
+
     def test_trace_has_explicit_domains_and_overlap_dependency(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             output = Path(temporary_directory) / "experiment"

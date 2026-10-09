@@ -49,6 +49,7 @@ try:
     from .topology import (
         CongestionControl,
         DataPlaneLoss,
+        LoadBalancing,
         PacketTrimming,
         PhysicalNetwork,
         SwitchFabric,
@@ -68,6 +69,7 @@ except ImportError:
     from topology import (
         CongestionControl,
         DataPlaneLoss,
+        LoadBalancing,
         PacketTrimming,
         PhysicalNetwork,
         SwitchFabric,
@@ -677,6 +679,12 @@ def parse_profile_document(document: Any) -> Profile:
             raise ValueError(
                 "selection_policy.domain 'recovery_exempt' requires "
                 "network.congestion_control.mode 'dcqcn'"
+            )
+        if network.load_balancing.mode != "ecmp":
+            raise ValueError(
+                f"selection_policy.domain '{domain_value}' and "
+                f"network.load_balancing.mode '{network.load_balancing.mode}' "
+                "are mutually exclusive"
             )
     microburst_flow_count = _require_positive_int(
         document.get("microburst_flow_count", min(2, ranks // 2)),
@@ -1340,6 +1348,7 @@ def write_network_config(
     fabric: SwitchFabric | None,
     congestion_control: CongestionControl,
     link_rate: str,
+    load_balancing: LoadBalancing,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     # The bundled ns-3 setup unconditionally opens these legacy input files,
@@ -1433,6 +1442,13 @@ def write_network_config(
             f"MIN_TRIM_SIZE {packet_trimming.min_trim_size_bytes}\n"
             f"PACKET_TRIM_LASTHOP {int(packet_trimming.last_hop_codepoint)}\n"
         )
+    # Absent means ECMP to the simulator, so an ECMP profile keeps the exact
+    # configuration it had before the knob existed.
+    load_balancing_settings = (
+        ""
+        if load_balancing.mode == "ecmp"
+        else f"LOAD_BALANCING {load_balancing.mode}\n"
+    )
     with path.open("w", encoding="utf-8") as config:
         config.write(
             "ENABLE_QCN 1\nUSE_DYNAMIC_PFC_THRESHOLD 1\n\n"
@@ -1451,7 +1467,8 @@ def write_network_config(
             "FAST_RECOVERY_TIMES 1\nDCTCP_RATE_AI 1000Mb/s\n\n"
             "ERROR_RATE_PER_LINK 0.0000\nL2_CHUNK_SIZE 4000\nL2_ACK_INTERVAL 1\n"
             "L2_BACK_TO_ZERO 0\n"
-            f"{data_loss_settings}{recovery_settings}{trim_settings}\n"
+            f"{data_loss_settings}{recovery_settings}{trim_settings}"
+            f"{load_balancing_settings}\n"
             "HAS_WIN 1\nGLOBAL_T 0\nVAR_WIN 1\n"
             "FAST_REACT 1\nU_TARGET 0.95\nMI_THRESH 0\nINT_MULTI 1\nMULTI_RATE 0\n"
             "SAMPLE_FEEDBACK 0\nPINT_LOG_BASE 1.05\nPINT_PROB 1.0\n"
@@ -1794,6 +1811,7 @@ def materialize(
         profile.network.fabric,
         profile.network.congestion_control,
         profile.network.link_rate,
+        profile.network.load_balancing,
     )
     experiment_config = output_dir / "experiment.json"
     write_experiment_config(
@@ -1873,6 +1891,7 @@ def materialize(
         "congestion_control": profile.network.congestion_control.manifest(
             profile.network.link_rate
         ),
+        "load_balancing": profile.network.load_balancing.manifest(),
         "fabric": (
             profile.network.fabric.manifest()
             if profile.network.fabric is not None

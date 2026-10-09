@@ -24,6 +24,7 @@ DATA_LOSS_SCOPES = {
 }
 PACKET_TRIM_MODES = {"ftd", "bts"}
 CONGESTION_CONTROL_MODES = {"none", "dcqcn"}
+LOAD_BALANCING_MODES = {"ecmp", "ev_hash", "spray_uniform"}
 # ns-3 CC_MODE numbers. 12 is no sender reaction at all: a queue pair is set to
 # link rate at creation and nothing ever changes it. 1 is Mellanox DCQCN.
 CC_MODE_NONE = 12
@@ -162,6 +163,23 @@ class CongestionControl:
 
 
 @dataclass(frozen=True)
+class LoadBalancing:
+    """How a leaf spreads a flow's data packets over its spine uplinks.
+
+    ``ecmp`` hashes the four-tuple, so a flow keeps one path. ``ev_hash`` adds
+    a 16-bit entropy value the sender draws per packet to that hash.
+    ``spray_uniform`` has the sender name a spine per packet, uniformly at
+    random, and the source leaf send the packet up that spine. Every mode but
+    ``ecmp`` reorders a flow's packets on the way.
+    """
+
+    mode: str
+
+    def manifest(self) -> dict[str, str]:
+        return {"mode": self.mode}
+
+
+@dataclass(frozen=True)
 class PacketTrimming:
     """UEC 1.0.3 section 4.1 switch packet-trimming policy.
 
@@ -278,6 +296,7 @@ class ClosNetwork:
     packet_trimming: PacketTrimming | None = None
     fabric: SwitchFabric | None = None
     congestion_control: CongestionControl = CongestionControl(mode="none")
+    load_balancing: LoadBalancing = LoadBalancing(mode="ecmp")
 
     @property
     def kind(self) -> str:
@@ -307,6 +326,11 @@ class RingNetwork:
     @property
     def kind(self) -> str:
         return "ring"
+
+    @property
+    def load_balancing(self) -> LoadBalancing:
+        """A ring has no spine tier, so its switches only hash."""
+        return LoadBalancing(mode="ecmp")
 
 
 PhysicalNetwork = ClosNetwork | RingNetwork
@@ -482,6 +506,40 @@ def _load_congestion_control(document: dict[str, Any]) -> CongestionControl:
         ),
         ecn_threshold_scale=float(scale),
     )
+
+
+def _load_load_balancing(
+    document: dict[str, Any],
+    recovery: TransportRecovery | None,
+    trimming: PacketTrimming | None,
+) -> LoadBalancing:
+    """Parse the optional knob, defaulting to the flow-pinned ECMP hash."""
+    if "load_balancing" not in document:
+        return LoadBalancing(mode="ecmp")
+    balancing = document["load_balancing"]
+    if not isinstance(balancing, dict) or set(balancing) != {"mode"}:
+        raise ValueError("network.load_balancing must contain exactly 'mode'")
+    mode = balancing["mode"]
+    if not isinstance(mode, str) or mode not in LOAD_BALANCING_MODES:
+        raise ValueError(
+            "network.load_balancing.mode must be one of "
+            f"{sorted(LOAD_BALANCING_MODES)}"
+        )
+    # A reordered flow needs a receiver that holds out-of-order data and a
+    # fabric that names the range it cuts, instead of a gap the receiver
+    # cannot tell from reordering.
+    if mode != "ecmp":
+        if recovery is None or not recovery.selective_repair:
+            raise ValueError(
+                f"network.load_balancing.mode '{mode}' requires "
+                "network.transport_recovery.selective_repair"
+            )
+        if trimming is None or trimming.mode != "ftd":
+            raise ValueError(
+                f"network.load_balancing.mode '{mode}' requires "
+                "network.packet_trimming.mode 'ftd'"
+            )
+    return LoadBalancing(mode=mode)
 
 
 def _probability(value: Any, field: str) -> float:
@@ -775,7 +833,9 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
         "congestion_control",
     }
     topology_keys = {"hosts_per_leaf", "spine_count"} if topology == "clos" else set()
-    optional_topology_keys = {"failed_spine_count"} if topology == "clos" else set()
+    optional_topology_keys = (
+        {"failed_spine_count", "load_balancing"} if topology == "clos" else set()
+    )
     unknown_keys = set(document) - common_keys - topology_keys - optional_topology_keys
     if unknown_keys:
         raise ValueError(f"unknown network keys: {sorted(unknown_keys)}")
@@ -849,6 +909,9 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
         raise ValueError(
             "network.failed_spine_count must leave at least one live spine"
         )
+    load_balancing = _load_load_balancing(
+        document, transport_recovery, packet_trimming
+    )
     return ClosNetwork(
         link_rate=link_rate,
         packet_payload_bytes=packet_payload_bytes,
@@ -862,6 +925,7 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
         packet_trimming=packet_trimming,
         fabric=fabric,
         congestion_control=congestion_control,
+        load_balancing=load_balancing,
     )
 
 
