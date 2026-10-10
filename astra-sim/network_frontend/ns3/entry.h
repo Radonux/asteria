@@ -569,11 +569,25 @@ void qp_finish_print_log(FILE* fout, Ptr<RdmaQueuePair> q) {
     fflush(fout);
 }
 
+// The receiver's queue pair of a terminal flow, removed from the receiver so
+// that a later flow on the same port starts afresh. Null when no packet of the
+// flow ever arrived.
+Ptr<RdmaRxQueuePair> remove_receive_queue_pair(Ptr<RdmaQueuePair> q) {
+    Ptr<RdmaHw> receiver =
+        n.Get(ip_to_node_id(q->dip))->GetObject<RdmaDriver>()->m_rdma;
+    Ptr<RdmaRxQueuePair> rx = receiver->GetRxQp(q->dip.Get(), q->sip.Get(),
+                                                q->dport, q->sport, q->m_pg,
+                                                false);
+    receiver->DeleteRxQp(q->sip.Get(), q->m_pg, q->sport);
+    return rx;
+}
+
 // Both terminal outcomes report the same transport counters, so they read them
 // through one function: a counter added on one path and not the other would be
 // a silent hole in exactly the failed flows that need diagnosing.
 void copy_transport_counters(AstraSimNs3::FlowRecord& flow,
-                             Ptr<RdmaQueuePair> q) {
+                             Ptr<RdmaQueuePair> q,
+                             Ptr<RdmaRxQueuePair> rx) {
     flow.physical_bytes = q->m_size;
     flow.data_attempted_bytes = q->m_data_attempted_bytes;
     flow.retransmitted_bytes = q->m_retransmitted_bytes;
@@ -601,6 +615,9 @@ void copy_transport_counters(AstraSimNs3::FlowRecord& flow,
              : 0);
     flow.first_trim_ns = q->m_first_trim_ns;
     flow.first_repair_ns = q->m_first_repair_ns;
+    flow.duplicate_repairs = q->m_duplicate_repairs;
+    flow.data_arrivals = rx ? rx->m_data_arrivals : 0;
+    flow.folded_arrivals = rx ? rx->m_folded_arrivals : 0;
     flow.end_time_ns = Simulator::Now().GetNanoSeconds();
 }
 
@@ -609,10 +626,7 @@ void qp_finish(FILE* fout, Ptr<RdmaQueuePair> q) {
     const uint32_t sid = ip_to_node_id(q->sip);
     const uint32_t did = ip_to_node_id(q->dip);
     qp_finish_print_log(fout, q);
-
-    Ptr<Node> dst_node = n.Get(did);
-    Ptr<RdmaDriver> rdma = dst_node->GetObject<RdmaDriver>();
-    rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->m_pg, q->sport);
+    Ptr<RdmaRxQueuePair> rx = remove_receive_queue_pair(q);
 
     const FlowKey key = make_flow_key(q->sport, sid, did);
     const auto active = active_flow_registry.find(key);
@@ -623,7 +637,7 @@ void qp_finish(FILE* fout, Ptr<RdmaQueuePair> q) {
     // receiving, and this one has stopped.
     AstraSimNs3::note_holes(active->second, 0);
     AstraSimNs3::FlowRecord flow = active->second;
-    copy_transport_counters(flow, q);
+    copy_transport_counters(flow, q, rx);
     flow.terminal_outcome = AstraSimNs3::FlowTerminalOutcome::Completed;
     // The receiver credited every byte as it arrived, so by completion its
     // account must equal what the sender offered less what it was forgiven. A
@@ -685,13 +699,11 @@ void qp_fail(FILE* fout, Ptr<RdmaQueuePair> q, uint32_t reason) {
         throw runtime_error("Failed QP has no active flow record");
     }
 
-    Ptr<Node> dst_node = n.Get(did);
-    Ptr<RdmaDriver> rdma = dst_node->GetObject<RdmaDriver>();
-    rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->m_pg, q->sport);
+    Ptr<RdmaRxQueuePair> rx = remove_receive_queue_pair(q);
 
     AstraSimNs3::note_holes(active->second, 0);
     AstraSimNs3::FlowRecord flow = active->second;
-    copy_transport_counters(flow, q);
+    copy_transport_counters(flow, q, rx);
     flow.terminal_outcome = AstraSimNs3::FlowTerminalOutcome::Failed;
     flow.failure_reason =
         reason == static_cast<uint32_t>(RdmaFailureReason::TimeoutRetryExhausted)

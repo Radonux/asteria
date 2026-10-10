@@ -579,6 +579,14 @@ struct FlowRecord {
     // Zero means never; no packet can be trimmed or repaired at time zero.
     uint64_t first_trim_ns = 0;
     uint64_t first_repair_ns = 0;
+    // Repair sends of a packet already repaired, where every data packet has
+    // a send record. Zero under ECMP.
+    uint32_t duplicate_repairs = 0;
+    // Data packets that reached the receiver, duplicates included, and those
+    // among them a source leaf carried on a spine other than the requested
+    // one. The second is zero outside spray_uniform.
+    uint64_t data_arrivals = 0;
+    uint64_t folded_arrivals = 0;
     uint64_t start_time_ns = 0;
     uint64_t end_time_ns = 0;
     FlowTerminalOutcome terminal_outcome = FlowTerminalOutcome::Pending;
@@ -649,7 +657,8 @@ class ExperimentTelemetry {
                "pacing_refusals,soft_refusals,late_forgiven_bytes,"
                "delivered_bytes,cc_exempt,"
                "cc_exempt_granted_ns,cc_signal_withheld,"
-               "allowance_gone_reports,cc_transitions,cc_obeying_ns\n";
+               "allowance_gone_reports,cc_transitions,cc_obeying_ns,"
+               "duplicate_repairs,data_arrivals,folded_arrivals\n";
         rank_completion << "rank,completion_time_ns\n";
         collective_events
             << "rank,parallelism_domain,collective_type,training_step,"
@@ -699,6 +708,8 @@ class ExperimentTelemetry {
                     << flow.cc_signal_withheld << ','
                     << flow.allowance_gone_reports << ','
                     << flow.cc_transitions << ',' << flow.cc_obeying_ns
+                    << ',' << flow.duplicate_repairs << ','
+                    << flow.data_arrivals << ',' << flow.folded_arrivals
                     << '\n';
     }
 
