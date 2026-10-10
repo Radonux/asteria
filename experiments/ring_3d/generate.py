@@ -1447,12 +1447,16 @@ def write_network_config(
             f"PACKET_TRIM_LASTHOP {int(packet_trimming.last_hop_codepoint)}\n"
         )
     # Absent means ECMP to the simulator, so an ECMP profile keeps the exact
-    # configuration it had before the knob existed.
-    load_balancing_settings = (
-        ""
-        if load_balancing.mode == "ecmp"
-        else f"LOAD_BALANCING {load_balancing.mode}\n"
-    )
+    # configuration it had before the knob existed. Under per-packet paths the
+    # run also writes what every switch port sent and, where the identification
+    # names a spine, what every host received over each.
+    load_balancing_settings = ""
+    for key, counter_file in counter_files(load_balancing, output_dir).items():
+        load_balancing_settings += f"{key} {counter_file}\n"
+    if load_balancing.mode != "ecmp":
+        load_balancing_settings = (
+            f"LOAD_BALANCING {load_balancing.mode}\n{load_balancing_settings}"
+        )
     with path.open("w", encoding="utf-8") as config:
         config.write(
             "ENABLE_QCN 1\nUSE_DYNAMIC_PFC_THRESHOLD 1\n\n"
@@ -1483,6 +1487,16 @@ def write_network_config(
             f"{fabric_settings}"
             f"{link_failure_settings}"
         )
+
+
+def counter_files(load_balancing: LoadBalancing, output_dir: Path) -> dict[str, Path]:
+    """The network configuration keys of the counter files a run writes."""
+    files: dict[str, Path] = {}
+    if load_balancing.mode != "ecmp":
+        files["PORT_COUNTER_OUTPUT_FILE"] = output_dir / "port_counters.csv"
+    if load_balancing.mode == "spray_uniform":
+        files["SPINE_ARRIVAL_OUTPUT_FILE"] = output_dir / "spine_arrivals.csv"
+    return files
 
 
 def _microburst_flows(profile: Profile) -> list[dict[str, int]]:
@@ -1942,6 +1956,12 @@ def materialize(
         "transport_event_summary_file": str(
             (output_dir / "ns3" / "transport_summary.csv").resolve()
         ),
+        "counter_files": {
+            name: str(path.resolve())
+            for name, path in counter_files(
+                profile.network.load_balancing, output_dir / "ns3"
+            ).items()
+        },
     }
     if model_metadata is not None:
         manifest["model_trace"] = model_metadata
