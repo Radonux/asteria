@@ -59,8 +59,8 @@ class LinkFailure:
     """A spine's links, or one leaf-spine link, failing at start_ns.
 
     ``graceful`` takes the links down, so the routing and every leaf see it.
-    ``silent`` leaves them up while the spine drops the data arriving from the
-    leaves. ``gray`` gives the links an error rate or a lower rate.
+    ``silent`` leaves them up while the spine drops every packet arriving from
+    the leaves. ``gray`` gives the links an error rate or a lower rate.
     """
 
     model: str
