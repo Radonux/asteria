@@ -549,6 +549,7 @@ int main(int argc, char* argv[]) {
 
     // Run the simulation by triggering the ns3 event queue.
     Simulator::Run();
+    write_fabric_counters();
     AstraSimNs3::finalize_experiment_telemetry();
     Simulator::Destroy();
     if (has_bridge_failure()) {
