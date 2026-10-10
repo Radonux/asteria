@@ -15,7 +15,11 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from experiments.ring_3d.generate import materialize
 
 PROFILES = REPOSITORY_ROOT / "experiments/ring_3d/profiles"
-KEYS = ("PORT_COUNTER_OUTPUT_FILE", "SPINE_ARRIVAL_OUTPUT_FILE")
+KEYS = (
+    "PORT_COUNTER_OUTPUT_FILE",
+    "SPINE_ARRIVAL_OUTPUT_FILE",
+    "SPINE_REPORT_OUTPUT_FILE",
+)
 
 
 class FabricCounterTests(unittest.TestCase):
@@ -26,11 +30,13 @@ class FabricCounterTests(unittest.TestCase):
         written = {
             "ecmp": (),
             "ev_hash": ("PORT_COUNTER_OUTPUT_FILE",),
-            "spray_uniform": KEYS,
+            "spray_uniform": KEYS[:2],
+            "spray_policy": KEYS,
         }
         files = {
             "PORT_COUNTER_OUTPUT_FILE": "port_counters.csv",
             "SPINE_ARRIVAL_OUTPUT_FILE": "spine_arrivals.csv",
+            "SPINE_REPORT_OUTPUT_FILE": "spine_reports.csv",
         }
         for mode, keys in written.items():
             document["network"]["load_balancing"] = {"mode": mode}

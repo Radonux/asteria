@@ -344,7 +344,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
         document["network"]["congestion_control"] = {"mode": "nscc"}
         with tempfile.TemporaryDirectory() as temporary_directory:
             profile_path = Path(temporary_directory) / "profile.json"
-            for mode in ("ev_hash", "spray_uniform"):
+            for mode in ("ev_hash", "spray_uniform", "spray_policy"):
                 document["network"]["load_balancing"] = {"mode": mode}
                 profile_path.write_text(json.dumps(document), encoding="utf-8")
                 output = Path(temporary_directory) / mode
@@ -1740,7 +1740,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temporary_directory:
             profile_path = Path(temporary_directory) / "profile.json"
-            for mode in ("ev_hash", "spray_uniform"):
+            for mode in ("ev_hash", "spray_uniform", "spray_policy"):
                 document["network"]["load_balancing"] = {"mode": mode}
                 profile_path.write_text(json.dumps(document), encoding="utf-8")
                 output = Path(temporary_directory) / mode
@@ -1750,7 +1750,10 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 if mode == "ev_hash":
                     expected["selector"] = "ops"
                 with self.subTest(mode=mode):
-                    self.assertEqual(manifest["load_balancing"], expected)
+                    self.assertEqual(manifest["load_balancing"]["mode"], mode)
+                    if mode != "spray_policy":
+                        self.assertEqual(manifest["load_balancing"], expected)
+                        self.assertNotIn("SPRAY_", config)
                     self.assertIn(f"\nLOAD_BALANCING {mode}\n", config)
                     self.assertNotIn("PATH_SELECTOR", config)
 
@@ -1865,6 +1868,179 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 config,
             )
 
+    def test_spray_policy_and_its_parameters_reach_the_configuration(self) -> None:
+        """spray_policy writes every parameter, defaults filled in, and those
+        of one-way delay only with it."""
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            runs = itertools.count()
+
+            def generated(balancing: dict[str, object]) -> tuple[dict, str]:
+                document["network"]["load_balancing"] = balancing
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                output = Path(temporary_directory) / f"run{next(runs)}"
+                manifest = materialize(profile_path, output)
+                config = (output / "network_config.txt").read_text(encoding="utf-8")
+                return manifest["load_balancing"], config.replace(str(output), "<o>")
+
+            manifest, config = generated({"mode": "spray_policy"})
+            self.assertEqual(
+                manifest,
+                {
+                    "mode": "spray_policy",
+                    "report_interval_base_rtts": 2.0,
+                    "estimator_gain": 0.0625,
+                    "mark_cusum_slack": 0.125,
+                    "mark_cusum_threshold": 0.5,
+                    "mark_thresholds": (0.25, 0.5, 0.75),
+                    "hold_down_intervals": 4,
+                    "one_way_delay": False,
+                    "gamma": 0.25,
+                    "epsilon": 0.02,
+                    "candidates": 1,
+                    "candidate_draw": "proportional",
+                    "edge_window_penalty": 64,
+                },
+            )
+            self.assertIn(
+                "\nLOAD_BALANCING spray_policy\n"
+                "SPRAY_REPORT_INTERVAL_BASE_RTTS 2.0\n"
+                "SPRAY_ESTIMATOR_GAIN 0.0625\n"
+                "SPRAY_MARK_CUSUM_SLACK 0.125\n"
+                "SPRAY_MARK_CUSUM_THRESHOLD 0.5\n"
+                "SPRAY_MARK_THRESHOLDS 0.25 0.5 0.75\n"
+                "SPRAY_HOLD_DOWN_INTERVALS 4\n"
+                "SPRAY_ONE_WAY_DELAY 0\n"
+                "SPRAY_GAMMA 0.25\n"
+                "SPRAY_EPSILON 0.02\n"
+                "SPRAY_CANDIDATES 1\n"
+                "SPRAY_CANDIDATE_DRAW proportional\n"
+                "SPRAY_EDGE_WINDOW_PENALTY 64\n"
+                "PORT_COUNTER_OUTPUT_FILE <o>/ns3/port_counters.csv\n"
+                "SPINE_ARRIVAL_OUTPUT_FILE <o>/ns3/spine_arrivals.csv\n"
+                "SPINE_REPORT_OUTPUT_FILE <o>/ns3/spine_reports.csv\n",
+                config,
+            )
+            self.assertNotIn("SPRAY_DELAY", config)
+
+            manifest, config = generated(
+                {
+                    "mode": "spray_policy",
+                    "report_interval_base_rtts": 3,
+                    "estimator_gain": 0.5,
+                    "mark_cusum_slack": 0,
+                    "mark_cusum_threshold": 1,
+                    "mark_thresholds": [0.1, 0.2, 0.9],
+                    "hold_down_intervals": 0,
+                    "gamma": 1,
+                    "epsilon": 0,
+                    "candidates": 3,
+                    "candidate_draw": "uniform",
+                    "edge_window_penalty": 127,
+                    "one_way_delay": True,
+                    "delay_cusum_slack_base_rtts": 0.25,
+                    "delay_cusum_threshold_base_rtts": 2,
+                    "delay_thresholds_base_rtts": [0.5, 1, 1.5],
+                }
+            )
+            self.assertEqual(manifest["delay_thresholds_base_rtts"], (0.5, 1.0, 1.5))
+            self.assertIn(
+                "\nSPRAY_REPORT_INTERVAL_BASE_RTTS 3.0\n"
+                "SPRAY_ESTIMATOR_GAIN 0.5\n"
+                "SPRAY_MARK_CUSUM_SLACK 0.0\n"
+                "SPRAY_MARK_CUSUM_THRESHOLD 1.0\n"
+                "SPRAY_MARK_THRESHOLDS 0.1 0.2 0.9\n"
+                "SPRAY_HOLD_DOWN_INTERVALS 0\n"
+                "SPRAY_ONE_WAY_DELAY 1\n"
+                "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS 0.25\n"
+                "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS 2.0\n"
+                "SPRAY_DELAY_THRESHOLDS_BASE_RTTS 0.5 1.0 1.5\n"
+                "SPRAY_GAMMA 1.0\n"
+                "SPRAY_EPSILON 0.0\n"
+                "SPRAY_CANDIDATES 3\n"
+                "SPRAY_CANDIDATE_DRAW uniform\n"
+                "SPRAY_EDGE_WINDOW_PENALTY 127\n",
+                config,
+            )
+
+    def test_spray_policy_refuses_what_nothing_would_read(self) -> None:
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        policy = {"mode": "spray_policy"}
+        refusals = [
+            ({**policy, "selector": "reps"}, "does not take"),
+            ({**policy, "buffer_size": 8}, "does not take"),
+            (
+                {**policy, "delay_thresholds_base_rtts": [0.5, 1, 1.5]},
+                "require one_way_delay",
+            ),
+            (
+                {**policy, "one_way_delay": False, "delay_cusum_slack_base_rtts": 0.1},
+                "require one_way_delay",
+            ),
+            ({"mode": "spray_uniform", "gamma": 0.5}, "takes no other key"),
+            ({"mode": "ev_hash", "gamma": 0.5}, "'ops' does not take"),
+            ({**policy, "one_way_delay": 1}, "one_way_delay must be a boolean"),
+            ({**policy, "candidate_draw": "best"}, "candidate_draw must be"),
+            ({**policy, "mark_thresholds": [0.5, 0.25, 0.75]}, "must increase"),
+            ({**policy, "mark_thresholds": [0.25, 0.5]}, "three thresholds"),
+            (
+                {**policy, "mark_thresholds": [0.25, 0.5, 1.5]},
+                "mark_thresholds must be",
+            ),
+            (
+                {
+                    **policy,
+                    "one_way_delay": True,
+                    "delay_thresholds_base_rtts": [0, 1, 2],
+                },
+                "delay_thresholds_base_rtts must be a positive number",
+            ),
+        ]
+        for knob, values in (
+            ("report_interval_base_rtts", (0, -1, True, "one")),
+            ("estimator_gain", (0, 1.5, True)),
+            ("mark_cusum_slack", (-0.1, True, float("nan"))),
+            ("mark_cusum_threshold", (0, True)),
+            ("hold_down_intervals", (-1, 1.5, True)),
+            ("gamma", (0, 1.25, True)),
+            ("epsilon", (-0.01, 1.01, True)),
+            ("candidates", (0, 2.0, True)),
+            ("edge_window_penalty", (-1, 128, 1.0)),
+        ):
+            refusals += [
+                ({**policy, knob: value}, f"{knob} must be") for value in values
+            ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            for balancing, message in refusals:
+                document["network"]["load_balancing"] = balancing
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                with self.subTest(balancing=balancing):
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_profile(profile_path)
+
+            # A report grades at most 32 spines.
+            for spines, refused in ((32, False), (33, True)):
+                wide = json.loads(json.dumps(document))
+                wide["network"]["spine_count"] = spines
+                wide["network"]["load_balancing"] = policy
+                profile_path.write_text(json.dumps(wide), encoding="utf-8")
+                with self.subTest(spines=spines):
+                    if refused:
+                        with self.assertRaisesRegex(ValueError, "at most 32 spines"):
+                            load_profile(profile_path)
+                    else:
+                        load_profile(profile_path)
+
     def test_path_selector_refuses_what_nothing_would_read(self) -> None:
         document = json.loads(
             (
@@ -1949,7 +2125,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
             del without_trimming["network"]["packet_trimming"]
             refused(without_trimming, "ftd")
 
-            for balancing in ({"mode": "spray_policy"}, {"mode": 2}):
+            for balancing in ({"mode": "spray_random"}, {"mode": 2}):
                 unknown_mode = json.loads(json.dumps(document))
                 unknown_mode["network"]["load_balancing"] = balancing
                 with self.subTest(balancing=balancing):
@@ -1958,6 +2134,13 @@ class Ring3DGeneratorTests(unittest.TestCase):
             extra_key = json.loads(json.dumps(document))
             extra_key["network"]["load_balancing"]["selector"] = "ops"
             refused(extra_key, "takes no other key")
+
+            policy = json.loads(json.dumps(without_repair))
+            policy["network"]["load_balancing"] = {"mode": "spray_policy"}
+            refused(policy, "selective_repair")
+            policy = json.loads(json.dumps(without_ftd))
+            policy["network"]["load_balancing"] = {"mode": "spray_policy"}
+            refused(policy, "ftd")
 
         ring = json.loads(
             (
@@ -1980,7 +2163,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temporary_directory:
             profile_path = Path(temporary_directory) / "profile.json"
-            for mode in ("ev_hash", "spray_uniform"):
+            for mode in ("ev_hash", "spray_uniform", "spray_policy"):
                 document["network"]["load_balancing"] = {"mode": mode}
                 profile_path.write_text(json.dumps(document), encoding="utf-8")
                 with self.subTest(mode=mode):

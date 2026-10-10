@@ -57,7 +57,11 @@ DATA_LOSS_SCOPES = {
     "switch_to_switch",
 }
 PACKET_TRIM_MODES = {"ftd", "bts"}
-LOAD_BALANCING_MODES = {"ecmp", "ev_hash", "spray_uniform"}
+LOAD_BALANCING_MODES = {"ecmp", "ev_hash", "spray_uniform", "spray_policy"}
+# The modes whose identification names the spine a packet goes up.
+SPINE_NAMING_MODES = {"spray_uniform", "spray_policy"}
+# The most spines a spray_policy report grades.
+MAX_REPORTED_SPINES = 32
 # What chooses each data packet's entropy value under ev_hash.
 PATH_SELECTORS = ("ops", "reps", "ue_oblivious", "ue_aware", "mrc")
 # The ns-3 CC_MODE number of each congestion_control.mode. 12 is no sender
@@ -199,29 +203,36 @@ class LoadBalancing:
     values, ``ue_aware`` rotates skipping a value once after a congestion
     report, and ``mrc`` rotates over values it holds GOOD, skipped or assumed
     bad. ``spray_uniform`` has the sender name a spine per packet, uniformly at
-    random, and the source leaf send the packet up that spine. Every mode but
-    ``ecmp`` reorders a flow's packets on the way.
+    random, and the source leaf send the packet up that spine. ``spray_policy``
+    names a spine per packet the same way, drawn from scores the sender builds
+    out of the grades the receiver reports in every acknowledgement. Every
+    mode but ``ecmp`` reorders a flow's packets on the way.
     """
 
     mode: str
     selector: str = "ops"
-    # The selector's parameters by profile key, defaults filled in.
-    parameters: tuple[tuple[str, int | float], ...] = ()
+    # The mode's or the selector's parameters by profile key, defaults filled
+    # in.
+    parameters: tuple[tuple[str, ParameterValue], ...] = ()
 
-    def manifest(self) -> dict[str, str | int | float]:
+    def manifest(self) -> dict[str, ParameterValue]:
         if self.mode != "ev_hash":
-            return {"mode": self.mode}
+            return {"mode": self.mode, **dict(self.parameters)}
         return {"mode": self.mode, "selector": self.selector, **dict(self.parameters)}
 
-    def selector_settings(self) -> str:
-        """PATH_SELECTOR and the selector's parameters. OPS has none and is the
-        simulator's default, so an ``ops`` profile writes nothing."""
-        if self.selector == "ops":
-            return ""
+    def parameter_settings(self) -> str:
+        """PATH_SELECTOR, unless the selector is ``ops``, the simulator's
+        default, and the parameters, each as its simulator key."""
+        selector = (
+            f"PATH_SELECTOR {self.selector}\n"
+            if self.mode == "ev_hash" and self.selector != "ops"
+            else ""
+        )
         values = dict(self.parameters)
-        return f"PATH_SELECTOR {self.selector}\n" + "".join(
-            f"{parameter.key} {values[parameter.name]}\n"
-            for parameter in SELECTOR_PARAMETERS[self.selector]
+        return selector + "".join(
+            f"{parameter.key} {_setting(values[parameter.name])}\n"
+            for parameter in _parameters_of(self.mode, self.selector)
+            if parameter.name in values
         )
 
 
@@ -601,15 +612,29 @@ def _load_congestion_control(document: dict[str, Any]) -> CongestionControl:
     )
 
 
+# A parameter's value: a number, a switch, a name or a list of thresholds.
+ParameterValue = int | float | bool | str | tuple[float, ...]
+
+
 @dataclass(frozen=True)
-class SelectorParameter:
-    """One parameter of a path selector: its profile key, its simulator key,
-    the default its source gives, and the parser that validates a value."""
+class BalancingParameter:
+    """One parameter of a load-balancing mode or a path selector: its profile
+    key, its simulator key, the default its source gives, and the parser that
+    validates a value."""
 
     name: str
     key: str
-    default: int | float
-    parse: Callable[[Any, str], int | float]
+    default: ParameterValue
+    parse: Callable[[Any, str], ParameterValue]
+
+
+def _setting(value: ParameterValue) -> str:
+    """A parameter's value as the simulator reads it."""
+    if isinstance(value, bool):
+        return str(int(value))
+    if isinstance(value, tuple):
+        return " ".join(str(item) for item in value)
+    return str(value)
 
 
 def _reps_buffer_size(value: Any, field: str) -> int:
@@ -638,13 +663,13 @@ def _positive_number(value: Any, field: str) -> float:
 
 
 # UEC 1.0.3 section 3.6.16.3's typical space.
-_UE_EV_SET_SIZE = SelectorParameter("ev_set_size", "UE_EV_SET_SIZE", 256, _ev_set_size)
-SELECTOR_PARAMETERS: dict[str, tuple[SelectorParameter, ...]] = {
+_UE_EV_SET_SIZE = BalancingParameter("ev_set_size", "UE_EV_SET_SIZE", 256, _ev_set_size)
+SELECTOR_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
     "ops": (),
     # REPS section 3.1 and its artifact's exit_freeze_after.
     "reps": (
-        SelectorParameter("buffer_size", "REPS_BUFFER_SIZE", 8, _reps_buffer_size),
-        SelectorParameter(
+        BalancingParameter("buffer_size", "REPS_BUFFER_SIZE", 8, _reps_buffer_size),
+        BalancingParameter(
             "freezing_timeout_ns", "REPS_FREEZING_TIMEOUT_NS", 10_000_000, _positive_int
         ),
     ),
@@ -652,7 +677,7 @@ SELECTOR_PARAMETERS: dict[str, tuple[SelectorParameter, ...]] = {
     # UEC 1.0.3 section 3.6.16.4's default saturation.
     "ue_aware": (
         _UE_EV_SET_SIZE,
-        SelectorParameter(
+        BalancingParameter(
             "saturation_fraction", "UE_SATURATION_FRACTION", 0.5, _fraction
         ),
     ),
@@ -660,15 +685,145 @@ SELECTOR_PARAMETERS: dict[str, tuple[SelectorParameter, ...]] = {
     # value out of use for a round trip, as UEC 1.0.3 section 3.6.16.4 keeps a
     # marked one; an assumed-bad value probed once per retransmission timeout.
     "mrc": (
-        SelectorParameter("ev_set_size", "MRC_EV_SET_SIZE", 128, _ev_set_size),
-        SelectorParameter(
+        BalancingParameter("ev_set_size", "MRC_EV_SET_SIZE", 128, _ev_set_size),
+        BalancingParameter(
             "skip_base_rtts", "MRC_SKIP_BASE_RTTS", 1.0, _positive_number
         ),
-        SelectorParameter(
+        BalancingParameter(
             "probe_timeouts", "MRC_PROBE_TIMEOUTS", 1.0, _positive_number
         ),
     ),
 }
+
+
+def _probability(value: Any, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a number in [0, 1]")
+    probability = float(value)
+    if not isfinite(probability) or not 0.0 <= probability <= 1.0:
+        raise ValueError(f"{field} must be a number in [0, 1]")
+    return probability
+
+
+def _nonnegative_number(value: Any, field: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(value)
+        or value < 0
+    ):
+        raise ValueError(f"{field} must be a nonnegative number")
+    return float(value)
+
+
+def _increasing_thresholds(
+    parse: Callable[[Any, str], float],
+) -> Callable[[Any, str], tuple[float, ...]]:
+    """Three thresholds, each parsed as parse does, strictly increasing."""
+
+    def thresholds(value: Any, field: str) -> tuple[float, ...]:
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            raise ValueError(f"{field} must be a list of three thresholds")
+        parsed = tuple(parse(item, field) for item in value)
+        if not parsed[0] < parsed[1] < parsed[2]:
+            raise ValueError(f"{field} must increase")
+        return parsed
+
+    return thresholds
+
+
+def _flag(value: Any, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} must be a boolean")
+    return value
+
+
+def _candidate_draw(value: Any, field: str) -> str:
+    if value not in ("proportional", "uniform"):
+        raise ValueError(f"{field} must be 'proportional' or 'uniform'")
+    return value
+
+
+def _window_penalty(value: Any, field: str) -> int:
+    # UEC 1.0.3 section 3.6.13.2's Rcv_Cwnd_Pend is seven bits.
+    if _nonnegative_int(value, field) > 127:
+        raise ValueError(f"{field} must be at most 127")
+    return value
+
+
+# spray_policy's receiver, then its sender. One report per loaded round trip,
+# about two base RTTs; DCTCP's
+# gain of 1/16 on the marked fraction; CUSUM slack of half a grade's width and
+# a threshold of two; grades in four equal bands of the marked fraction and,
+# with one-way delay, of the delay up to NSCC's target_qdelay of 0.75 base
+# RTTs; gamma 0.25 and epsilon 0.02, and one candidate, as the design gives
+# them; NSCC's Rcv_Cwnd_Pend example of 64.
+POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
+    BalancingParameter(
+        "report_interval_base_rtts",
+        "SPRAY_REPORT_INTERVAL_BASE_RTTS",
+        2.0,
+        _positive_number,
+    ),
+    BalancingParameter("estimator_gain", "SPRAY_ESTIMATOR_GAIN", 0.0625, _fraction),
+    BalancingParameter(
+        "mark_cusum_slack", "SPRAY_MARK_CUSUM_SLACK", 0.125, _nonnegative_number
+    ),
+    BalancingParameter(
+        "mark_cusum_threshold", "SPRAY_MARK_CUSUM_THRESHOLD", 0.5, _positive_number
+    ),
+    BalancingParameter(
+        "mark_thresholds",
+        "SPRAY_MARK_THRESHOLDS",
+        (0.25, 0.5, 0.75),
+        _increasing_thresholds(_fraction),
+    ),
+    BalancingParameter(
+        "hold_down_intervals", "SPRAY_HOLD_DOWN_INTERVALS", 4, _nonnegative_int
+    ),
+    BalancingParameter("one_way_delay", "SPRAY_ONE_WAY_DELAY", False, _flag),
+    BalancingParameter(
+        "delay_cusum_slack_base_rtts",
+        "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS",
+        0.125,
+        _nonnegative_number,
+    ),
+    BalancingParameter(
+        "delay_cusum_threshold_base_rtts",
+        "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS",
+        0.5,
+        _positive_number,
+    ),
+    BalancingParameter(
+        "delay_thresholds_base_rtts",
+        "SPRAY_DELAY_THRESHOLDS_BASE_RTTS",
+        (0.25, 0.5, 0.75),
+        _increasing_thresholds(_positive_number),
+    ),
+    BalancingParameter("gamma", "SPRAY_GAMMA", 0.25, _fraction),
+    BalancingParameter("epsilon", "SPRAY_EPSILON", 0.02, _probability),
+    BalancingParameter("candidates", "SPRAY_CANDIDATES", 1, _positive_int),
+    BalancingParameter(
+        "candidate_draw", "SPRAY_CANDIDATE_DRAW", "proportional", _candidate_draw
+    ),
+    BalancingParameter(
+        "edge_window_penalty", "SPRAY_EDGE_WINDOW_PENALTY", 64, _window_penalty
+    ),
+)
+# The parameters only one-way delay reads.
+ONE_WAY_DELAY_PARAMETERS = {
+    "delay_cusum_slack_base_rtts",
+    "delay_cusum_threshold_base_rtts",
+    "delay_thresholds_base_rtts",
+}
+
+
+def _parameters_of(mode: str, selector: str) -> tuple[BalancingParameter, ...]:
+    if mode == "ev_hash":
+        return SELECTOR_PARAMETERS[selector]
+    if mode == "spray_policy":
+        return POLICY_PARAMETERS
+    return ()
 
 
 def _load_load_balancing(
@@ -688,6 +843,8 @@ def _load_load_balancing(
             "network.load_balancing.mode must be one of "
             f"{sorted(LOAD_BALANCING_MODES)}"
         )
+    if mode == "spray_policy":
+        return _load_spray_policy(balancing, recovery, trimming)
     if mode != "ev_hash" and set(balancing) != {"mode"}:
         raise ValueError(
             f"network.load_balancing.mode '{mode}' takes no other key; a selector "
@@ -705,6 +862,67 @@ def _load_load_balancing(
             f"network.load_balancing.selector '{selector}' does not take "
             f"{sorted(unknown)}"
         )
+    _require_reorder_tolerance(mode, recovery, trimming)
+    return LoadBalancing(
+        mode=mode,
+        selector=selector,
+        parameters=_parsed(balancing, parameters),
+    )
+
+
+def _load_spray_policy(
+    balancing: dict[str, Any],
+    recovery: TransportRecovery | None,
+    trimming: PacketTrimming | None,
+) -> LoadBalancing:
+    """spray_policy and its parameters; those of one-way delay only with it."""
+    unknown = set(balancing) - {"mode"} - {p.name for p in POLICY_PARAMETERS}
+    if unknown:
+        raise ValueError(
+            "network.load_balancing.mode 'spray_policy' does not take "
+            f"{sorted(unknown)}"
+        )
+    one_way_delay = _flag(
+        balancing.get("one_way_delay", False), "network.load_balancing.one_way_delay"
+    )
+    delay_only = sorted(set(balancing) & ONE_WAY_DELAY_PARAMETERS)
+    if not one_way_delay and delay_only:
+        raise ValueError(f"network.load_balancing {delay_only} require one_way_delay")
+    _require_reorder_tolerance("spray_policy", recovery, trimming)
+    return LoadBalancing(
+        mode="spray_policy",
+        parameters=_parsed(
+            balancing,
+            tuple(
+                parameter
+                for parameter in POLICY_PARAMETERS
+                if one_way_delay or parameter.name not in ONE_WAY_DELAY_PARAMETERS
+            ),
+        ),
+    )
+
+
+def _parsed(
+    balancing: dict[str, Any], parameters: tuple[BalancingParameter, ...]
+) -> tuple[tuple[str, ParameterValue], ...]:
+    """Each parameter's value as given or its default, validated."""
+    return tuple(
+        (
+            parameter.name,
+            parameter.parse(
+                balancing.get(parameter.name, parameter.default),
+                f"network.load_balancing.{parameter.name}",
+            ),
+        )
+        for parameter in parameters
+    )
+
+
+def _require_reorder_tolerance(
+    mode: str,
+    recovery: TransportRecovery | None,
+    trimming: PacketTrimming | None,
+) -> None:
     # A reordered flow needs a receiver that holds out-of-order data and a
     # fabric that names the range it cuts, instead of a gap the receiver
     # cannot tell from reordering.
@@ -719,29 +937,6 @@ def _load_load_balancing(
                 f"network.load_balancing.mode '{mode}' requires "
                 "network.packet_trimming.mode 'ftd'"
             )
-    return LoadBalancing(
-        mode=mode,
-        selector=selector,
-        parameters=tuple(
-            (
-                parameter.name,
-                parameter.parse(
-                    balancing.get(parameter.name, parameter.default),
-                    f"network.load_balancing.{parameter.name}",
-                ),
-            )
-            for parameter in parameters
-        ),
-    )
-
-
-def _probability(value: Any, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{field} must be a number in [0, 1]")
-    probability = float(value)
-    if not isfinite(probability) or not 0.0 <= probability <= 1.0:
-        raise ValueError(f"{field} must be a number in [0, 1]")
-    return probability
 
 
 def _optional_host(value: Any, field: str, host_count: int) -> int | None:
@@ -1124,6 +1319,7 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
                 document, transport_recovery, packet_trimming
             ),
         )
+        _require_reported_spines(network)
     _require_acknowledged_packets(network)
     return network
 
@@ -1249,7 +1445,20 @@ def _require_acknowledged_packets(network: PhysicalNetwork) -> None:
     ):
         raise ValueError(
             "network.congestion_control.mode 'nscc' requires "
-            "network.load_balancing.mode 'ev_hash' or 'spray_uniform'"
+            "network.load_balancing.mode 'ev_hash', 'spray_uniform' or "
+            "'spray_policy'"
+        )
+
+
+def _require_reported_spines(network: ClosNetwork) -> None:
+    """Refuse a spray_policy report over more spines than it can grade."""
+    if (
+        network.load_balancing.mode == "spray_policy"
+        and network.live_spine_count > MAX_REPORTED_SPINES
+    ):
+        raise ValueError(
+            "network.load_balancing.mode 'spray_policy' grades at most "
+            f"{MAX_REPORTED_SPINES} spines"
         )
 
 

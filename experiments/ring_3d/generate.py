@@ -50,6 +50,7 @@ try:
     from .topology import (
         CongestionControl,
         DataPlaneLoss,
+        SPINE_NAMING_MODES,
         LoadBalancing,
         PacketTrimming,
         PhysicalNetwork,
@@ -71,6 +72,7 @@ except ImportError:
     from topology import (
         CongestionControl,
         DataPlaneLoss,
+        SPINE_NAMING_MODES,
         LoadBalancing,
         PacketTrimming,
         PhysicalNetwork,
@@ -1598,7 +1600,7 @@ def write_network_config(
         ""
         if load_balancing.mode == "ecmp"
         else f"LOAD_BALANCING {load_balancing.mode}\n"
-        + load_balancing.selector_settings()
+        + load_balancing.parameter_settings()
     )
     for key, counter_file in counter_files(load_balancing, output_dir).items():
         load_balancing_settings += f"{key} {counter_file}\n"
@@ -1639,8 +1641,10 @@ def counter_files(load_balancing: LoadBalancing, output_dir: Path) -> dict[str, 
     files: dict[str, Path] = {}
     if load_balancing.mode != "ecmp":
         files["PORT_COUNTER_OUTPUT_FILE"] = output_dir / "port_counters.csv"
-    if load_balancing.mode == "spray_uniform":
+    if load_balancing.mode in SPINE_NAMING_MODES:
         files["SPINE_ARRIVAL_OUTPUT_FILE"] = output_dir / "spine_arrivals.csv"
+    if load_balancing.mode == "spray_policy":
+        files["SPINE_REPORT_OUTPUT_FILE"] = output_dir / "spine_reports.csv"
     return files
 
 
