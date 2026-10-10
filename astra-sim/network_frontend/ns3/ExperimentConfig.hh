@@ -584,7 +584,7 @@ struct FlowRecord {
     uint32_t duplicate_repairs = 0;
     // Data packets that reached the receiver, duplicates included, and those
     // among them a source leaf carried on a spine other than the requested
-    // one. The second is zero outside spray_uniform.
+    // one. The second is zero where the identification names no spine.
     uint64_t data_arrivals = 0;
     uint64_t folded_arrivals = 0;
     uint64_t start_time_ns = 0;
