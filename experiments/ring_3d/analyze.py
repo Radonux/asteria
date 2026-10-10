@@ -796,6 +796,7 @@ _HOST_TRANSPORT_EVENTS: Final = frozenset(
         "allowance_gone_reports",
         "cc_exempt_granted",
         "cc_transition",
+        "path_probe",
     }
 )
 
@@ -872,6 +873,9 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
         # was asked about fewer bytes than the packet carried. Those bytes were
         # delivered, so the event carries a count and no bytes.
         "clipped_trim",
+        # A path selector's probe of a path it no longer sends data on. It
+        # carries no payload, so it is a count on the control plane.
+        "path_probe",
     }
     # Switch conversions only: trim_forgiven is the receiver's answer to one,
     # not a second conversion, and adding it would double-count the payload.

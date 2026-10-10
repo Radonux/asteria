@@ -403,7 +403,8 @@ class Ring3DAnalysisTests(unittest.TestCase):
                 "event,plane,event_count,total_bytes\n"
                 "rto_fired,control,3,0\n"
                 "cnp_taken,control,5,0\n"
-                "clipped_trim,control,2,0\n",
+                "clipped_trim,control,2,0\n"
+                "path_probe,control,7,0\n",
                 encoding="utf-8",
             )
 
@@ -420,6 +421,7 @@ class Ring3DAnalysisTests(unittest.TestCase):
         self.assertEqual(transport["rto_fired_count"], 3)
         self.assertEqual(transport["cnp_taken_count"], 5)
         self.assertEqual(transport["clipped_trim_count"], 2)
+        self.assertEqual(transport["event_counts"]["path_probe"], 7)
 
     def test_host_transport_event_must_ride_the_control_plane(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -428,13 +430,14 @@ class Ring3DAnalysisTests(unittest.TestCase):
             self.write_telemetry(telemetry, self.valid_shed_flow())
             ns3 = root / "ns3"
             ns3.mkdir()
-            (ns3 / "transport_summary.csv").write_text(
-                "event,plane,event_count,total_bytes\ncnp_taken,data,1,0\n",
-                encoding="utf-8",
-            )
-
-            with self.assertRaisesRegex(ValueError, "control plane"):
-                summarize(telemetry, ns3_dir=ns3)
+            for event in ("cnp_taken", "path_probe"):
+                (ns3 / "transport_summary.csv").write_text(
+                    f"event,plane,event_count,total_bytes\n{event},data,1,0\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(event=event):
+                    with self.assertRaisesRegex(ValueError, "control plane"):
+                        summarize(telemetry, ns3_dir=ns3)
 
     def test_a_forgiven_remainder_must_account_for_undelivered_data(
         self,
