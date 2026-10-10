@@ -835,6 +835,9 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
         "switch_trimmed_queue_drop",
         # A packet of either plane that a link's own error rate dropped.
         "link_error_drop",
+        # Data a switch dropped, telling no one, on a port that has stopped
+        # forwarding it.
+        "switch_blackhole_drop",
         "trim_ftd_admission",
         "trim_ftd_egress_queue",
         "trim_ftd_lasthop_admission",

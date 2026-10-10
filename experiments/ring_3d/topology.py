@@ -16,7 +16,9 @@ from typing import Any
 try:
     from .links import (
         ClosIndex,
+        LinkFailure,
         LinkOverride,
+        load_link_failures,
         load_link_overrides,
     )
     from .switch import (
@@ -29,7 +31,9 @@ try:
 except ImportError:
     from links import (
         ClosIndex,
+        LinkFailure,
         LinkOverride,
+        load_link_failures,
         load_link_overrides,
     )
     from switch import (
@@ -310,6 +314,7 @@ class ClosNetwork:
     host_link_delay_ns: int = DEFAULT_HOST_LINK_DELAY_NS
     switch_link_delay_ns: int = DEFAULT_SWITCH_LINK_DELAY_NS
     link_overrides: tuple[LinkOverride, ...] = ()
+    link_failures: tuple[LinkFailure, ...] = ()
 
     @property
     def live_spine_count(self) -> int:
@@ -321,6 +326,13 @@ class ClosNetwork:
             host_count=host_count,
             leaf_count=host_count // self.hosts_per_leaf,
             spine_count=self.live_spine_count,
+        )
+
+    def link_failure_config(self, host_count: int) -> str:
+        """The LINK_FAILURE lines of every failure, in profile order."""
+        index = self.clos_index(host_count)
+        return "".join(
+            line for failure in self.link_failures for line in failure.config_lines(index)
         )
     data_loss: DataPlaneLoss | None = None
     transport_recovery: TransportRecovery | None = None
@@ -367,6 +379,15 @@ class RingNetwork:
     def load_balancing(self) -> LoadBalancing:
         """A ring has no spine tier, so its switches only hash."""
         return LoadBalancing(mode="ecmp")
+
+    @property
+    def link_failures(self) -> tuple[LinkFailure, ...]:
+        """Failures name spines, which a ring has none of."""
+        return ()
+
+    def link_failure_config(self, host_count: int) -> str:
+        del host_count
+        return ""
 
 
 PhysicalNetwork = ClosNetwork | RingNetwork
@@ -902,7 +923,9 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
     }
     topology_keys = {"hosts_per_leaf", "spine_count"} if topology == "clos" else set()
     optional_topology_keys = (
-        {"failed_spine_count", "load_balancing"} if topology == "clos" else set()
+        {"failed_spine_count", "load_balancing", "link_failures"}
+        if topology == "clos"
+        else set()
     )
     unknown_keys = set(document) - common_keys - topology_keys - optional_topology_keys
     if unknown_keys:
@@ -1046,6 +1069,7 @@ def _load_geometry(
     return replace(
         clos,
         link_overrides=_load_link_overrides(document, clos, host_count, index),
+        link_failures=load_link_failures(document, index),
     )
 
 

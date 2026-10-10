@@ -1,5 +1,5 @@
-"""Per-link settings of the generated fabric: propagation delays and per-link
-overrides."""
+"""Per-link settings of the generated fabric: propagation delays, per-link
+overrides and link failures."""
 
 from __future__ import annotations
 
@@ -51,6 +51,15 @@ class LinkTests(unittest.TestCase):
             manifest = materialize(path, output)
             topology = (output / "topology.txt").read_text(encoding="utf-8")
         return manifest, topology
+
+    def _config(self, document: dict[str, Any]) -> str:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "profile.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            output = Path(temporary_directory) / "out"
+            materialize(path, output)
+            config = (output / "network_config.txt").read_text(encoding="utf-8")
+        return config.replace(temporary_directory, "<tmp>")
 
     def _refused(self, document: dict[str, Any], message: str) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -231,6 +240,87 @@ class LinkOverrideTests(LinkTests):
             {"endpoints": [SPINE, LEAF], "delay_ns": 1},
         ]
         self._refused(document, "a link an earlier override names")
+
+
+def _failure_lines(config: str) -> list[str]:
+    return [line for line in config.splitlines() if line.startswith("LINK_FAILURE")]
+
+
+class LinkFailureTests(LinkTests):
+    def test_absent_failures_write_no_line(self) -> None:
+        document = _sprayed_clos()
+        document["network"]["link_failures"] = []
+        self.assertEqual(self._config(document), self._config(_sprayed_clos()))
+        self.assertEqual(_failure_lines(self._config(document)), [])
+
+    def test_each_model_writes_its_lines(self) -> None:
+        document = _sprayed_clos()
+        document["network"]["link_failures"] = [
+            {"model": "graceful", "spine": 3, "start_ns": 200_000},
+            {"model": "silent", "spine": 1, "leaf": 4, "start_ns": 0},
+            {"model": "gray", "spine": 2, "leaf": 0, "start_ns": 5, "error_rate": 0.01},
+            {"model": "gray", "spine": 2, "leaf": 1, "start_ns": 5, "rate": "200Gbps"},
+        ]
+        lines = _failure_lines(self._config(document))
+        self.assertEqual(
+            lines,
+            [f"LINK_FAILURE 200000 down {LEAF + leaf} {SPINE + 3}" for leaf in range(8)]
+            + [
+                f"LINK_FAILURE 0 blackhole {LEAF + 4} {SPINE + 1}",
+                f"LINK_FAILURE 5 loss {LEAF} {SPINE + 2} 0.01",
+                f"LINK_FAILURE 5 rate {LEAF + 1} {SPINE + 2} 200Gbps",
+            ],
+        )
+        manifest, _ = self._materialize(document)
+        self.assertEqual(
+            manifest["link_failures"][2],
+            {"model": "gray", "start_ns": 5, "spine": 2, "leaf": 0, "error_rate": 0.01,
+             "rate": None},
+        )
+
+    def test_failures_refuse_what_they_cannot_mean(self) -> None:
+        cases = (
+            ({"model": "crash", "spine": 0, "start_ns": 0}, "model must be one of"),
+            ({"model": "graceful", "spine": 0}, "must contain model, start_ns and spine"),
+            ({"model": "graceful", "spine": 0, "start_ns": 0, "error_rate": 0.1},
+             "must contain model, start_ns and spine"),
+            ({"model": "gray", "spine": 0, "start_ns": 0}, "sets one of error_rate and rate"),
+            ({"model": "gray", "spine": 0, "start_ns": 0, "error_rate": 0.1, "rate": "200Gbps"},
+             "sets one of error_rate and rate"),
+            ({"model": "gray", "spine": 0, "start_ns": 0, "error_rate": 2},
+             r"error_rate must be a number in \(0, 1\]"),
+            ({"model": "gray", "spine": 0, "start_ns": 0, "rate": "fast"},
+             "must be a rate such as 200Gbps"),
+            ({"model": "silent", "spine": 8, "start_ns": 0}, r"spine must be an integer in \[0, 8\)"),
+            ({"model": "silent", "spine": 0, "leaf": -1, "start_ns": 0},
+             r"leaf must be an integer in \[0, 8\)"),
+            ({"model": "silent", "spine": 0, "start_ns": -1}, "start_ns must be a nonnegative"),
+        )
+        for failure, message in cases:
+            document = _sprayed_clos()
+            document["network"]["link_failures"] = [failure]
+            with self.subTest(failure=failure):
+                self._refused(document, message)
+        document = _sprayed_clos()
+        document["network"]["link_failures"] = [
+            {"model": "silent", "spine": 0, "start_ns": 0},
+            {"model": "gray", "spine": 0, "leaf": 3, "start_ns": 9, "error_rate": 0.1},
+        ]
+        self._refused(document, "a link an earlier failure names")
+        document["network"]["link_failures"] = [
+            {"model": "graceful", "spine": spine, "leaf": 2, "start_ns": 0}
+            for spine in range(8)
+        ]
+        self._refused(document, "must leave every leaf a link to a spine")
+
+    def test_a_ring_has_no_spine_to_fail(self) -> None:
+        document = json.loads(
+            (PROFILES / "model_100b_256_ring.json").read_text(encoding="utf-8")
+        )
+        document["network"]["link_failures"] = [
+            {"model": "graceful", "spine": 0, "start_ns": 0}
+        ]
+        self._refused(document, "unknown network keys")
 
 
 if __name__ == "__main__":

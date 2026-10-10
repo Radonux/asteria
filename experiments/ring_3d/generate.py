@@ -1352,6 +1352,7 @@ def write_network_config(
     link_rate: str,
     load_balancing: LoadBalancing,
     switch: SwitchProfile,
+    link_failure_settings: str,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     # The bundled ns-3 setup unconditionally opens these legacy input files,
@@ -1480,6 +1481,7 @@ def write_network_config(
             f"{switch.ecn_threshold_maps(congestion_control.ecn_threshold_maps())}"
             f"{switch.probability_map()}"
             f"{fabric_settings}"
+            f"{link_failure_settings}"
         )
 
 
@@ -1815,6 +1817,7 @@ def materialize(
         profile.network.link_rate,
         profile.network.load_balancing,
         profile.network.switch,
+        profile.network.link_failure_config(profile.ranks),
     )
     experiment_config = output_dir / "experiment.json"
     write_experiment_config(
@@ -1897,6 +1900,9 @@ def materialize(
         "load_balancing": profile.network.load_balancing.manifest(),
         "link_overrides": [
             override.manifest() for override in profile.network.link_overrides
+        ],
+        "link_failures": [
+            failure.manifest() for failure in profile.network.link_failures
         ],
         "switch": profile.network.switch.manifest(),
         "fabric": (
