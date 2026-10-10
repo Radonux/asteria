@@ -1835,6 +1835,36 @@ class Ring3DGeneratorTests(unittest.TestCase):
             )
             self.assertIn("\nUE_EV_SET_SIZE 64\nUE_SATURATION_FRACTION 0.75\n", config)
 
+            manifest, config = generated({"mode": "ev_hash", "selector": "mrc"})
+            self.assertEqual(
+                manifest,
+                {
+                    "mode": "ev_hash",
+                    "selector": "mrc",
+                    "ev_set_size": 128,
+                    "skip_base_rtts": 1.0,
+                    "probe_timeouts": 1.0,
+                },
+            )
+            self.assertIn(
+                "\nPATH_SELECTOR mrc\nMRC_EV_SET_SIZE 128\nMRC_SKIP_BASE_RTTS 1.0\n"
+                "MRC_PROBE_TIMEOUTS 1.0\n",
+                config,
+            )
+            manifest, config = generated(
+                {
+                    "mode": "ev_hash",
+                    "selector": "mrc",
+                    "ev_set_size": 256,
+                    "skip_base_rtts": 2,
+                    "probe_timeouts": 0.5,
+                }
+            )
+            self.assertIn(
+                "\nMRC_EV_SET_SIZE 256\nMRC_SKIP_BASE_RTTS 2.0\nMRC_PROBE_TIMEOUTS 0.5\n",
+                config,
+            )
+
     def test_path_selector_refuses_what_nothing_would_read(self) -> None:
         document = json.loads(
             (
@@ -1874,6 +1904,16 @@ class Ring3DGeneratorTests(unittest.TestCase):
             refusals += [
                 ({**ue, "saturation_fraction": fraction}, "saturation_fraction must be")
                 for fraction in (0, 1.5, "half")
+            ]
+            mrc = {"mode": "ev_hash", "selector": "mrc"}
+            refusals += [
+                ({**mrc, "saturation_fraction": 0.5}, "'mrc' does not take"),
+                ({**mrc, "ev_set_size": 0}, "ev_set_size must be"),
+            ]
+            refusals += [
+                ({**mrc, knob: value}, f"{knob} must be a positive number")
+                for knob in ("skip_base_rtts", "probe_timeouts")
+                for value in (0, -1.0, True, float("inf"))
             ]
             for balancing, message in refusals:
                 document["network"]["load_balancing"] = balancing

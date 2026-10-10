@@ -59,7 +59,7 @@ DATA_LOSS_SCOPES = {
 PACKET_TRIM_MODES = {"ftd", "bts"}
 LOAD_BALANCING_MODES = {"ecmp", "ev_hash", "spray_uniform"}
 # What chooses each data packet's entropy value under ev_hash.
-PATH_SELECTORS = ("ops", "reps", "ue_oblivious", "ue_aware")
+PATH_SELECTORS = ("ops", "reps", "ue_oblivious", "ue_aware", "mrc")
 # The ns-3 CC_MODE number of each congestion_control.mode. 12 is no sender
 # reaction at all: a queue pair is set to link rate at creation and nothing ever
 # changes it. 1 is Mellanox DCQCN. 11 is UEC NSCC, a window per queue pair
@@ -196,9 +196,10 @@ class LoadBalancing:
     a 16-bit entropy value per packet to that hash, which ``selector`` chooses:
     ``ops`` draws it afresh, ``reps`` reuses the values that came back on
     unmarked acknowledgements, ``ue_oblivious`` rotates through a set of
-    values, and ``ue_aware`` rotates skipping a value once after a congestion
-    report. ``spray_uniform`` has the sender name a spine per packet, uniformly
-    at random, and the source leaf send the packet up that spine. Every mode but
+    values, ``ue_aware`` rotates skipping a value once after a congestion
+    report, and ``mrc`` rotates over values it holds GOOD, skipped or assumed
+    bad. ``spray_uniform`` has the sender name a spine per packet, uniformly at
+    random, and the source leaf send the packet up that spine. Every mode but
     ``ecmp`` reorders a flow's packets on the way.
     """
 
@@ -625,6 +626,17 @@ def _ev_set_size(value: Any, field: str) -> int:
     return value
 
 
+def _positive_number(value: Any, field: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{field} must be a positive number")
+    return float(value)
+
+
 # UEC 1.0.3 section 3.6.16.3's typical space.
 _UE_EV_SET_SIZE = SelectorParameter("ev_set_size", "UE_EV_SET_SIZE", 256, _ev_set_size)
 SELECTOR_PARAMETERS: dict[str, tuple[SelectorParameter, ...]] = {
@@ -642,6 +654,18 @@ SELECTOR_PARAMETERS: dict[str, tuple[SelectorParameter, ...]] = {
         _UE_EV_SET_SIZE,
         SelectorParameter(
             "saturation_fraction", "UE_SATURATION_FRACTION", 0.5, _fraction
+        ),
+    ),
+    # A set within OCP MRC 1.0 section 11.2.1's one to two windows; a SKIP
+    # value out of use for a round trip, as UEC 1.0.3 section 3.6.16.4 keeps a
+    # marked one; an assumed-bad value probed once per retransmission timeout.
+    "mrc": (
+        SelectorParameter("ev_set_size", "MRC_EV_SET_SIZE", 128, _ev_set_size),
+        SelectorParameter(
+            "skip_base_rtts", "MRC_SKIP_BASE_RTTS", 1.0, _positive_number
+        ),
+        SelectorParameter(
+            "probe_timeouts", "MRC_PROBE_TIMEOUTS", 1.0, _positive_number
         ),
     ),
 }
