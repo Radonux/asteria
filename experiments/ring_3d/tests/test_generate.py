@@ -1895,10 +1895,14 @@ class Ring3DGeneratorTests(unittest.TestCase):
                     "mode": "spray_policy",
                     "report_interval_base_rtts": 2.0,
                     "estimator_gain": 0.0625,
+                    "estimator_interval_samples": 0,
                     "mark_cusum_slack": 0.125,
                     "mark_cusum_threshold": 0.5,
                     "mark_thresholds": (0.25, 0.5, 0.75),
                     "hold_down_intervals": 4,
+                    "absence_fraction_of_median": 0.125,
+                    "absence_minimum_median": 16,
+                    "grade_reference": "absolute",
                     "one_way_delay": False,
                     "gamma": 0.25,
                     "epsilon": 0.02,
@@ -1911,10 +1915,14 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 "\nLOAD_BALANCING spray_policy\n"
                 "SPRAY_REPORT_INTERVAL_BASE_RTTS 2.0\n"
                 "SPRAY_ESTIMATOR_GAIN 0.0625\n"
+                "SPRAY_ESTIMATOR_INTERVAL_SAMPLES 0\n"
                 "SPRAY_MARK_CUSUM_SLACK 0.125\n"
                 "SPRAY_MARK_CUSUM_THRESHOLD 0.5\n"
                 "SPRAY_MARK_THRESHOLDS 0.25 0.5 0.75\n"
                 "SPRAY_HOLD_DOWN_INTERVALS 4\n"
+                "SPRAY_ABSENCE_FRACTION_OF_MEDIAN 0.125\n"
+                "SPRAY_ABSENCE_MINIMUM_MEDIAN 16\n"
+                "SPRAY_GRADE_REFERENCE absolute\n"
                 "SPRAY_ONE_WAY_DELAY 0\n"
                 "SPRAY_GAMMA 0.25\n"
                 "SPRAY_EPSILON 0.02\n"
@@ -1933,10 +1941,14 @@ class Ring3DGeneratorTests(unittest.TestCase):
                     "mode": "spray_policy",
                     "report_interval_base_rtts": 3,
                     "estimator_gain": 0.5,
+                    "estimator_interval_samples": 32,
                     "mark_cusum_slack": 0,
                     "mark_cusum_threshold": 1,
                     "mark_thresholds": [0.1, 0.2, 0.9],
                     "hold_down_intervals": 0,
+                    "absence_fraction_of_median": 0,
+                    "absence_minimum_median": 8,
+                    "grade_reference": "median",
                     "gamma": 1,
                     "epsilon": 0,
                     "candidates": 3,
@@ -1952,10 +1964,14 @@ class Ring3DGeneratorTests(unittest.TestCase):
             self.assertIn(
                 "\nSPRAY_REPORT_INTERVAL_BASE_RTTS 3.0\n"
                 "SPRAY_ESTIMATOR_GAIN 0.5\n"
+                "SPRAY_ESTIMATOR_INTERVAL_SAMPLES 32\n"
                 "SPRAY_MARK_CUSUM_SLACK 0.0\n"
                 "SPRAY_MARK_CUSUM_THRESHOLD 1.0\n"
                 "SPRAY_MARK_THRESHOLDS 0.1 0.2 0.9\n"
                 "SPRAY_HOLD_DOWN_INTERVALS 0\n"
+                "SPRAY_ABSENCE_FRACTION_OF_MEDIAN 0.0\n"
+                "SPRAY_ABSENCE_MINIMUM_MEDIAN 8\n"
+                "SPRAY_GRADE_REFERENCE median\n"
                 "SPRAY_ONE_WAY_DELAY 1\n"
                 "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS 0.25\n"
                 "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS 2.0\n"
@@ -1990,6 +2006,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
             ({"mode": "ev_hash", "gamma": 0.5}, "'ops' does not take"),
             ({**policy, "one_way_delay": 1}, "one_way_delay must be a boolean"),
             ({**policy, "candidate_draw": "best"}, "candidate_draw must be"),
+            ({**policy, "grade_reference": "rank"}, "grade_reference must be"),
             ({**policy, "mark_thresholds": [0.5, 0.25, 0.75]}, "must increase"),
             ({**policy, "mark_thresholds": [0.25, 0.5]}, "three thresholds"),
             (
@@ -2011,6 +2028,9 @@ class Ring3DGeneratorTests(unittest.TestCase):
             ("mark_cusum_slack", (-0.1, True, float("nan"))),
             ("mark_cusum_threshold", (0, True)),
             ("hold_down_intervals", (-1, 1.5, True)),
+            ("absence_fraction_of_median", (-0.1, 1, True, "eighth")),
+            ("absence_minimum_median", (0, 1.5, True)),
+            ("estimator_interval_samples", (-1, 2.5, True)),
             ("gamma", (0, 1.25, True)),
             ("epsilon", (-0.01, 1.01, True)),
             ("candidates", (0, 2.0, True)),

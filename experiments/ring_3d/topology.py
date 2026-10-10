@@ -744,6 +744,23 @@ def _candidate_draw(value: Any, field: str) -> str:
     return value
 
 
+def _absence_fraction(value: Any, field: str) -> float:
+    # Zero holds no spine down for its absence; at one every spine would be.
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not 0 <= value < 1
+    ):
+        raise ValueError(f"{field} must be a number in [0, 1)")
+    return float(value)
+
+
+def _grade_reference(value: Any, field: str) -> str:
+    if value not in ("absolute", "median"):
+        raise ValueError(f"{field} must be 'absolute' or 'median'")
+    return value
+
+
 def _window_penalty(value: Any, field: str) -> int:
     # UEC 1.0.3 section 3.6.13.2's Rcv_Cwnd_Pend is seven bits.
     if _nonnegative_int(value, field) > 127:
@@ -752,12 +769,14 @@ def _window_penalty(value: Any, field: str) -> int:
 
 
 # spray_policy's receiver, then its sender. One report per loaded round trip,
-# about two base RTTs; DCTCP's
-# gain of 1/16 on the marked fraction; CUSUM slack of half a grade's width and
-# a threshold of two; grades in four equal bands of the marked fraction and,
-# with one-way delay, of the delay up to NSCC's target_qdelay of 0.75 base
-# RTTs; gamma 0.25 and epsilon 0.02, and one candidate, as the design gives
-# them; NSCC's Rcv_Cwnd_Pend example of 64.
+# about two base RTTs; DCTCP's gain of 1/16 on the marked fraction, which an
+# interval's own fraction never replaces; CUSUM slack of half a grade's width
+# and a threshold of two; grades in four equal bands of the marked fraction
+# and, with one-way delay, of the delay up to NSCC's target_qdelay of 0.75 base
+# RTTs, against no reference; a spine held down for arriving below an eighth of
+# the median spine's arrivals once that median is 16; gamma 0.25 and epsilon
+# 0.02, and one candidate, as the design gives them; NSCC's Rcv_Cwnd_Pend
+# example of 64.
 POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "report_interval_base_rtts",
@@ -766,6 +785,12 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
         _positive_number,
     ),
     BalancingParameter("estimator_gain", "SPRAY_ESTIMATOR_GAIN", 0.0625, _fraction),
+    BalancingParameter(
+        "estimator_interval_samples",
+        "SPRAY_ESTIMATOR_INTERVAL_SAMPLES",
+        0,
+        _nonnegative_int,
+    ),
     BalancingParameter(
         "mark_cusum_slack", "SPRAY_MARK_CUSUM_SLACK", 0.125, _nonnegative_number
     ),
@@ -780,6 +805,18 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     ),
     BalancingParameter(
         "hold_down_intervals", "SPRAY_HOLD_DOWN_INTERVALS", 4, _nonnegative_int
+    ),
+    BalancingParameter(
+        "absence_fraction_of_median",
+        "SPRAY_ABSENCE_FRACTION_OF_MEDIAN",
+        0.125,
+        _absence_fraction,
+    ),
+    BalancingParameter(
+        "absence_minimum_median", "SPRAY_ABSENCE_MINIMUM_MEDIAN", 16, _positive_int
+    ),
+    BalancingParameter(
+        "grade_reference", "SPRAY_GRADE_REFERENCE", "absolute", _grade_reference
     ),
     BalancingParameter("one_way_delay", "SPRAY_ONE_WAY_DELAY", False, _flag),
     BalancingParameter(
