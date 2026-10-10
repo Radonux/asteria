@@ -1,4 +1,5 @@
-"""Per-link settings of the generated fabric: propagation delays."""
+"""Per-link settings of the generated fabric: propagation delays and per-link
+overrides."""
 
 from __future__ import annotations
 
@@ -118,6 +119,118 @@ class LinkDelayTests(LinkTests):
                 document["network"][key] = value
                 with self.subTest(key=key, value=value):
                     self._refused(document, f"network.{key} must be a positive integer")
+
+
+# Node ids of the 64-host fabric: hosts 0-63, leaves 64-71, spines 72-79.
+LEAF = 64
+SPINE = 72
+
+
+def _line(topology: str, a: int, b: int) -> str:
+    return next(
+        line
+        for line in topology.splitlines()[2:]
+        if sorted(map(int, line.split()[:2])) == sorted((a, b))
+    )
+
+
+class LinkOverrideTests(LinkTests):
+    def test_an_override_changes_its_link_alone(self) -> None:
+        document = _sprayed_clos()
+        document["network"]["host_link_delay_ns"] = 1_000
+        document["network"]["switch_link_delay_ns"] = 2_000
+        _, plain = self._materialize(document)
+        document["network"]["link_overrides"] = [
+            {"leaf": 2, "spine": 5, "rate": "200Gbps", "delay_ns": 4_000, "error_rate": 0.01},
+            {"endpoints": [3, LEAF], "delay_ns": 1_500},
+        ]
+        manifest, topology = self._materialize(document)
+        self.assertEqual(
+            _line(topology, LEAF + 2, SPINE + 5), "66 77 200Gbps 0.004ms 0.01"
+        )
+        self.assertEqual(_line(topology, 3, LEAF), "3 64 400Gbps 0.0015ms 0")
+        changed = set(topology.splitlines()) - set(plain.splitlines())
+        self.assertEqual(len(changed), 2)
+        self.assertEqual(
+            manifest["link_overrides"],
+            [
+                {"endpoints": [66, 77], "rate": "200Gbps", "delay_ns": 4_000, "error_rate": 0.01},
+                {"endpoints": [3, 64], "rate": None, "delay_ns": 1_500, "error_rate": None},
+            ],
+        )
+
+    def test_leaf_and_spine_name_the_link_endpoints_name(self) -> None:
+        by_index = _sprayed_clos()
+        by_index["network"]["link_overrides"] = [{"leaf": 7, "spine": 0, "rate": "200Gbps"}]
+        by_nodes = _sprayed_clos()
+        by_nodes["network"]["link_overrides"] = [
+            {"endpoints": [SPINE, LEAF + 7], "rate": "200Gbps"}
+        ]
+        self.assertEqual(self._materialize(by_index)[1], self._materialize(by_nodes)[1])
+
+    def test_a_slow_spine_leaves_the_base_rtt_and_a_slow_host_does_not(self) -> None:
+        """The base RTT takes the best shortest-hop path, as ns-3 now does."""
+        document = _sprayed_clos()
+        document["network"]["host_link_delay_ns"] = 1_000
+        document["network"]["switch_link_delay_ns"] = 2_000
+        document["network"]["link_overrides"] = [
+            {"leaf": leaf, "spine": 7, "rate": "200Gbps", "delay_ns": 4_000}
+            for leaf in range(8)
+        ]
+        manifest, _ = self._materialize(document)
+        self.assertEqual(manifest["switch"]["config_base_rtt_ns"], 12_324)
+        # Host 0's link at 200 Gb/s and 3000 ns: 163 ns a packet on it.
+        document["network"]["link_overrides"] = [
+            {"endpoints": [0, LEAF], "rate": "200Gbps", "delay_ns": 3_000}
+        ]
+        manifest, _ = self._materialize(document)
+        self.assertEqual(
+            manifest["switch"]["config_base_rtt_ns"],
+            2 * (3_000 + 2_000 + 2_000 + 1_000) + 163 + 3 * 81,
+        )
+
+    def test_a_ring_link_is_named_by_its_endpoints(self) -> None:
+        document = json.loads(
+            (PROFILES / "model_100b_256_ring.json").read_text(encoding="utf-8")
+        )
+        hosts = 256
+        document["network"]["link_overrides"] = [
+            {"endpoints": [hosts, hosts + 1], "error_rate": 0.5}
+        ]
+        _, topology = self._materialize(document)
+        self.assertTrue(_line(topology, hosts, hosts + 1).endswith(" 0.5"))
+        document["network"]["link_overrides"] = [{"leaf": 0, "spine": 0, "error_rate": 0.5}]
+        self._refused(document, "names a leaf and spine, which a ring has not")
+
+    def test_overrides_refuse_what_they_cannot_mean(self) -> None:
+        cases = (
+            ({"leaf": 0}, "must name 'endpoints' or 'leaf' and 'spine'"),
+            ({"leaf": 0, "spine": 0, "endpoints": [0, LEAF], "rate": "200Gbps"},
+             "must name 'endpoints' or 'leaf' and 'spine'"),
+            ({"leaf": 0, "spine": 0, "speed": "200Gbps"},
+             "must name 'endpoints' or 'leaf' and 'spine'"),
+            ({"leaf": 0, "spine": 0}, "must set one of"),
+            ({"leaf": 8, "spine": 0, "rate": "200Gbps"}, r"leaf must be an integer in \[0, 8\)"),
+            ({"leaf": 0, "spine": 8, "rate": "200Gbps"}, r"spine must be an integer in \[0, 8\)"),
+            ({"endpoints": [0, 1], "rate": "200Gbps"}, "which no link joins"),
+            ({"endpoints": [0], "rate": "200Gbps"}, "endpoints must be two node ids"),
+            ({"leaf": 0, "spine": 0, "rate": "300Gbps"}, "the switch ECN table covers"),
+            ({"leaf": 0, "spine": 0, "rate": "200G"}, "must be a rate such as 200Gbps"),
+            ({"leaf": 0, "spine": 0, "delay_ns": 0}, "delay_ns must be a positive integer"),
+            ({"leaf": 0, "spine": 0, "error_rate": 0}, r"error_rate must be a number in \(0, 1\]"),
+            ({"leaf": 0, "spine": 0, "error_rate": 1.5}, r"error_rate must be a number in \(0, 1\]"),
+        )
+        for override, message in cases:
+            document = _sprayed_clos()
+            document["network"]["link_overrides"] = [override]
+            with self.subTest(override=override):
+                self._refused(document, message)
+        document = _sprayed_clos()
+        document["network"]["link_overrides"] = [
+            {"leaf": 0, "spine": 0, "rate": "200Gbps"},
+            {"endpoints": [SPINE, LEAF], "delay_ns": 1},
+        ]
+        self._refused(document, "a link an earlier override names")
 
 
 if __name__ == "__main__":

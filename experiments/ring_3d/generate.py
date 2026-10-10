@@ -1895,6 +1895,9 @@ def materialize(
             profile.network.link_rate
         ),
         "load_balancing": profile.network.load_balancing.manifest(),
+        "link_overrides": [
+            override.manifest() for override in profile.network.link_overrides
+        ],
         "switch": profile.network.switch.manifest(),
         "fabric": (
             profile.network.fabric.manifest()

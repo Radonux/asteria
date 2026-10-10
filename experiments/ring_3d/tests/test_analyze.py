@@ -1053,6 +1053,28 @@ class Ring3DAnalysisTests(unittest.TestCase):
                 summary["transport_recovery"]["trim_lasthop_notification_count"], 1
             )
 
+    def test_summary_counts_drops_on_a_lossy_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            telemetry = root / "telemetry"
+            self.write_telemetry(telemetry, self.valid_shed_flow())
+            ns3 = root / "ns3"
+            ns3.mkdir()
+            (ns3 / "transport_summary.csv").write_text(
+                "event,plane,event_count,total_bytes\n"
+                "link_error_drop,control,3,144\n"
+                "link_error_drop,data,2,8292\n",
+                encoding="utf-8",
+            )
+
+            transport = summarize(telemetry, ns3_dir=ns3)["ns3_observability"][
+                "transport"
+            ]
+
+            self.assertEqual(transport["event_counts"]["link_error_drop"], 5)
+            self.assertEqual(transport["event_bytes"]["link_error_drop"], 8436)
+            self.assertEqual(transport["plane_event_counts"], {"data": 2, "control": 3})
+
     def test_summary_requires_exact_expected_rank_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             telemetry = Path(temporary_directory) / "telemetry"

@@ -833,6 +833,8 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
         # A trimmed packet stays subject to the TC_med drop threshold at the
         # trimming switch and every downstream hop (UEC 1.0.3 section 4.1).
         "switch_trimmed_queue_drop",
+        # A packet of either plane that a link's own error rate dropped.
+        "link_error_drop",
         "trim_ftd_admission",
         "trim_ftd_egress_queue",
         "trim_ftd_lasthop_admission",

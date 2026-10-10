@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from .links import (
+        ClosIndex,
+        LinkOverride,
+        load_link_overrides,
+    )
     from .switch import (
         ECN_THRESHOLDS_KB,
         DefaultSwitch,
@@ -22,6 +27,11 @@ try:
         load_switch_request,
     )
 except ImportError:
+    from links import (
+        ClosIndex,
+        LinkOverride,
+        load_link_overrides,
+    )
     from switch import (
         ECN_THRESHOLDS_KB,
         DefaultSwitch,
@@ -299,10 +309,19 @@ class ClosNetwork:
     failed_spine_count: int = 0
     host_link_delay_ns: int = DEFAULT_HOST_LINK_DELAY_NS
     switch_link_delay_ns: int = DEFAULT_SWITCH_LINK_DELAY_NS
+    link_overrides: tuple[LinkOverride, ...] = ()
 
     @property
     def live_spine_count(self) -> int:
         return self.spine_count - self.failed_spine_count
+
+    def clos_index(self, host_count: int) -> ClosIndex:
+        """Node ids of the built fabric's leaves and spines."""
+        return ClosIndex(
+            host_count=host_count,
+            leaf_count=host_count // self.hosts_per_leaf,
+            spine_count=self.live_spine_count,
+        )
     data_loss: DataPlaneLoss | None = None
     transport_recovery: TransportRecovery | None = None
     packet_trimming: PacketTrimming | None = None
@@ -332,6 +351,7 @@ class RingNetwork:
     queue_monitor_interval_ns: int
     host_link_delay_ns: int = DEFAULT_HOST_LINK_DELAY_NS
     switch_link_delay_ns: int = DEFAULT_SWITCH_LINK_DELAY_NS
+    link_overrides: tuple[LinkOverride, ...] = ()
     data_loss: DataPlaneLoss | None = None
     transport_recovery: TransportRecovery | None = None
     packet_trimming: PacketTrimming | None = None
@@ -359,6 +379,12 @@ class TopologyLink:
     source: int
     destination: int
     delay_ns: int
+    rate: str
+    error_rate: float = 0.0
+
+    @property
+    def rate_bps(self) -> int:
+        return link_rate_bits_per_second(self.rate)
 
 
 @dataclass(frozen=True)
@@ -408,8 +434,9 @@ class TopologyLayout:
             topology.write(" ".join(str(node) for node in self.switch_ids) + "\n")
             for link in self.links:
                 topology.write(
-                    f"{link.source} {link.destination} {self.link_rate} "
-                    f"{_milliseconds(link.delay_ns)}ms 0\n"
+                    f"{link.source} {link.destination} {link.rate} "
+                    f"{_milliseconds(link.delay_ns)}ms "
+                    f"{format(link.error_rate, '.17g')}\n"
                 )
 
     def manifest(self) -> dict[str, int | str]:
@@ -871,6 +898,7 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
         "switch",
         "host_link_delay_ns",
         "switch_link_delay_ns",
+        "link_overrides",
     }
     topology_keys = {"hosts_per_leaf", "spine_count"} if topology == "clos" else set()
     optional_topology_keys = (
@@ -974,13 +1002,16 @@ def _load_geometry(
     if topology == "ring":
         if host_count < 3:
             raise ValueError("network.ring requires at least three hosts")
-        return RingNetwork(
+        ring = RingNetwork(
             link_rate=link_rate,
             packet_payload_bytes=packet_payload_bytes,
             queue_monitor_start_ns=queue_monitor_start_ns,
             queue_monitor_interval_ns=queue_monitor_interval_ns,
             host_link_delay_ns=host_link_delay_ns,
             switch_link_delay_ns=switch_link_delay_ns,
+        )
+        return replace(
+            ring, link_overrides=_load_link_overrides(document, ring, host_count, None)
         )
 
     hosts_per_leaf = _positive_int(document["hosts_per_leaf"], "network.hosts_per_leaf")
@@ -1000,7 +1031,7 @@ def _load_geometry(
         raise ValueError(
             "network.failed_spine_count must leave at least one live spine"
         )
-    return ClosNetwork(
+    clos = ClosNetwork(
         link_rate=link_rate,
         packet_payload_bytes=packet_payload_bytes,
         queue_monitor_start_ns=queue_monitor_start_ns,
@@ -1010,6 +1041,27 @@ def _load_geometry(
         failed_spine_count=failed_value,
         host_link_delay_ns=host_link_delay_ns,
         switch_link_delay_ns=switch_link_delay_ns,
+    )
+    index = clos.clos_index(host_count)
+    return replace(
+        clos,
+        link_overrides=_load_link_overrides(document, clos, host_count, index),
+    )
+
+
+def _load_link_overrides(
+    document: dict[str, Any],
+    network: PhysicalNetwork,
+    host_count: int,
+    index: ClosIndex | None,
+) -> tuple[LinkOverride, ...]:
+    """The overrides, checked against the links the fabric builds."""
+    links = build_topology(network, host_count).links
+    return load_link_overrides(
+        document,
+        ((link.source, link.destination) for link in links),
+        index,
+        (rate for rate, _, _ in ECN_THRESHOLDS_KB),
     )
 
 
@@ -1084,12 +1136,16 @@ def _build_clos_topology(network: ClosNetwork, host_count: int) -> TopologyLayou
             source=host,
             destination=leaf_start + host // network.hosts_per_leaf,
             delay_ns=network.host_link_delay_ns,
+            rate=network.link_rate,
         )
         for host in range(host_count)
     ]
     links.extend(
         TopologyLink(
-            source=leaf, destination=spine, delay_ns=network.switch_link_delay_ns
+            source=leaf,
+            destination=spine,
+            delay_ns=network.switch_link_delay_ns,
+            rate=network.link_rate,
         )
         for leaf in range(leaf_start, spine_start)
         for spine in range(spine_start, node_count)
@@ -1104,7 +1160,7 @@ def _build_clos_topology(network: ClosNetwork, host_count: int) -> TopologyLayou
         host_count=host_count,
         node_count=node_count,
         switch_ids=tuple(range(leaf_start, node_count)),
-        links=tuple(links),
+        links=_overridden(links, network.link_overrides),
         link_rate=network.link_rate,
         details=(
             ("leaf_count", leaf_count),
@@ -1126,6 +1182,7 @@ def _build_ring_topology(network: RingNetwork, host_count: int) -> TopologyLayou
             source=host,
             destination=switch_start + host,
             delay_ns=network.host_link_delay_ns,
+            rate=network.link_rate,
         )
         for host in range(host_count)
     ]
@@ -1134,6 +1191,7 @@ def _build_ring_topology(network: RingNetwork, host_count: int) -> TopologyLayou
             source=switch_start + index,
             destination=switch_start + (index + 1) % host_count,
             delay_ns=network.switch_link_delay_ns,
+            rate=network.link_rate,
         )
         for index in range(host_count)
     )
@@ -1143,7 +1201,7 @@ def _build_ring_topology(network: RingNetwork, host_count: int) -> TopologyLayou
         host_count=host_count,
         node_count=host_count * 2,
         switch_ids=switch_ids,
-        links=tuple(links),
+        links=_overridden(links, network.link_overrides),
         link_rate=network.link_rate,
         details=(
             ("switch_ring_size", host_count),
@@ -1151,3 +1209,25 @@ def _build_ring_topology(network: RingNetwork, host_count: int) -> TopologyLayou
             ("switch_link_delay_ns", network.switch_link_delay_ns),
         ),
     )
+
+
+def _overridden(
+    links: list[TopologyLink], overrides: tuple[LinkOverride, ...]
+) -> tuple[TopologyLink, ...]:
+    """The links with each override's settings in place of the fabric's."""
+    by_link = {tuple(sorted(override.endpoints)): override for override in overrides}
+    result = []
+    for link in links:
+        override = by_link.get(tuple(sorted((link.source, link.destination))))
+        if override is None:
+            result.append(link)
+            continue
+        result.append(
+            replace(
+                link,
+                rate=override.rate or link.rate,
+                delay_ns=override.delay_ns or link.delay_ns,
+                error_rate=override.error_rate or link.error_rate,
+            )
+        )
+    return tuple(result)

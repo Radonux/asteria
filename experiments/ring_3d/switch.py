@@ -52,6 +52,9 @@ class _Link(Protocol):
     destination: int
     delay_ns: int
 
+    @property
+    def rate_bps(self) -> int: ...
+
 
 class _Layout(Protocol):
     host_count: int
@@ -164,61 +167,83 @@ def _whole_kb(value: Decimal) -> int:
     )
 
 
-def longest_round_trip_ns(layout: _Layout, payload_bytes: int, link_bps: int) -> int:
+def longest_round_trip_ns(layout: _Layout, payload_bytes: int) -> int:
     """The longest unloaded host-to-host round trip, as ns-3 computes maxRtt.
 
-    The backend routes over shortest-hop paths through switches only and takes
-    twice the one-way propagation delay plus one data packet's serialization at
-    every hop of the way out. Every link runs at ``link_bps``. Among the
-    shortest-hop paths between two switches the fastest is taken; in the
-    generated fabrics they all have one delay.
+    The backend routes over shortest-hop paths through switches only. A pair's
+    round trip is twice the least one-way propagation among those paths plus
+    the least serialization of one data packet along one of them, each link
+    serializing at its own rate. A host's own link adds twice its delay and one
+    packet time at either end.
     """
-    hop_serialization = payload_bytes * 1_000_000_000 * 8 // link_bps
+    def cost(link: _Link) -> tuple[int, int]:
+        return link.delay_ns, payload_bytes * 1_000_000_000 * 8 // link.rate_bps
+
     hosts = range(layout.host_count)
-    neighbours: dict[int, list[tuple[int, int]]] = {}
-    attachment: dict[int, tuple[int, int]] = {}
+    neighbours: dict[int, list[tuple[int, int, int]]] = {}
+    access: dict[int, list[int]] = {}  # switch -> each attached host's link cost
+    attached: set[int] = set()
     for link in layout.links:
-        delay = link.delay_ns
+        delay, serialization = cost(link)
         if link.source in hosts or link.destination in hosts:
             host, switch = sorted((link.source, link.destination))
-            if host in attachment:
+            if host in attached:
                 raise ValueError("a host attaches to more than one switch")
-            attachment[host] = (switch, delay)
+            attached.add(host)
+            access.setdefault(switch, []).append(2 * delay + serialization)
         else:
-            neighbours.setdefault(link.source, []).append((link.destination, delay))
-            neighbours.setdefault(link.destination, []).append((link.source, delay))
-    if len(attachment) != layout.host_count:
+            neighbours.setdefault(link.source, []).append(
+                (link.destination, delay, serialization)
+            )
+            neighbours.setdefault(link.destination, []).append(
+                (link.source, delay, serialization)
+            )
+    if len(attached) != layout.host_count:
         raise ValueError("every host must attach to one switch")
-    # Per attachment switch: its hosts' longest access delay and host count.
-    edges: dict[int, tuple[int, int]] = {}
-    for switch, delay in attachment.values():
-        longest, count = edges.get(switch, (0, 0))
-        edges[switch] = (max(longest, delay), count + 1)
+    for costs in access.values():
+        costs.sort(reverse=True)
     longest_rtt = 0
-    for source, (source_delay, source_hosts) in edges.items():
-        # Breadth first over switches, keeping (hops, delay) per switch.
-        reached = {source: (0, 0)}
+    for source, source_costs in access.items():
+        # Breadth first over switches, keeping per switch its hop count and the
+        # least delay and serialization of the paths of that many hops.
+        reached = {source: (0, 0, 0)}
         frontier = [source]
         while frontier:
             following = []
             for switch in frontier:
-                hops, delay = reached[switch]
-                for neighbour, link_delay in neighbours.get(switch, ()):
-                    candidate = (hops + 1, delay + link_delay)
+                hops, delay, serialization = reached[switch]
+                for neighbour, link_delay, link_serialization in neighbours.get(
+                    switch, ()
+                ):
+                    candidate = (
+                        hops + 1,
+                        delay + link_delay,
+                        serialization + link_serialization,
+                    )
                     if neighbour not in reached:
                         reached[neighbour] = candidate
                         following.append(neighbour)
-                    elif candidate < reached[neighbour]:
-                        reached[neighbour] = candidate
+                    elif reached[neighbour][0] == hops + 1:
+                        _, best_delay, best_serialization = reached[neighbour]
+                        reached[neighbour] = (
+                            hops + 1,
+                            min(best_delay, candidate[1]),
+                            min(best_serialization, candidate[2]),
+                        )
             frontier = following
-        for target, (target_delay, _) in edges.items():
-            if target == source and source_hosts < 2:
+        for target, target_costs in access.items():
+            if target == source:
+                if len(source_costs) < 2:
+                    continue
+                longest_rtt = max(longest_rtt, source_costs[0] + source_costs[1])
                 continue
             if target not in reached:
                 raise ValueError("the fabric does not connect every pair of hosts")
-            hops, delay = reached[target]
-            one_way = source_delay + delay + target_delay
-            longest_rtt = max(longest_rtt, 2 * one_way + (hops + 2) * hop_serialization)
+            _, delay, serialization = reached[target]
+            longest_rtt = max(
+                longest_rtt,
+                source_costs[0] + 2 * delay + serialization + target_costs[0],
+            )
     return longest_rtt
 
 
@@ -246,7 +271,7 @@ class SwitchRequest:
         if self.profile != "ue":
             raise ValueError(f"network.switch.profile '{self.profile}' is not 'ue'")
         switch = UeSwitch(
-            config_base_rtt_ns=longest_round_trip_ns(layout, payload_bytes, link_bps),
+            config_base_rtt_ns=longest_round_trip_ns(layout, payload_bytes),
             link_bps=link_bps,
         )
         if switch.ecn_min_kb < 1:
