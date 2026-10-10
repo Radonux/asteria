@@ -45,13 +45,12 @@ UE_TRIM_THRESHOLD_FRACTION = 1
 UE_TRIMMED_QUEUE_DROP_FRACTION = 1
 # ns-3 reads DATA_QUEUE_BYTES and TRIMMED_QUEUE_BYTES as 32-bit integers.
 MAX_QUEUE_BYTES = 2**32 - 1
-_TIME_UNITS_NS = {"ms": 1_000_000, "us": 1_000, "ns": 1}
 
 
 class _Link(Protocol):
     source: int
     destination: int
-    delay: str
+    delay_ns: int
 
 
 class _Layout(Protocol):
@@ -165,17 +164,6 @@ def _whole_kb(value: Decimal) -> int:
     )
 
 
-def _delay_ns(delay: str) -> int:
-    """A topology link delay such as 0.005ms, in nanoseconds."""
-    for unit, scale in _TIME_UNITS_NS.items():
-        if delay.endswith(unit):
-            value = Decimal(delay[: -len(unit)]) * scale
-            if value != value.to_integral_value() or value < 0:
-                raise ValueError(f"link delay {delay} is not whole nanoseconds")
-            return int(value)
-    raise ValueError(f"link delay {delay} has no ms, us or ns unit")
-
-
 def longest_round_trip_ns(layout: _Layout, payload_bytes: int, link_bps: int) -> int:
     """The longest unloaded host-to-host round trip, as ns-3 computes maxRtt.
 
@@ -190,7 +178,7 @@ def longest_round_trip_ns(layout: _Layout, payload_bytes: int, link_bps: int) ->
     neighbours: dict[int, list[tuple[int, int]]] = {}
     attachment: dict[int, tuple[int, int]] = {}
     for link in layout.links:
-        delay = _delay_ns(link.delay)
+        delay = link.delay_ns
         if link.source in hosts or link.destination in hosts:
             host, switch = sorted((link.source, link.destination))
             if host in attachment:

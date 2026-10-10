@@ -8,6 +8,7 @@ in one place so profile parsing cannot drift from emitted topology files.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from math import isfinite
 from pathlib import Path
 from typing import Any
@@ -31,8 +32,10 @@ except ImportError:
 
 DEFAULT_PACKET_PAYLOAD_BYTES = 1_000
 MAX_PACKET_PAYLOAD_BYTES = 9_000
-HOST_TO_SWITCH_DELAY = "0.005ms"
-SWITCH_TO_SWITCH_DELAY = "0.0125ms"
+# One-way propagation of a host's link to its switch and of a link between two
+# switches. The defaults are what every profile ran before the knobs existed.
+DEFAULT_HOST_LINK_DELAY_NS = 5_000
+DEFAULT_SWITCH_LINK_DELAY_NS = 12_500
 DATA_LOSS_SCOPES = {
     "all",
     "host_to_switch",
@@ -294,6 +297,8 @@ class ClosNetwork:
     hosts_per_leaf: int
     spine_count: int
     failed_spine_count: int = 0
+    host_link_delay_ns: int = DEFAULT_HOST_LINK_DELAY_NS
+    switch_link_delay_ns: int = DEFAULT_SWITCH_LINK_DELAY_NS
 
     @property
     def live_spine_count(self) -> int:
@@ -325,6 +330,8 @@ class RingNetwork:
     packet_payload_bytes: int
     queue_monitor_start_ns: int
     queue_monitor_interval_ns: int
+    host_link_delay_ns: int = DEFAULT_HOST_LINK_DELAY_NS
+    switch_link_delay_ns: int = DEFAULT_SWITCH_LINK_DELAY_NS
     data_loss: DataPlaneLoss | None = None
     transport_recovery: TransportRecovery | None = None
     packet_trimming: PacketTrimming | None = None
@@ -351,7 +358,7 @@ class TopologyLink:
 
     source: int
     destination: int
-    delay: str
+    delay_ns: int
 
 
 @dataclass(frozen=True)
@@ -402,7 +409,7 @@ class TopologyLayout:
             for link in self.links:
                 topology.write(
                     f"{link.source} {link.destination} {self.link_rate} "
-                    f"{link.delay} 0\n"
+                    f"{_milliseconds(link.delay_ns)}ms 0\n"
                 )
 
     def manifest(self) -> dict[str, int | str]:
@@ -417,6 +424,11 @@ class TopologyLayout:
             "link_rate": self.link_rate,
             **dict(self.details),
         }
+
+
+def _milliseconds(nanoseconds: int) -> str:
+    """Nanoseconds as the plain decimal milliseconds ns-3 parses, 5000 as 0.005."""
+    return format(Decimal(nanoseconds) / 1_000_000, "f")
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -857,6 +869,8 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
         "fabric",
         "congestion_control",
         "switch",
+        "host_link_delay_ns",
+        "switch_link_delay_ns",
     }
     topology_keys = {"hosts_per_leaf", "spine_count"} if topology == "clos" else set()
     optional_topology_keys = (
@@ -949,6 +963,14 @@ def _load_geometry(
     queue_monitor_interval_ns: int,
 ) -> PhysicalNetwork:
     """The ring or Clos with its links and packets, and nothing configured."""
+    host_link_delay_ns = _positive_int(
+        document.get("host_link_delay_ns", DEFAULT_HOST_LINK_DELAY_NS),
+        "network.host_link_delay_ns",
+    )
+    switch_link_delay_ns = _positive_int(
+        document.get("switch_link_delay_ns", DEFAULT_SWITCH_LINK_DELAY_NS),
+        "network.switch_link_delay_ns",
+    )
     if topology == "ring":
         if host_count < 3:
             raise ValueError("network.ring requires at least three hosts")
@@ -957,6 +979,8 @@ def _load_geometry(
             packet_payload_bytes=packet_payload_bytes,
             queue_monitor_start_ns=queue_monitor_start_ns,
             queue_monitor_interval_ns=queue_monitor_interval_ns,
+            host_link_delay_ns=host_link_delay_ns,
+            switch_link_delay_ns=switch_link_delay_ns,
         )
 
     hosts_per_leaf = _positive_int(document["hosts_per_leaf"], "network.hosts_per_leaf")
@@ -984,6 +1008,8 @@ def _load_geometry(
         hosts_per_leaf=hosts_per_leaf,
         spine_count=spine_count,
         failed_spine_count=failed_value,
+        host_link_delay_ns=host_link_delay_ns,
+        switch_link_delay_ns=switch_link_delay_ns,
     )
 
 
@@ -1057,12 +1083,14 @@ def _build_clos_topology(network: ClosNetwork, host_count: int) -> TopologyLayou
         TopologyLink(
             source=host,
             destination=leaf_start + host // network.hosts_per_leaf,
-            delay=HOST_TO_SWITCH_DELAY,
+            delay_ns=network.host_link_delay_ns,
         )
         for host in range(host_count)
     ]
     links.extend(
-        TopologyLink(source=leaf, destination=spine, delay=SWITCH_TO_SWITCH_DELAY)
+        TopologyLink(
+            source=leaf, destination=spine, delay_ns=network.switch_link_delay_ns
+        )
         for leaf in range(leaf_start, spine_start)
         for spine in range(spine_start, node_count)
     )
@@ -1084,6 +1112,8 @@ def _build_clos_topology(network: ClosNetwork, host_count: int) -> TopologyLayou
             ("failed_spine_count", network.failed_spine_count),
             ("live_spine_count", network.live_spine_count),
             ("hosts_per_leaf", network.hosts_per_leaf),
+            ("host_link_delay_ns", network.host_link_delay_ns),
+            ("switch_link_delay_ns", network.switch_link_delay_ns),
         ),
     )
 
@@ -1095,7 +1125,7 @@ def _build_ring_topology(network: RingNetwork, host_count: int) -> TopologyLayou
         TopologyLink(
             source=host,
             destination=switch_start + host,
-            delay=HOST_TO_SWITCH_DELAY,
+            delay_ns=network.host_link_delay_ns,
         )
         for host in range(host_count)
     ]
@@ -1103,7 +1133,7 @@ def _build_ring_topology(network: RingNetwork, host_count: int) -> TopologyLayou
         TopologyLink(
             source=switch_start + index,
             destination=switch_start + (index + 1) % host_count,
-            delay=SWITCH_TO_SWITCH_DELAY,
+            delay_ns=network.switch_link_delay_ns,
         )
         for index in range(host_count)
     )
@@ -1115,5 +1145,9 @@ def _build_ring_topology(network: RingNetwork, host_count: int) -> TopologyLayou
         switch_ids=switch_ids,
         links=tuple(links),
         link_rate=network.link_rate,
-        details=(("switch_ring_size", host_count),),
+        details=(
+            ("switch_ring_size", host_count),
+            ("host_link_delay_ns", network.host_link_delay_ns),
+            ("switch_link_delay_ns", network.switch_link_delay_ns),
+        ),
     )
