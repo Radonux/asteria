@@ -7,7 +7,7 @@ in one place so profile parsing cannot drift from emitted topology files.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from pathlib import Path
 from typing import Any
@@ -17,6 +17,7 @@ try:
         ECN_THRESHOLDS_KB,
         DefaultSwitch,
         SwitchProfile,
+        SwitchRequest,
         load_switch_request,
     )
 except ImportError:
@@ -24,6 +25,7 @@ except ImportError:
         ECN_THRESHOLDS_KB,
         DefaultSwitch,
         SwitchProfile,
+        SwitchRequest,
         load_switch_request,
     )
 
@@ -737,8 +739,11 @@ def _load_packet_trimming(document: dict[str, Any]) -> PacketTrimming | None:
 
 
 def _load_fabric(
-    document: dict[str, Any], trimming: PacketTrimming | None
+    document: dict[str, Any],
+    trimming: PacketTrimming | None,
+    preset_queue_bytes: tuple[int, int] | None,
 ) -> SwitchFabric | None:
+    """Parse the switch buffer; a switch preset may own the two queue bounds."""
     trimming_enabled = trimming is not None
     if "fabric" not in document:
         if trimming_enabled:
@@ -748,8 +753,18 @@ def _load_fabric(
             )
         return None
     fabric = document["fabric"]
-    required = {"buffer_size_mb", "pfc_enabled", "data_queue_bytes"}
-    optional = {"headroom_factor", "trimmed_queue_bytes"}
+    queue_bounds = {"data_queue_bytes", "trimmed_queue_bytes"}
+    if preset_queue_bytes is None:
+        required = {"buffer_size_mb", "pfc_enabled", "data_queue_bytes"}
+        optional = {"headroom_factor", "trimmed_queue_bytes"}
+    elif isinstance(fabric, dict) and queue_bounds & set(fabric):
+        raise ValueError(
+            "network.switch.profile 'ue' sets network.fabric.data_queue_bytes "
+            "and trimmed_queue_bytes from Plane_BDP; remove them"
+        )
+    else:
+        required = {"buffer_size_mb", "pfc_enabled"}
+        optional = {"headroom_factor"}
     if not isinstance(fabric, dict) or not required <= set(fabric) <= (
         required | optional
     ):
@@ -763,13 +778,16 @@ def _load_fabric(
     buffer_size_mb = _positive_int(
         fabric["buffer_size_mb"], "network.fabric.buffer_size_mb"
     )
-    data_queue_bytes = _positive_int(
-        fabric["data_queue_bytes"], "network.fabric.data_queue_bytes"
-    )
-    trimmed_queue_bytes = _positive_int(
-        fabric.get("trimmed_queue_bytes", data_queue_bytes),
-        "network.fabric.trimmed_queue_bytes",
-    )
+    if preset_queue_bytes is None:
+        data_queue_bytes = _positive_int(
+            fabric["data_queue_bytes"], "network.fabric.data_queue_bytes"
+        )
+        trimmed_queue_bytes = _positive_int(
+            fabric.get("trimmed_queue_bytes", data_queue_bytes),
+            "network.fabric.trimmed_queue_bytes",
+        )
+    else:
+        data_queue_bytes, trimmed_queue_bytes = preset_queue_bytes
     default_headroom = DEFAULT_HEADROOM_FACTOR if pfc_enabled else 0
     headroom_factor = _nonnegative_int(
         fabric.get("headroom_factor", default_headroom),
@@ -857,12 +875,32 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
         queue_monitor_start_ns,
         queue_monitor_interval_ns,
     ) = _common_network_fields(document)
+    if packet_payload_bytes > MAX_PACKET_PAYLOAD_BYTES:
+        raise ValueError(
+            f"network.packet_payload_bytes must not exceed {MAX_PACKET_PAYLOAD_BYTES}"
+        )
+    switch_request = load_switch_request(document)
     data_loss = _load_data_loss(document, host_count)
     transport_recovery = _load_transport_recovery(document)
     packet_trimming = _load_packet_trimming(document)
-    fabric = _load_fabric(document, packet_trimming)
+    # The bare fabric: what the switch preset needs to measure Plane_BDP.
+    geometry: PhysicalNetwork = _load_geometry(
+        document,
+        topology,
+        host_count,
+        link_rate,
+        packet_payload_bytes,
+        queue_monitor_start_ns,
+        queue_monitor_interval_ns,
+    )
+    switch = _resolve_switch(document, switch_request, geometry, host_count)
+    if switch.profile == "ue" and packet_trimming is None:
+        raise ValueError(
+            "network.switch.profile 'ue' requires network.packet_trimming: "
+            "UEC 1.0.3 section 3.6.17 fixes the thresholds of a trimming fabric"
+        )
+    fabric = _load_fabric(document, packet_trimming, switch.queue_bytes())
     congestion_control = _load_congestion_control(document)
-    switch = load_switch_request(document).default_switch()
     if (
         data_loss is not None or packet_trimming is not None
     ) and transport_recovery is None:
@@ -881,28 +919,45 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
             "network.transport_recovery is required when network.fabric disables "
             "PFC, because a best-effort fabric can drop data packets"
         )
-    if packet_payload_bytes > MAX_PACKET_PAYLOAD_BYTES:
-        raise ValueError(
-            f"network.packet_payload_bytes must not exceed {MAX_PACKET_PAYLOAD_BYTES}"
+    network: PhysicalNetwork = replace(
+        geometry,
+        data_loss=data_loss,
+        transport_recovery=transport_recovery,
+        packet_trimming=packet_trimming,
+        fabric=fabric,
+        congestion_control=congestion_control,
+        switch=switch,
+    )
+    if isinstance(network, ClosNetwork):
+        network = replace(
+            network,
+            load_balancing=_load_load_balancing(
+                document, transport_recovery, packet_trimming
+            ),
         )
+    _require_acknowledged_packets(network)
+    return network
 
+
+def _load_geometry(
+    document: dict[str, Any],
+    topology: str,
+    host_count: int,
+    link_rate: str,
+    packet_payload_bytes: int,
+    queue_monitor_start_ns: int,
+    queue_monitor_interval_ns: int,
+) -> PhysicalNetwork:
+    """The ring or Clos with its links and packets, and nothing configured."""
     if topology == "ring":
         if host_count < 3:
             raise ValueError("network.ring requires at least three hosts")
-        ring = RingNetwork(
+        return RingNetwork(
             link_rate=link_rate,
             packet_payload_bytes=packet_payload_bytes,
             queue_monitor_start_ns=queue_monitor_start_ns,
             queue_monitor_interval_ns=queue_monitor_interval_ns,
-            data_loss=data_loss,
-            transport_recovery=transport_recovery,
-            packet_trimming=packet_trimming,
-            fabric=fabric,
-            congestion_control=congestion_control,
-            switch=switch,
         )
-        _require_acknowledged_packets(ring)
-        return ring
 
     hosts_per_leaf = _positive_int(document["hosts_per_leaf"], "network.hosts_per_leaf")
     spine_count = _positive_int(document["spine_count"], "network.spine_count")
@@ -921,10 +976,7 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
         raise ValueError(
             "network.failed_spine_count must leave at least one live spine"
         )
-    load_balancing = _load_load_balancing(
-        document, transport_recovery, packet_trimming
-    )
-    clos = ClosNetwork(
+    return ClosNetwork(
         link_rate=link_rate,
         packet_payload_bytes=packet_payload_bytes,
         queue_monitor_start_ns=queue_monitor_start_ns,
@@ -932,16 +984,30 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
         hosts_per_leaf=hosts_per_leaf,
         spine_count=spine_count,
         failed_spine_count=failed_value,
-        data_loss=data_loss,
-        transport_recovery=transport_recovery,
-        packet_trimming=packet_trimming,
-        fabric=fabric,
-        congestion_control=congestion_control,
-        load_balancing=load_balancing,
-        switch=switch,
     )
-    _require_acknowledged_packets(clos)
-    return clos
+
+
+def _resolve_switch(
+    document: dict[str, Any],
+    request: SwitchRequest,
+    geometry: PhysicalNetwork,
+    host_count: int,
+) -> SwitchProfile:
+    """The switch profile, a preset's thresholds measured on the built fabric."""
+    if request.profile == "default":
+        return request.default_switch()
+    control = document.get("congestion_control")
+    if isinstance(control, dict) and "ecn_threshold_scale" in control:
+        raise ValueError(
+            "network.congestion_control.ecn_threshold_scale cannot be combined "
+            f"with network.switch.profile '{request.profile}', which sets the "
+            "ECN thresholds from Plane_BDP"
+        )
+    return request.ue_switch(
+        build_topology(geometry, host_count),
+        geometry.packet_payload_bytes,
+        link_rate_bits_per_second(geometry.link_rate),
+    )
 
 
 def _require_acknowledged_packets(network: PhysicalNetwork) -> None:
