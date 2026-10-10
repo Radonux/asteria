@@ -332,7 +332,9 @@ class ClosNetwork:
         """The LINK_FAILURE lines of every failure, in profile order."""
         index = self.clos_index(host_count)
         return "".join(
-            line for failure in self.link_failures for line in failure.config_lines(index)
+            line
+            for failure in self.link_failures
+            for line in failure.config_lines(index)
         )
     data_loss: DataPlaneLoss | None = None
     transport_recovery: TransportRecovery | None = None

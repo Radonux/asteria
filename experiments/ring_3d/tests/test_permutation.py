@@ -82,7 +82,9 @@ class PermutationTests(unittest.TestCase):
                 rank: _nodes(output / f"workload/ring_3d.{rank}.et")
                 for rank in range(64)
             }
-            policy = json.loads((output / "experiment.json").read_text(encoding="utf-8"))
+            policy = json.loads(
+                (output / "experiment.json").read_text(encoding="utf-8")
+            )
         self.assertEqual(
             manifest["workload"],
             {"kind": "permutation", "shift": 8, "message_bytes": 2_097_152},
@@ -90,7 +92,9 @@ class PermutationTests(unittest.TestCase):
         self.assertEqual(policy["microburst"]["flows"], [])
         for rank, nodes in traces.items():
             with self.subTest(rank=rank):
-                self.assertEqual([node.type for node in nodes], [COMM_SEND_NODE, COMM_RECV_NODE])
+                self.assertEqual(
+                    [node.type for node in nodes], [COMM_SEND_NODE, COMM_RECV_NODE]
+                )
                 ends = []
                 for node in nodes:
                     attributes = {attribute.name: attribute for attribute in node.attr}
@@ -99,15 +103,23 @@ class PermutationTests(unittest.TestCase):
                     self.assertEqual(attributes["comm_size"].uint64_val, 2_097_152)
                     self.assertEqual(attributes["training_step"].uint64_val, 1)
                     ends.append(
-                        (attributes["comm_src"].uint32_val, attributes["comm_dst"].uint32_val)
+                        (
+                            attributes["comm_src"].uint32_val,
+                            attributes["comm_dst"].uint32_val,
+                        )
                     )
-                self.assertEqual(ends, [(rank, (rank + 8) % 64), ((rank - 8) % 64, rank)])
+                self.assertEqual(
+                    ends, [(rank, (rank + 8) % 64), ((rank - 8) % 64, rank)]
+                )
 
     def test_permutation_refuses_what_it_cannot_send(self) -> None:
         cases = (
             (_permutation(shift=0), "workload.shift must be a positive integer"),
             (_permutation(shift=64), "workload.shift must be below the rank count"),
-            (_permutation(message_bytes=0), "workload.message_bytes must be a positive"),
+            (
+                _permutation(message_bytes=0),
+                "workload.message_bytes must be a positive",
+            ),
         )
         for document, message in cases:
             with self.subTest(message=message):

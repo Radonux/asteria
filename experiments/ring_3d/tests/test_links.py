@@ -150,7 +150,13 @@ class LinkOverrideTests(LinkTests):
         document["network"]["switch_link_delay_ns"] = 2_000
         _, plain = self._materialize(document)
         document["network"]["link_overrides"] = [
-            {"leaf": 2, "spine": 5, "rate": "200Gbps", "delay_ns": 4_000, "error_rate": 0.01},
+            {
+                "leaf": 2,
+                "spine": 5,
+                "rate": "200Gbps",
+                "delay_ns": 4_000,
+                "error_rate": 0.01,
+            },
             {"endpoints": [3, LEAF], "delay_ns": 1_500},
         ]
         manifest, topology = self._materialize(document)
@@ -163,14 +169,26 @@ class LinkOverrideTests(LinkTests):
         self.assertEqual(
             manifest["link_overrides"],
             [
-                {"endpoints": [66, 77], "rate": "200Gbps", "delay_ns": 4_000, "error_rate": 0.01},
-                {"endpoints": [3, 64], "rate": None, "delay_ns": 1_500, "error_rate": None},
+                {
+                    "endpoints": [66, 77],
+                    "rate": "200Gbps",
+                    "delay_ns": 4_000,
+                    "error_rate": 0.01,
+                },
+                {
+                    "endpoints": [3, 64],
+                    "rate": None,
+                    "delay_ns": 1_500,
+                    "error_rate": None,
+                },
             ],
         )
 
     def test_leaf_and_spine_name_the_link_endpoints_name(self) -> None:
         by_index = _sprayed_clos()
-        by_index["network"]["link_overrides"] = [{"leaf": 7, "spine": 0, "rate": "200Gbps"}]
+        by_index["network"]["link_overrides"] = [
+            {"leaf": 7, "spine": 0, "rate": "200Gbps"}
+        ]
         by_nodes = _sprayed_clos()
         by_nodes["network"]["link_overrides"] = [
             {"endpoints": [SPINE, LEAF + 7], "rate": "200Gbps"}
@@ -208,26 +226,47 @@ class LinkOverrideTests(LinkTests):
         ]
         _, topology = self._materialize(document)
         self.assertTrue(_line(topology, hosts, hosts + 1).endswith(" 0.5"))
-        document["network"]["link_overrides"] = [{"leaf": 0, "spine": 0, "error_rate": 0.5}]
+        document["network"]["link_overrides"] = [
+            {"leaf": 0, "spine": 0, "error_rate": 0.5}
+        ]
         self._refused(document, "names a leaf and spine, which a ring has not")
 
     def test_overrides_refuse_what_they_cannot_mean(self) -> None:
         cases = (
             ({"leaf": 0}, "must name 'endpoints' or 'leaf' and 'spine'"),
-            ({"leaf": 0, "spine": 0, "endpoints": [0, LEAF], "rate": "200Gbps"},
-             "must name 'endpoints' or 'leaf' and 'spine'"),
-            ({"leaf": 0, "spine": 0, "speed": "200Gbps"},
-             "must name 'endpoints' or 'leaf' and 'spine'"),
+            (
+                {"leaf": 0, "spine": 0, "endpoints": [0, LEAF], "rate": "200Gbps"},
+                "must name 'endpoints' or 'leaf' and 'spine'",
+            ),
+            (
+                {"leaf": 0, "spine": 0, "speed": "200Gbps"},
+                "must name 'endpoints' or 'leaf' and 'spine'",
+            ),
             ({"leaf": 0, "spine": 0}, "must set one of"),
-            ({"leaf": 8, "spine": 0, "rate": "200Gbps"}, r"leaf must be an integer in \[0, 8\)"),
-            ({"leaf": 0, "spine": 8, "rate": "200Gbps"}, r"spine must be an integer in \[0, 8\)"),
+            (
+                {"leaf": 8, "spine": 0, "rate": "200Gbps"},
+                r"leaf must be an integer in \[0, 8\)",
+            ),
+            (
+                {"leaf": 0, "spine": 8, "rate": "200Gbps"},
+                r"spine must be an integer in \[0, 8\)",
+            ),
             ({"endpoints": [0, 1], "rate": "200Gbps"}, "which no link joins"),
             ({"endpoints": [0], "rate": "200Gbps"}, "endpoints must be two node ids"),
             ({"leaf": 0, "spine": 0, "rate": "300Gbps"}, "the switch ECN table covers"),
             ({"leaf": 0, "spine": 0, "rate": "200G"}, "must be a rate such as 200Gbps"),
-            ({"leaf": 0, "spine": 0, "delay_ns": 0}, "delay_ns must be a positive integer"),
-            ({"leaf": 0, "spine": 0, "error_rate": 0}, r"error_rate must be a number in \(0, 1\]"),
-            ({"leaf": 0, "spine": 0, "error_rate": 1.5}, r"error_rate must be a number in \(0, 1\]"),
+            (
+                {"leaf": 0, "spine": 0, "delay_ns": 0},
+                "delay_ns must be a positive integer",
+            ),
+            (
+                {"leaf": 0, "spine": 0, "error_rate": 0},
+                r"error_rate must be a number in \(0, 1\]",
+            ),
+            (
+                {"leaf": 0, "spine": 0, "error_rate": 1.5},
+                r"error_rate must be a number in \(0, 1\]",
+            ),
         )
         for override, message in cases:
             document = _sprayed_clos()
@@ -274,27 +313,61 @@ class LinkFailureTests(LinkTests):
         manifest, _ = self._materialize(document)
         self.assertEqual(
             manifest["link_failures"][2],
-            {"model": "gray", "start_ns": 5, "spine": 2, "leaf": 0, "error_rate": 0.01,
-             "rate": None},
+            {
+                "model": "gray",
+                "start_ns": 5,
+                "spine": 2,
+                "leaf": 0,
+                "error_rate": 0.01,
+                "rate": None,
+            },
         )
 
     def test_failures_refuse_what_they_cannot_mean(self) -> None:
         cases = (
             ({"model": "crash", "spine": 0, "start_ns": 0}, "model must be one of"),
-            ({"model": "graceful", "spine": 0}, "must contain model, start_ns and spine"),
-            ({"model": "graceful", "spine": 0, "start_ns": 0, "error_rate": 0.1},
-             "must contain model, start_ns and spine"),
-            ({"model": "gray", "spine": 0, "start_ns": 0}, "sets one of error_rate and rate"),
-            ({"model": "gray", "spine": 0, "start_ns": 0, "error_rate": 0.1, "rate": "200Gbps"},
-             "sets one of error_rate and rate"),
-            ({"model": "gray", "spine": 0, "start_ns": 0, "error_rate": 2},
-             r"error_rate must be a number in \(0, 1\]"),
-            ({"model": "gray", "spine": 0, "start_ns": 0, "rate": "fast"},
-             "must be a rate such as 200Gbps"),
-            ({"model": "silent", "spine": 8, "start_ns": 0}, r"spine must be an integer in \[0, 8\)"),
-            ({"model": "silent", "spine": 0, "leaf": -1, "start_ns": 0},
-             r"leaf must be an integer in \[0, 8\)"),
-            ({"model": "silent", "spine": 0, "start_ns": -1}, "start_ns must be a nonnegative"),
+            (
+                {"model": "graceful", "spine": 0},
+                "must contain model, start_ns and spine",
+            ),
+            (
+                {"model": "graceful", "spine": 0, "start_ns": 0, "error_rate": 0.1},
+                "must contain model, start_ns and spine",
+            ),
+            (
+                {"model": "gray", "spine": 0, "start_ns": 0},
+                "sets one of error_rate and rate",
+            ),
+            (
+                {
+                    "model": "gray",
+                    "spine": 0,
+                    "start_ns": 0,
+                    "error_rate": 0.1,
+                    "rate": "200Gbps",
+                },
+                "sets one of error_rate and rate",
+            ),
+            (
+                {"model": "gray", "spine": 0, "start_ns": 0, "error_rate": 2},
+                r"error_rate must be a number in \(0, 1\]",
+            ),
+            (
+                {"model": "gray", "spine": 0, "start_ns": 0, "rate": "fast"},
+                "must be a rate such as 200Gbps",
+            ),
+            (
+                {"model": "silent", "spine": 8, "start_ns": 0},
+                r"spine must be an integer in \[0, 8\)",
+            ),
+            (
+                {"model": "silent", "spine": 0, "leaf": -1, "start_ns": 0},
+                r"leaf must be an integer in \[0, 8\)",
+            ),
+            (
+                {"model": "silent", "spine": 0, "start_ns": -1},
+                "start_ns must be a nonnegative",
+            ),
         )
         for failure, message in cases:
             document = _sprayed_clos()

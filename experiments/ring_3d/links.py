@@ -71,7 +71,9 @@ class LinkFailure:
     rate: str | None
 
     def leaves(self, leaf_count: int) -> range:
-        return range(leaf_count) if self.leaf is None else range(self.leaf, self.leaf + 1)
+        return (
+            range(leaf_count) if self.leaf is None else range(self.leaf, self.leaf + 1)
+        )
 
     def _action(self) -> tuple[str, str]:
         """The LINK_FAILURE kind, and the value written after the two nodes."""
@@ -169,7 +171,9 @@ def load_link_overrides(
             endpoints = (ends[0], ends[1])
         elif address == {"leaf", "spine"}:
             if clos is None:
-                raise ValueError(f"{field} names a leaf and spine, which a ring has not")
+                raise ValueError(
+                    f"{field} names a leaf and spine, which a ring has not"
+                )
             endpoints = (
                 clos.leaf(_index(entry["leaf"], f"{field}.leaf", clos.leaf_count)),
                 clos.spine(_index(entry["spine"], f"{field}.spine", clos.spine_count)),
@@ -260,7 +264,9 @@ def load_link_failures(
                 if "error_rate" in entry
                 else None
             ),
-            rate=_rate(entry["rate"], f"{field}.rate", None) if "rate" in entry else None,
+            rate=_rate(entry["rate"], f"{field}.rate", None)
+            if "rate" in entry
+            else None,
         )
         for leaf in failure.leaves(clos.leaf_count):
             if (leaf, failure.spine) in failed:
@@ -271,5 +277,7 @@ def load_link_failures(
         failures.append(failure)
     # A leaf with every uplink down is cut off and no flow to it can finish.
     if any(len(spines) == clos.spine_count for spines in down.values()):
-        raise ValueError("network.link_failures must leave every leaf a link to a spine")
+        raise ValueError(
+            "network.link_failures must leave every leaf a link to a spine"
+        )
     return tuple(failures)

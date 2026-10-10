@@ -335,7 +335,9 @@ class Workload:
 
     def __post_init__(self) -> None:
         if (self.kind == PERMUTATION_WORKLOAD) != (self.permutation is not None):
-            raise ValueError("a permutation workload, and no other, carries a permutation")
+            raise ValueError(
+                "a permutation workload, and no other, carries a permutation"
+            )
 
     def manifest(self) -> dict[str, Any]:
         if self.permutation is None:
@@ -868,10 +870,14 @@ def parse_profile_document(document: Any) -> Profile:
                 "tp_all_reduce_bytes and pp_bytes to be zero"
             )
         if profile.model is not None:
-            raise ValueError("workload.kind 'permutation' cannot include model metadata")
+            raise ValueError(
+                "workload.kind 'permutation' cannot include model metadata"
+            )
         # The background incast fires on a DP All-Reduce, of which there is none.
         if profile.microburst_enabled:
-            raise ValueError("workload.kind 'permutation' requires microburst_enabled false")
+            raise ValueError(
+                "workload.kind 'permutation' requires microburst_enabled false"
+            )
     elif profile.workload.kind == SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD:
         if profile.tp != 1 or profile.pp != 1:
             raise ValueError("sequential_dp_all_reduce requires TP=1 and PP=1")
@@ -1110,7 +1116,15 @@ class TraceWriter:
         step: int,
     ) -> int:
         return self.point_to_point_node(
-            name, node_type, dependencies, src, dst, tag, self.profile.pp_bytes, step, "pp"
+            name,
+            node_type,
+            dependencies,
+            src,
+            dst,
+            tag,
+            self.profile.pp_bytes,
+            step,
+            "pp",
         )
 
     def _build_smoke_trace(self) -> None:
@@ -1427,7 +1441,12 @@ class TraceWriter:
         destination = permutation.destination(self.rank, ranks)
         source = permutation.source(self.rank, ranks)
         for name, node_type, src, dst in (
-            (f"permutation_send_to_{destination}", COMM_SEND_NODE, self.rank, destination),
+            (
+                f"permutation_send_to_{destination}",
+                COMM_SEND_NODE,
+                self.rank,
+                destination,
+            ),
             (f"permutation_recv_from_{source}", COMM_RECV_NODE, source, self.rank),
         ):
             self.point_to_point_node(
@@ -1575,13 +1594,13 @@ def write_network_config(
     # configuration it had before the knob existed. Under per-packet paths the
     # run also writes what every switch port sent and, where the identification
     # names a spine, what every host received over each.
-    load_balancing_settings = ""
+    load_balancing_settings = (
+        ""
+        if load_balancing.mode == "ecmp"
+        else f"LOAD_BALANCING {load_balancing.mode}\n"
+    )
     for key, counter_file in counter_files(load_balancing, output_dir).items():
         load_balancing_settings += f"{key} {counter_file}\n"
-    if load_balancing.mode != "ecmp":
-        load_balancing_settings = (
-            f"LOAD_BALANCING {load_balancing.mode}\n{load_balancing_settings}"
-        )
     with path.open("w", encoding="utf-8") as config:
         config.write(
             "ENABLE_QCN 1\nUSE_DYNAMIC_PFC_THRESHOLD 1\n\n"
