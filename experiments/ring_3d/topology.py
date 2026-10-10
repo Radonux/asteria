@@ -59,7 +59,7 @@ DATA_LOSS_SCOPES = {
 PACKET_TRIM_MODES = {"ftd", "bts"}
 LOAD_BALANCING_MODES = {"ecmp", "ev_hash", "spray_uniform"}
 # What chooses each data packet's entropy value under ev_hash.
-PATH_SELECTORS = ("ops", "reps")
+PATH_SELECTORS = ("ops", "reps", "ue_oblivious", "ue_aware")
 # The ns-3 CC_MODE number of each congestion_control.mode. 12 is no sender
 # reaction at all: a queue pair is set to link rate at creation and nothing ever
 # changes it. 1 is Mellanox DCQCN. 11 is UEC NSCC, a window per queue pair
@@ -194,10 +194,12 @@ class LoadBalancing:
 
     ``ecmp`` hashes the four-tuple, so a flow keeps one path. ``ev_hash`` adds
     a 16-bit entropy value per packet to that hash, which ``selector`` chooses:
-    ``ops`` draws it afresh and ``reps`` reuses the values that came back on
-    unmarked acknowledgements. ``spray_uniform`` has the sender name a spine
-    per packet, uniformly at random, and the source leaf send the packet up
-    that spine. Every mode but ``ecmp`` reorders a flow's packets on the way.
+    ``ops`` draws it afresh, ``reps`` reuses the values that came back on
+    unmarked acknowledgements, ``ue_oblivious`` rotates through a set of
+    values, and ``ue_aware`` rotates skipping a value once after a congestion
+    report. ``spray_uniform`` has the sender name a spine per packet, uniformly
+    at random, and the source leaf send the packet up that spine. Every mode but
+    ``ecmp`` reorders a flow's packets on the way.
     """
 
     mode: str
@@ -616,6 +618,15 @@ def _reps_buffer_size(value: Any, field: str) -> int:
     return value
 
 
+def _ev_set_size(value: Any, field: str) -> int:
+    # The values of a set are 0 to its size less one, in 16 bits.
+    if _positive_int(value, field) > 65536:
+        raise ValueError(f"{field} must be at most 65536")
+    return value
+
+
+# UEC 1.0.3 section 3.6.16.3's typical space.
+_UE_EV_SET_SIZE = SelectorParameter("ev_set_size", "UE_EV_SET_SIZE", 256, _ev_set_size)
 SELECTOR_PARAMETERS: dict[str, tuple[SelectorParameter, ...]] = {
     "ops": (),
     # REPS section 3.1 and its artifact's exit_freeze_after.
@@ -623,6 +634,14 @@ SELECTOR_PARAMETERS: dict[str, tuple[SelectorParameter, ...]] = {
         SelectorParameter("buffer_size", "REPS_BUFFER_SIZE", 8, _reps_buffer_size),
         SelectorParameter(
             "freezing_timeout_ns", "REPS_FREEZING_TIMEOUT_NS", 10_000_000, _positive_int
+        ),
+    ),
+    "ue_oblivious": (_UE_EV_SET_SIZE,),
+    # UEC 1.0.3 section 3.6.16.4's default saturation.
+    "ue_aware": (
+        _UE_EV_SET_SIZE,
+        SelectorParameter(
+            "saturation_fraction", "UE_SATURATION_FRACTION", 0.5, _fraction
         ),
     ),
 }

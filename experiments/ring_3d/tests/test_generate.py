@@ -1809,6 +1809,32 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 "\nREPS_BUFFER_SIZE 4\nREPS_FREEZING_TIMEOUT_NS 500000\n", config
             )
 
+            manifest, config = generated(
+                {"mode": "ev_hash", "selector": "ue_oblivious"}
+            )
+            self.assertEqual(manifest["ev_set_size"], 256)
+            self.assertIn(
+                "\nPATH_SELECTOR ue_oblivious\nUE_EV_SET_SIZE 256\nPORT_COUNTER", config
+            )
+            manifest, config = generated({"mode": "ev_hash", "selector": "ue_aware"})
+            self.assertEqual(
+                (manifest["ev_set_size"], manifest["saturation_fraction"]), (256, 0.5)
+            )
+            self.assertIn(
+                "\nPATH_SELECTOR ue_aware\nUE_EV_SET_SIZE 256\n"
+                "UE_SATURATION_FRACTION 0.5\n",
+                config,
+            )
+            manifest, config = generated(
+                {
+                    "mode": "ev_hash",
+                    "selector": "ue_aware",
+                    "ev_set_size": 64,
+                    "saturation_fraction": 0.75,
+                }
+            )
+            self.assertIn("\nUE_EV_SET_SIZE 64\nUE_SATURATION_FRACTION 0.75\n", config)
+
     def test_path_selector_refuses_what_nothing_would_read(self) -> None:
         document = json.loads(
             (
@@ -1832,6 +1858,22 @@ class Ring3DGeneratorTests(unittest.TestCase):
             refusals += [
                 ({**reps, "buffer_size": size}, "buffer_size must be")
                 for size in (0, 256, True, 1.5)
+            ]
+            ue = {"mode": "ev_hash", "selector": "ue_aware"}
+            refusals += [
+                ({**reps, "ev_set_size": 128}, "'reps' does not take"),
+                (
+                    {**ue, "selector": "ue_oblivious", "saturation_fraction": 0.5},
+                    "'ue_oblivious' does not take",
+                ),
+            ]
+            refusals += [
+                ({**ue, "ev_set_size": size}, "ev_set_size must be")
+                for size in (0, 65537, 2.0)
+            ]
+            refusals += [
+                ({**ue, "saturation_fraction": fraction}, "saturation_fraction must be")
+                for fraction in (0, 1.5, "half")
             ]
             for balancing, message in refusals:
                 document["network"]["load_balancing"] = balancing
