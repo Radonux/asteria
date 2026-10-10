@@ -12,6 +12,21 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
+try:
+    from .switch import (
+        ECN_THRESHOLDS_KB,
+        DefaultSwitch,
+        SwitchProfile,
+        load_switch_request,
+    )
+except ImportError:
+    from switch import (
+        ECN_THRESHOLDS_KB,
+        DefaultSwitch,
+        SwitchProfile,
+        load_switch_request,
+    )
+
 DEFAULT_PACKET_PAYLOAD_BYTES = 1_000
 MAX_PACKET_PAYLOAD_BYTES = 9_000
 HOST_TO_SWITCH_DELAY = "0.005ms"
@@ -35,17 +50,6 @@ CONGESTION_CONTROL_MODES = {"none": 12, "dcqcn": 1, "nscc": 11}
 DEFAULT_RATE_AI_FRACTION = 1 / 2000
 DEFAULT_RATE_HAI_FRACTION = 1 / 1000
 DEFAULT_MIN_RATE_FRACTION = 1 / 1000
-# The HPCC switch ECN table: (link bps, KMIN KB, KMAX KB) per link speed. ns-3
-# reads each threshold as an integer count of kilobytes, so a scaled value is
-# rounded and must stay at least 1.
-ECN_THRESHOLDS_KB = (
-    (25_000_000_000, 100, 400),
-    (40_000_000_000, 200, 800),
-    (100_000_000_000, 400, 1600),
-    (200_000_000_000, 600, 2400),
-    (400_000_000_000, 800, 3200),
-    (2_400_000_000_000, 800, 3200),
-)
 # Queue 0 carries DSCP_CONTROL (TC_high) and priority groups 1 and 3 carry UET
 # data (TC_low), so TC_med for DSCP_TRIMMED must avoid all three. UEC 1.0.3
 # section 4.1.4.1 requires trimmed packets to sit in their own traffic class.
@@ -298,6 +302,7 @@ class ClosNetwork:
     fabric: SwitchFabric | None = None
     congestion_control: CongestionControl = CongestionControl(mode="none")
     load_balancing: LoadBalancing = LoadBalancing(mode="ecmp")
+    switch: SwitchProfile = DefaultSwitch()
 
     @property
     def kind(self) -> str:
@@ -323,6 +328,7 @@ class RingNetwork:
     packet_trimming: PacketTrimming | None = None
     fabric: SwitchFabric | None = None
     congestion_control: CongestionControl = CongestionControl(mode="none")
+    switch: SwitchProfile = DefaultSwitch()
 
     @property
     def kind(self) -> str:
@@ -832,6 +838,7 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
         "packet_trimming",
         "fabric",
         "congestion_control",
+        "switch",
     }
     topology_keys = {"hosts_per_leaf", "spine_count"} if topology == "clos" else set()
     optional_topology_keys = (
@@ -855,6 +862,7 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
     packet_trimming = _load_packet_trimming(document)
     fabric = _load_fabric(document, packet_trimming)
     congestion_control = _load_congestion_control(document)
+    switch = load_switch_request(document).default_switch()
     if (
         data_loss is not None or packet_trimming is not None
     ) and transport_recovery is None:
@@ -891,6 +899,7 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
             packet_trimming=packet_trimming,
             fabric=fabric,
             congestion_control=congestion_control,
+            switch=switch,
         )
         _require_acknowledged_packets(ring)
         return ring
@@ -929,6 +938,7 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
         fabric=fabric,
         congestion_control=congestion_control,
         load_balancing=load_balancing,
+        switch=switch,
     )
     _require_acknowledged_packets(clos)
     return clos

@@ -46,6 +46,7 @@ try:
         schedule_metadata,
         write_clr_mask,
     )
+    from .switch import SwitchProfile
     from .topology import (
         CongestionControl,
         DataPlaneLoss,
@@ -66,6 +67,7 @@ except ImportError:
         schedule_metadata,
         write_clr_mask,
     )
+    from switch import SwitchProfile
     from topology import (
         CongestionControl,
         DataPlaneLoss,
@@ -1349,6 +1351,7 @@ def write_network_config(
     congestion_control: CongestionControl,
     link_rate: str,
     load_balancing: LoadBalancing,
+    switch: SwitchProfile,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     # The bundled ns-3 setup unconditionally opens these legacy input files,
@@ -1474,9 +1477,8 @@ def write_network_config(
             "SAMPLE_FEEDBACK 0\nPINT_LOG_BASE 1.05\nPINT_PROB 1.0\n"
             "NIC_TOTAL_PAUSE_TIME 0\n\nRATE_BOUND 1\nACK_HIGH_PRIO 1\n"
             "LINK_DOWN 0 0 0\nENABLE_TRACE 1\n\n"
-            f"{congestion_control.ecn_threshold_maps()}"
-            "PMAX_MAP 6 25000000000 0.2 40000000000 0.2 100000000000 0.2 "
-            "200000000000 0.2 400000000000 0.2 2400000000000 0.2\n"
+            f"{switch.ecn_threshold_maps(congestion_control.ecn_threshold_maps())}"
+            f"{switch.probability_map()}"
             f"{fabric_settings}"
         )
 
@@ -1812,6 +1814,7 @@ def materialize(
         profile.network.congestion_control,
         profile.network.link_rate,
         profile.network.load_balancing,
+        profile.network.switch,
     )
     experiment_config = output_dir / "experiment.json"
     write_experiment_config(
@@ -1892,6 +1895,7 @@ def materialize(
             profile.network.link_rate
         ),
         "load_balancing": profile.network.load_balancing.manifest(),
+        "switch": profile.network.switch.manifest(),
         "fabric": (
             profile.network.fabric.manifest()
             if profile.network.fabric is not None
