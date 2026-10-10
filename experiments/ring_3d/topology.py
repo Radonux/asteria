@@ -769,14 +769,15 @@ def _window_penalty(value: Any, field: str) -> int:
 
 
 # spray_policy's receiver, then its sender. One report per loaded round trip,
-# about two base RTTs; DCTCP's gain of 1/16 on the marked fraction, which an
-# interval's own fraction never replaces; CUSUM slack of half a grade's width
-# and a threshold of two; grades in four equal bands of the marked fraction
-# and, with one-way delay, of the delay up to NSCC's target_qdelay of 0.75 base
-# RTTs, against no reference; a spine held down for arriving below an eighth of
-# the median spine's arrivals once that median is 16; gamma 0.25 and epsilon
-# 0.02, and one candidate, as the design gives them; NSCC's Rcv_Cwnd_Pend
-# example of 64.
+# about two base RTTs; DCTCP's gain of 1/16 on the marked and the trimmed
+# fraction, which an interval of 32 packets replaces; CUSUM slack of half a
+# grade's width and a threshold of two; grades in four equal bands of the
+# fractions' and, with one-way delay, the delay's excess over the median
+# spine's, the delay's up to NSCC's target_qdelay of 0.75 base RTTs; a spine
+# held for arriving below an eighth of the median spine's arrivals over a
+# window whose median reaches 16, and released at half its floor's arrivals;
+# gamma 0.25 and epsilon 0.02, and one candidate, as the design gives them;
+# NSCC's Rcv_Cwnd_Pend example of 64.
 POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "report_interval_base_rtts",
@@ -788,23 +789,26 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "estimator_interval_samples",
         "SPRAY_ESTIMATOR_INTERVAL_SAMPLES",
-        0,
+        32,
         _nonnegative_int,
     ),
     BalancingParameter(
-        "mark_cusum_slack", "SPRAY_MARK_CUSUM_SLACK", 0.125, _nonnegative_number
+        "fraction_cusum_slack",
+        "SPRAY_FRACTION_CUSUM_SLACK",
+        0.125,
+        _nonnegative_number,
     ),
     BalancingParameter(
-        "mark_cusum_threshold", "SPRAY_MARK_CUSUM_THRESHOLD", 0.5, _positive_number
+        "fraction_cusum_threshold",
+        "SPRAY_FRACTION_CUSUM_THRESHOLD",
+        0.5,
+        _positive_number,
     ),
     BalancingParameter(
-        "mark_thresholds",
-        "SPRAY_MARK_THRESHOLDS",
+        "congestion_thresholds",
+        "SPRAY_CONGESTION_THRESHOLDS",
         (0.25, 0.5, 0.75),
         _increasing_thresholds(_fraction),
-    ),
-    BalancingParameter(
-        "hold_down_intervals", "SPRAY_HOLD_DOWN_INTERVALS", 4, _nonnegative_int
     ),
     BalancingParameter(
         "absence_fraction_of_median",
@@ -816,7 +820,13 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
         "absence_minimum_median", "SPRAY_ABSENCE_MINIMUM_MEDIAN", 16, _positive_int
     ),
     BalancingParameter(
-        "grade_reference", "SPRAY_GRADE_REFERENCE", "absolute", _grade_reference
+        "release_fraction_of_floor",
+        "SPRAY_RELEASE_FRACTION_OF_FLOOR",
+        0.5,
+        _nonnegative_number,
+    ),
+    BalancingParameter(
+        "grade_reference", "SPRAY_GRADE_REFERENCE", "median", _grade_reference
     ),
     BalancingParameter("one_way_delay", "SPRAY_ONE_WAY_DELAY", False, _flag),
     BalancingParameter(
