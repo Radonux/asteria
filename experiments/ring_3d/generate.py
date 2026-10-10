@@ -1598,6 +1598,7 @@ def write_network_config(
         ""
         if load_balancing.mode == "ecmp"
         else f"LOAD_BALANCING {load_balancing.mode}\n"
+        + load_balancing.selector_settings()
     )
     for key, counter_file in counter_files(load_balancing, output_dir).items():
         load_balancing_settings += f"{key} {counter_file}\n"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import itertools
 import json
 import sys
 import tempfile
@@ -1745,9 +1746,99 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 output = Path(temporary_directory) / mode
                 manifest = materialize(profile_path, output)
                 config = (output / "network_config.txt").read_text(encoding="utf-8")
+                expected = {"mode": mode}
+                if mode == "ev_hash":
+                    expected["selector"] = "ops"
                 with self.subTest(mode=mode):
-                    self.assertEqual(manifest["load_balancing"], {"mode": mode})
+                    self.assertEqual(manifest["load_balancing"], expected)
                     self.assertIn(f"\nLOAD_BALANCING {mode}\n", config)
+                    self.assertNotIn("PATH_SELECTOR", config)
+
+    def test_path_selector_and_its_parameters_reach_the_configuration(self) -> None:
+        """A selector writes its key and every parameter, defaults filled in;
+        ``ops``, the simulator's default, writes nothing."""
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            runs = itertools.count()
+
+            def generated(balancing: dict[str, object]) -> tuple[dict, str]:
+                document["network"]["load_balancing"] = balancing
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                output = Path(temporary_directory) / f"run{next(runs)}"
+                manifest = materialize(profile_path, output)
+                config = (output / "network_config.txt").read_text(encoding="utf-8")
+                return manifest["load_balancing"], config.replace(str(output), "<o>")
+
+            absent = generated({"mode": "ev_hash"})
+            ops = generated({"mode": "ev_hash", "selector": "ops"})
+            self.assertEqual(absent, ops)
+            self.assertEqual(ops[0], {"mode": "ev_hash", "selector": "ops"})
+
+            manifest, config = generated({"mode": "ev_hash", "selector": "reps"})
+            self.assertEqual(
+                manifest,
+                {
+                    "mode": "ev_hash",
+                    "selector": "reps",
+                    "buffer_size": 8,
+                    "freezing_timeout_ns": 10_000_000,
+                },
+            )
+            self.assertIn(
+                "\nLOAD_BALANCING ev_hash\nPATH_SELECTOR reps\nREPS_BUFFER_SIZE 8\n"
+                "REPS_FREEZING_TIMEOUT_NS 10000000\n",
+                config,
+            )
+            manifest, config = generated(
+                {
+                    "mode": "ev_hash",
+                    "selector": "reps",
+                    "buffer_size": 4,
+                    "freezing_timeout_ns": 500_000,
+                }
+            )
+            self.assertEqual(
+                (manifest["buffer_size"], manifest["freezing_timeout_ns"]), (4, 500_000)
+            )
+            self.assertIn(
+                "\nREPS_BUFFER_SIZE 4\nREPS_FREEZING_TIMEOUT_NS 500000\n", config
+            )
+
+    def test_path_selector_refuses_what_nothing_would_read(self) -> None:
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            reps = {"mode": "ev_hash", "selector": "reps"}
+            refusals = [
+                (
+                    {"mode": "spray_uniform", "selector": "ops"},
+                    "require mode 'ev_hash'",
+                ),
+                ({"mode": "ecmp", "selector": "reps"}, "require mode 'ev_hash'"),
+                ({"mode": "ev_hash", "selector": "random"}, "selector must be one of"),
+                ({"mode": "ev_hash", "buffer_size": 8}, "'ops' does not take"),
+                ({**reps, "explore": 1}, "'reps' does not take"),
+                ({**reps, "freezing_timeout_ns": 0}, "freezing_timeout_ns must be"),
+            ]
+            refusals += [
+                ({**reps, "buffer_size": size}, "buffer_size must be")
+                for size in (0, 256, True, 1.5)
+            ]
+            for balancing, message in refusals:
+                document["network"]["load_balancing"] = balancing
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                with self.subTest(balancing=balancing):
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_profile(profile_path)
 
     def test_load_balancing_refuses_a_transport_that_cannot_carry_it(self) -> None:
         document = json.loads(
@@ -1784,7 +1875,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
 
             extra_key = json.loads(json.dumps(document))
             extra_key["network"]["load_balancing"]["selector"] = "ops"
-            refused(extra_key, "exactly 'mode'")
+            refused(extra_key, "takes no other key")
 
         ring = json.loads(
             (

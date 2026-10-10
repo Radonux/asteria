@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     from .links import (
@@ -58,6 +58,8 @@ DATA_LOSS_SCOPES = {
 }
 PACKET_TRIM_MODES = {"ftd", "bts"}
 LOAD_BALANCING_MODES = {"ecmp", "ev_hash", "spray_uniform"}
+# What chooses each data packet's entropy value under ev_hash.
+PATH_SELECTORS = ("ops", "reps")
 # The ns-3 CC_MODE number of each congestion_control.mode. 12 is no sender
 # reaction at all: a queue pair is set to link rate at creation and nothing ever
 # changes it. 1 is Mellanox DCQCN. 11 is UEC NSCC, a window per queue pair
@@ -191,16 +193,33 @@ class LoadBalancing:
     """How a leaf spreads a flow's data packets over its spine uplinks.
 
     ``ecmp`` hashes the four-tuple, so a flow keeps one path. ``ev_hash`` adds
-    a 16-bit entropy value the sender draws per packet to that hash.
-    ``spray_uniform`` has the sender name a spine per packet, uniformly at
-    random, and the source leaf send the packet up that spine. Every mode but
-    ``ecmp`` reorders a flow's packets on the way.
+    a 16-bit entropy value per packet to that hash, which ``selector`` chooses:
+    ``ops`` draws it afresh and ``reps`` reuses the values that came back on
+    unmarked acknowledgements. ``spray_uniform`` has the sender name a spine
+    per packet, uniformly at random, and the source leaf send the packet up
+    that spine. Every mode but ``ecmp`` reorders a flow's packets on the way.
     """
 
     mode: str
+    selector: str = "ops"
+    # The selector's parameters by profile key, defaults filled in.
+    parameters: tuple[tuple[str, int | float], ...] = ()
 
-    def manifest(self) -> dict[str, str]:
-        return {"mode": self.mode}
+    def manifest(self) -> dict[str, str | int | float]:
+        if self.mode != "ev_hash":
+            return {"mode": self.mode}
+        return {"mode": self.mode, "selector": self.selector, **dict(self.parameters)}
+
+    def selector_settings(self) -> str:
+        """PATH_SELECTOR and the selector's parameters. OPS has none and is the
+        simulator's default, so an ``ops`` profile writes nothing."""
+        if self.selector == "ops":
+            return ""
+        values = dict(self.parameters)
+        return f"PATH_SELECTOR {self.selector}\n" + "".join(
+            f"{parameter.key} {values[parameter.name]}\n"
+            for parameter in SELECTOR_PARAMETERS[self.selector]
+        )
 
 
 @dataclass(frozen=True)
@@ -579,6 +598,36 @@ def _load_congestion_control(document: dict[str, Any]) -> CongestionControl:
     )
 
 
+@dataclass(frozen=True)
+class SelectorParameter:
+    """One parameter of a path selector: its profile key, its simulator key,
+    the default its source gives, and the parser that validates a value."""
+
+    name: str
+    key: str
+    default: int | float
+    parse: Callable[[Any, str], int | float]
+
+
+def _reps_buffer_size(value: Any, field: str) -> int:
+    # REPS's Table 1 holds the buffer's position and its count in a byte each.
+    if _positive_int(value, field) > 255:
+        raise ValueError(f"{field} must be at most 255")
+    return value
+
+
+SELECTOR_PARAMETERS: dict[str, tuple[SelectorParameter, ...]] = {
+    "ops": (),
+    # REPS section 3.1 and its artifact's exit_freeze_after.
+    "reps": (
+        SelectorParameter("buffer_size", "REPS_BUFFER_SIZE", 8, _reps_buffer_size),
+        SelectorParameter(
+            "freezing_timeout_ns", "REPS_FREEZING_TIMEOUT_NS", 10_000_000, _positive_int
+        ),
+    ),
+}
+
+
 def _load_load_balancing(
     document: dict[str, Any],
     recovery: TransportRecovery | None,
@@ -588,13 +637,30 @@ def _load_load_balancing(
     if "load_balancing" not in document:
         return LoadBalancing(mode="ecmp")
     balancing = document["load_balancing"]
-    if not isinstance(balancing, dict) or set(balancing) != {"mode"}:
-        raise ValueError("network.load_balancing must contain exactly 'mode'")
+    if not isinstance(balancing, dict) or "mode" not in balancing:
+        raise ValueError("network.load_balancing must contain 'mode'")
     mode = balancing["mode"]
     if not isinstance(mode, str) or mode not in LOAD_BALANCING_MODES:
         raise ValueError(
             "network.load_balancing.mode must be one of "
             f"{sorted(LOAD_BALANCING_MODES)}"
+        )
+    if mode != "ev_hash" and set(balancing) != {"mode"}:
+        raise ValueError(
+            f"network.load_balancing.mode '{mode}' takes no other key; a selector "
+            "and its parameters require mode 'ev_hash'"
+        )
+    selector = balancing.get("selector", "ops")
+    if selector not in PATH_SELECTORS:
+        raise ValueError(
+            f"network.load_balancing.selector must be one of {list(PATH_SELECTORS)}"
+        )
+    parameters = SELECTOR_PARAMETERS[selector]
+    unknown = set(balancing) - {"mode", "selector"} - {p.name for p in parameters}
+    if unknown:
+        raise ValueError(
+            f"network.load_balancing.selector '{selector}' does not take "
+            f"{sorted(unknown)}"
         )
     # A reordered flow needs a receiver that holds out-of-order data and a
     # fabric that names the range it cuts, instead of a gap the receiver
@@ -610,7 +676,20 @@ def _load_load_balancing(
                 f"network.load_balancing.mode '{mode}' requires "
                 "network.packet_trimming.mode 'ftd'"
             )
-    return LoadBalancing(mode=mode)
+    return LoadBalancing(
+        mode=mode,
+        selector=selector,
+        parameters=tuple(
+            (
+                parameter.name,
+                parameter.parse(
+                    balancing.get(parameter.name, parameter.default),
+                    f"network.load_balancing.{parameter.name}",
+                ),
+            )
+            for parameter in parameters
+        ),
+    )
 
 
 def _probability(value: Any, field: str) -> float:
