@@ -23,12 +23,12 @@ DATA_LOSS_SCOPES = {
     "switch_to_switch",
 }
 PACKET_TRIM_MODES = {"ftd", "bts"}
-CONGESTION_CONTROL_MODES = {"none", "dcqcn"}
 LOAD_BALANCING_MODES = {"ecmp", "ev_hash", "spray_uniform"}
-# ns-3 CC_MODE numbers. 12 is no sender reaction at all: a queue pair is set to
-# link rate at creation and nothing ever changes it. 1 is Mellanox DCQCN.
-CC_MODE_NONE = 12
-CC_MODE_DCQCN = 1
+# The ns-3 CC_MODE number of each congestion_control.mode. 12 is no sender
+# reaction at all: a queue pair is set to link rate at creation and nothing ever
+# changes it. 1 is Mellanox DCQCN. 11 is UEC NSCC, a window per queue pair
+# clocked by per-packet acknowledgements.
+CONGESTION_CONTROL_MODES = {"none": 12, "dcqcn": 1, "nscc": 11}
 # The HPCC-era literals RATE_AI 50Mb/s, RATE_HAI 100Mb/s, MIN_RATE 100Mb/s were
 # written for 100 Gb/s links; as fractions of the link they are 1/2000, 1/1000,
 # 1/1000, which is what carries them to any other link rate.
@@ -106,10 +106,11 @@ class CongestionControl:
 
     ``none`` is what every arm before this knob ran: CC_MODE 12, where a queue
     pair blasts at link rate inside a static window and no signal slows it.
-    ``dcqcn`` is Mellanox DCQCN (CC_MODE 1), which is the only implemented mode
-    wired to trim notifications. It is not UEC's own NSCC, which is
-    window-based, so a result under it names DCQCN and not UEC congestion
-    control. The three rates are fractions of the link rate rather than
+    ``dcqcn`` is Mellanox DCQCN (CC_MODE 1), a rate controller. ``nscc`` is
+    UEC's own NSCC (CC_MODE 11): one window per queue pair, moved by the ECN
+    mark and the round trip of every acknowledged packet and cut by trims and
+    losses, so it needs a load-balancing mode that acknowledges every packet.
+    The three rates are DCQCN's and are fractions of the link rate rather than
     absolute literals, so a profile keeps its intended aggressiveness at any
     link speed. ``ecn_threshold_scale`` multiplies every switch KMIN and KMAX
     threshold and leaves the marking probability alone.
@@ -123,7 +124,7 @@ class CongestionControl:
 
     @property
     def cc_mode(self) -> int:
-        return CC_MODE_NONE if self.mode == "none" else CC_MODE_DCQCN
+        return CONGESTION_CONTROL_MODES[self.mode]
 
     def rates_bps(self, link_rate: str) -> tuple[int, int, int]:
         """Resolve the three rate knobs against a link rate such as 400Gbps."""
@@ -880,7 +881,7 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
     if topology == "ring":
         if host_count < 3:
             raise ValueError("network.ring requires at least three hosts")
-        return RingNetwork(
+        ring = RingNetwork(
             link_rate=link_rate,
             packet_payload_bytes=packet_payload_bytes,
             queue_monitor_start_ns=queue_monitor_start_ns,
@@ -891,6 +892,8 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
             fabric=fabric,
             congestion_control=congestion_control,
         )
+        _require_acknowledged_packets(ring)
+        return ring
 
     hosts_per_leaf = _positive_int(document["hosts_per_leaf"], "network.hosts_per_leaf")
     spine_count = _positive_int(document["spine_count"], "network.spine_count")
@@ -912,7 +915,7 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
     load_balancing = _load_load_balancing(
         document, transport_recovery, packet_trimming
     )
-    return ClosNetwork(
+    clos = ClosNetwork(
         link_rate=link_rate,
         packet_payload_bytes=packet_payload_bytes,
         queue_monitor_start_ns=queue_monitor_start_ns,
@@ -927,6 +930,25 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
         congestion_control=congestion_control,
         load_balancing=load_balancing,
     )
+    _require_acknowledged_packets(clos)
+    return clos
+
+
+def _require_acknowledged_packets(network: PhysicalNetwork) -> None:
+    """Refuse NSCC where the receiver does not acknowledge every packet.
+
+    NSCC clocks its window on the acknowledgement of each data packet and times
+    each from the packet's send record; under ``ecmp`` the receiver
+    acknowledges cumulatively and the sender keeps no records.
+    """
+    if (
+        network.congestion_control.mode == "nscc"
+        and network.load_balancing.mode == "ecmp"
+    ):
+        raise ValueError(
+            "network.congestion_control.mode 'nscc' requires "
+            "network.load_balancing.mode 'ev_hash' or 'spray_uniform'"
+        )
 
 
 def build_topology(network: PhysicalNetwork, host_count: int) -> TopologyLayout:

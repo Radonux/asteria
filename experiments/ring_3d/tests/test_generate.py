@@ -321,7 +321,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "congestion_control"):
                 load_profile(profile_path)
 
-            document["network"]["congestion_control"] = {"mode": "nscc"}
+            document["network"]["congestion_control"] = {"mode": "swift"}
             profile_path.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "congestion_control.mode"):
                 load_profile(profile_path)
@@ -333,6 +333,55 @@ class Ring3DGeneratorTests(unittest.TestCase):
             profile_path.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "min_rate_fraction"):
                 load_profile(profile_path)
+
+    def test_congestion_control_nscc_writes_mode_eleven(self) -> None:
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        document["network"]["congestion_control"] = {"mode": "nscc"}
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            for mode in ("ev_hash", "spray_uniform"):
+                document["network"]["load_balancing"] = {"mode": mode}
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                output = Path(temporary_directory) / mode
+                manifest = materialize(profile_path, output)
+                config = (output / "network_config.txt").read_text(encoding="utf-8")
+                with self.subTest(mode=mode):
+                    self.assertEqual(manifest["congestion_control"]["mode"], "nscc")
+                    self.assertEqual(manifest["congestion_control"]["cc_mode"], 11)
+                    self.assertIn("\nCC_MODE 11\n", config)
+                    self.assertIn(f"\nLOAD_BALANCING {mode}\n", config)
+                    self.assertIn("\nHAS_WIN 1\n", config)
+
+    def test_congestion_control_nscc_refuses_ecmp(self) -> None:
+        """NSCC needs an acknowledgement per packet, which ECMP does not send."""
+        ring_path = (
+            REPOSITORY_ROOT / "experiments/ring_3d/profiles/model_100b_256_ring.json"
+        )
+        clos_path = (
+            REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+        )
+        absent = json.loads(clos_path.read_text(encoding="utf-8"))
+        explicit = json.loads(json.dumps(absent))
+        explicit["network"]["load_balancing"] = {"mode": "ecmp"}
+        ring = json.loads(ring_path.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            for name, document in (
+                ("clos without load_balancing", absent),
+                ("clos with ecmp", explicit),
+                ("ring", ring),
+            ):
+                document["network"]["congestion_control"] = {"mode": "nscc"}
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                with self.subTest(network=name):
+                    with self.assertRaisesRegex(
+                        ValueError, "'nscc' requires network.load_balancing.mode"
+                    ):
+                        load_profile(profile_path)
 
     def test_congestion_control_bounds_each_fraction_at_one(self) -> None:
         """A fraction of the link rate: exactly the link rate is the ceiling."""
