@@ -73,6 +73,7 @@ Profiles are strict JSON input validated by `generate.py`; unknown fields fail.
 | `model.gradient_accumulation_steps` | Accumulation microbatches represented by the 70B sampled layer window | 2 | The generator emits the sampled TP pattern for each accumulation microbatch; it does not replay every model layer |
 | `model` | Structural or bounded event-window metadata | 70B BF16/FP16 sample | Validated against trace shape |
 | `workload.kind: "sequential_dp_all_reduce"` | Communication-only trace with one chained DP All-Reduce per step | 64-rank Phase-1 reference | Requires $TP=PP=1$, zero compute/TP/PP bytes, and no model metadata |
+| `workload.kind: "permutation"` | Communication-only trace in which every rank sends one message of `workload.message_bytes` to the rank `workload.shift` places on, modulo the rank count, and receives one from the rank as far back; no message waits for anything and none carries a parallel dimension | Absent | Requires `shift` in $[1, \text{ranks})$, a positive `message_bytes`, `steps` 1, zero compute/TP/PP bytes, no model metadata, `microburst_enabled: false`, and no `dp_all_reduce_bytes`. With eight hosts per leaf, `shift: 8` sends every rank's message to the next leaf |
 
 `selection_policy` is a strict profile object. `compare.py` holds the fixed-low
 baseline at `p_low` for both phases, then compares it with a policy that uses

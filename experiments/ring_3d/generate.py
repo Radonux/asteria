@@ -147,6 +147,12 @@ DP_ALL_REDUCE_IMPLEMENTATION_PATTERN = re.compile(
     r"^(ring|direct(?:[1-9][0-9]{0,4})?)$"
 )
 SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD = "sequential_dp_all_reduce"
+PERMUTATION_WORKLOAD = "permutation"
+WORKLOAD_KINDS = frozenset(
+    {DEFAULT_WORKLOAD_KIND, SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD, PERMUTATION_WORKLOAD}
+)
+# The tag every permutation message carries; one pair of ranks exchanges one.
+PERMUTATION_TAG = 1
 
 
 @dataclass(frozen=True)
@@ -306,10 +312,39 @@ class SelectionPolicy:
 
 
 @dataclass(frozen=True)
+class Permutation:
+    """Every rank sends one message to the rank ``shift`` places on."""
+
+    shift: int
+    message_bytes: int
+
+    def destination(self, rank: int, ranks: int) -> int:
+        return (rank + self.shift) % ranks
+
+    def source(self, rank: int, ranks: int) -> int:
+        return (rank - self.shift) % ranks
+
+
+@dataclass(frozen=True)
 class Workload:
     """Trace-shape selector retained in the profile provenance."""
 
     kind: str
+    # Present exactly when the kind is the permutation.
+    permutation: Permutation | None = None
+
+    def __post_init__(self) -> None:
+        if (self.kind == PERMUTATION_WORKLOAD) != (self.permutation is not None):
+            raise ValueError("a permutation workload, and no other, carries a permutation")
+
+    def manifest(self) -> dict[str, Any]:
+        if self.permutation is None:
+            return {"kind": self.kind}
+        return {
+            "kind": self.kind,
+            "shift": self.permutation.shift,
+            "message_bytes": self.permutation.message_bytes,
+        }
 
 
 @dataclass(frozen=True)
@@ -488,15 +523,29 @@ def _load_workload(document: dict[str, Any]) -> Workload:
     value = document.get("workload")
     if value is None:
         return Workload(DEFAULT_WORKLOAD_KIND)
-    if not isinstance(value, dict) or set(value) != {"kind"}:
-        raise ValueError("workload must contain exactly ['kind']")
+    if not isinstance(value, dict) or "kind" not in value:
+        raise ValueError("workload must contain 'kind'")
     kind = value["kind"]
-    if kind not in {DEFAULT_WORKLOAD_KIND, SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD}:
+    if kind not in WORKLOAD_KINDS:
+        raise ValueError(f"workload.kind must be one of {sorted(WORKLOAD_KINDS)}")
+    if kind != PERMUTATION_WORKLOAD:
+        if set(value) != {"kind"}:
+            raise ValueError(f"workload.kind '{kind}' takes no other key")
+        return Workload(kind)
+    if set(value) != {"kind", "shift", "message_bytes"}:
         raise ValueError(
-            "workload.kind must be one of "
-            f"{sorted({DEFAULT_WORKLOAD_KIND, SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD})}"
+            "workload.kind 'permutation' must contain exactly "
+            "['kind', 'message_bytes', 'shift']"
         )
-    return Workload(kind)
+    return Workload(
+        kind,
+        Permutation(
+            shift=_require_positive_int(value["shift"], "workload.shift"),
+            message_bytes=_require_positive_int(
+                value["message_bytes"], "workload.message_bytes"
+            ),
+        ),
+    )
 
 
 def _load_explicit_clr_schedule(
@@ -635,9 +684,21 @@ def parse_profile_document(document: Any) -> Profile:
     unknown_keys = set(document) - EXPECTED_PROFILE_KEYS
     if unknown_keys:
         raise ValueError(f"unknown profile keys: {sorted(unknown_keys)}")
-    missing_keys = REQUIRED_PROFILE_KEYS - set(document)
+    workload = _load_workload(document)
+    # A permutation's message size is its own, so it takes no DP bucket size.
+    required_keys = (
+        REQUIRED_PROFILE_KEYS - {"dp_all_reduce_bytes"}
+        if workload.permutation is not None
+        else REQUIRED_PROFILE_KEYS
+    )
+    missing_keys = required_keys - set(document)
     if missing_keys:
         raise ValueError(f"missing profile keys: {sorted(missing_keys)}")
+    if workload.permutation is not None and "dp_all_reduce_bytes" in document:
+        raise ValueError(
+            "workload.kind 'permutation' sends workload.message_bytes and takes "
+            "no dp_all_reduce_bytes"
+        )
     if document.get("schema_version") != 1:
         raise ValueError("profile schema_version must be 1")
 
@@ -653,7 +714,6 @@ def parse_profile_document(document: Any) -> Profile:
     dp = _require_positive_int(parallelism["dp"], "parallelism.dp")
     ranks = tp * pp * dp
     selection_policy = _load_selection_policy(document)
-    workload = _load_workload(document)
     explicit_clr_schedule = _load_explicit_clr_schedule(document, steps)
     network = load_network(document.get("network"), ranks)
     if selection_policy.domain in FORGIVING_DOMAINS:
@@ -766,8 +826,12 @@ def parse_profile_document(document: Any) -> Profile:
             document.get("tp_all_reduce_bytes"), "tp_all_reduce_bytes"
         ),
         pp_bytes=_require_nonnegative_int(document.get("pp_bytes"), "pp_bytes"),
-        dp_all_reduce_bytes=_require_positive_int(
-            document.get("dp_all_reduce_bytes"), "dp_all_reduce_bytes"
+        dp_all_reduce_bytes=(
+            0
+            if workload.permutation is not None
+            else _require_positive_int(
+                document.get("dp_all_reduce_bytes"), "dp_all_reduce_bytes"
+            )
         ),
         seed=_require_positive_int(document.get("seed"), "seed"),
         selection_policy=selection_policy,
@@ -789,7 +853,26 @@ def parse_profile_document(document: Any) -> Profile:
         dp_all_reduce_implementation=dp_all_reduce_implementation,
         model=model,
     )
-    if profile.workload.kind == SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD:
+    if profile.workload.permutation is not None:
+        if profile.workload.permutation.shift >= profile.ranks:
+            raise ValueError("workload.shift must be below the rank count")
+        if profile.steps != 1:
+            raise ValueError("workload.kind 'permutation' sends once and needs steps 1")
+        if (
+            profile.compute_duration_us != 0
+            or profile.tp_all_reduce_bytes != 0
+            or profile.pp_bytes != 0
+        ):
+            raise ValueError(
+                "workload.kind 'permutation' requires compute_duration_us, "
+                "tp_all_reduce_bytes and pp_bytes to be zero"
+            )
+        if profile.model is not None:
+            raise ValueError("workload.kind 'permutation' cannot include model metadata")
+        # The background incast fires on a DP All-Reduce, of which there is none.
+        if profile.microburst_enabled:
+            raise ValueError("workload.kind 'permutation' requires microburst_enabled false")
+    elif profile.workload.kind == SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD:
         if profile.tp != 1 or profile.pp != 1:
             raise ValueError("sequential_dp_all_reduce requires TP=1 and PP=1")
         if profile.compute_duration_us != 0:
@@ -989,6 +1072,33 @@ class TraceWriter:
         )
         return node.id
 
+    def point_to_point_node(
+        self,
+        name: str,
+        node_type: int,
+        dependencies: Iterable[int],
+        src: int,
+        dst: int,
+        tag: int,
+        size_bytes: int,
+        step: int,
+        domain: str | None,
+    ) -> int:
+        node = self._new_node(name, node_type, dependencies)
+        node.attr.extend(
+            [
+                _attribute("is_cpu_op", bool_val=False),
+                _attribute("comm_src", uint32_val=src),
+                _attribute("comm_dst", uint32_val=dst),
+                _attribute("comm_tag", uint32_val=tag),
+                _attribute("comm_size", uint64_val=size_bytes),
+            ]
+        )
+        if domain is not None:
+            node.attr.append(_attribute("parallelism_domain", string_val=domain))
+        node.attr.append(_attribute("training_step", uint64_val=step))
+        return node.id
+
     def pipeline_node(
         self,
         name: str,
@@ -999,19 +1109,9 @@ class TraceWriter:
         tag: int,
         step: int,
     ) -> int:
-        node = self._new_node(name, node_type, dependencies)
-        node.attr.extend(
-            [
-                _attribute("is_cpu_op", bool_val=False),
-                _attribute("comm_src", uint32_val=src),
-                _attribute("comm_dst", uint32_val=dst),
-                _attribute("comm_tag", uint32_val=tag),
-                _attribute("comm_size", uint64_val=self.profile.pp_bytes),
-                _attribute("parallelism_domain", string_val="pp"),
-                _attribute("training_step", uint64_val=step),
-            ]
+        return self.point_to_point_node(
+            name, node_type, dependencies, src, dst, tag, self.profile.pp_bytes, step, "pp"
         )
-        return node.id
 
     def _build_smoke_trace(self) -> None:
         _, tp_groups, _, dp_groups = self.groups
@@ -1319,8 +1419,33 @@ class TraceWriter:
                 [*dp_reductions, *backward_pipeline],
             )
 
+    def _build_permutation_trace(self, permutation: Permutation) -> None:
+        """One message to the rank shift places on and one from the rank as
+        far back, neither waiting for anything. No parallel dimension owns
+        them, so they carry no domain."""
+        ranks = self.profile.ranks
+        destination = permutation.destination(self.rank, ranks)
+        source = permutation.source(self.rank, ranks)
+        for name, node_type, src, dst in (
+            (f"permutation_send_to_{destination}", COMM_SEND_NODE, self.rank, destination),
+            (f"permutation_recv_from_{source}", COMM_RECV_NODE, source, self.rank),
+        ):
+            self.point_to_point_node(
+                name,
+                node_type,
+                [],
+                src,
+                dst,
+                PERMUTATION_TAG,
+                permutation.message_bytes,
+                1,
+                None,
+            )
+
     def build(self) -> None:
-        if self.profile.workload.kind == SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD:
+        if self.profile.workload.permutation is not None:
+            self._build_permutation_trace(self.profile.workload.permutation)
+        elif self.profile.workload.kind == SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD:
             self._build_sequential_dp_all_reduce_trace()
         elif self.profile.model is None:
             self._build_smoke_trace()
@@ -1876,7 +2001,7 @@ def materialize(
             "p_low_threshold": scaled_threshold(selection_policy.p_low),
             "p_high_threshold": scaled_threshold(selection_policy.p_high),
         },
-        "workload": {"kind": profile.workload.kind},
+        "workload": profile.workload.manifest(),
         "collective_implementations": {
             "default_all_reduce": "ring",
             "dp_all_reduce": profile.dp_all_reduce_implementation,
