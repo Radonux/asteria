@@ -64,6 +64,12 @@ SPINE_NAMING_MODES = {"spray_uniform", "spray_policy"}
 MAX_REPORTED_SPINES = 32
 # What chooses each data packet's entropy value under ev_hash.
 PATH_SELECTORS = ("ops", "reps", "ue_oblivious", "ue_aware", "mrc")
+# What chooses each data packet's spine under spray_uniform instead of the
+# uniform draw.
+SPINE_SELECTORS = ("ack_redirect",)
+# The value an acknowledgement's redirect field names no spine with, so
+# ack_redirect names at most this many spines.
+MAX_REDIRECT_SPINES = 255
 # The ns-3 CC_MODE number of each congestion_control.mode. 12 is no sender
 # reaction at all: a queue pair is set to link rate at creation and nothing ever
 # changes it. 1 is Mellanox DCQCN. 11 is UEC NSCC, a window per queue pair
@@ -203,10 +209,13 @@ class LoadBalancing:
     values, ``ue_aware`` rotates skipping a value once after a congestion
     report, and ``mrc`` rotates over values it holds GOOD, skipped or assumed
     bad. ``spray_uniform`` has the sender name a spine per packet, uniformly at
-    random, and the source leaf send the packet up that spine. ``spray_policy``
-    names a spine per packet the same way, drawn from scores the sender builds
-    out of the grades the receiver reports in every acknowledgement. Every
-    mode but ``ecmp`` reorders a flow's packets on the way.
+    random, and the source leaf send the packet up that spine; with
+    ``selector`` ``ack_redirect`` the sender names instead the spine the latest
+    acknowledgement redirects it to, else the spine that carried the packet it
+    answers. ``spray_policy`` names a spine per packet the same way, drawn from
+    scores the sender builds out of the grades the receiver reports in every
+    acknowledgement. Every mode but ``ecmp`` reorders a flow's packets on the
+    way.
     """
 
     mode: str
@@ -215,8 +224,11 @@ class LoadBalancing:
     # in.
     parameters: tuple[tuple[str, ParameterValue], ...] = ()
 
+    def _names_selector(self) -> bool:
+        return self.mode == "ev_hash" or self.selector in SPINE_SELECTORS
+
     def manifest(self) -> dict[str, ParameterValue]:
-        if self.mode != "ev_hash":
+        if not self._names_selector():
             return {"mode": self.mode, **dict(self.parameters)}
         return {"mode": self.mode, "selector": self.selector, **dict(self.parameters)}
 
@@ -225,7 +237,7 @@ class LoadBalancing:
         default, and the parameters, each as its simulator key."""
         selector = (
             f"PATH_SELECTOR {self.selector}\n"
-            if self.mode == "ev_hash" and self.selector != "ops"
+            if self._names_selector() and self.selector != "ops"
             else ""
         )
         values = dict(self.parameters)
@@ -761,6 +773,45 @@ def _grade_reference(value: Any, field: str) -> str:
     return value
 
 
+def _grade_scope(value: Any, field: str) -> str:
+    if value not in ("per_receiver", "per_connection"):
+        raise ValueError(f"{field} must be 'per_receiver' or 'per_connection'")
+    return value
+
+
+def _grade_cost_source(value: Any, field: str) -> str:
+    if value not in ("estimate", "switch_queue"):
+        raise ValueError(f"{field} must be 'estimate' or 'switch_queue'")
+    return value
+
+
+def _trim_scoring(value: Any, field: str) -> str:
+    if value not in ("mark", "ignore"):
+        raise ValueError(f"{field} must be 'mark' or 'ignore'")
+    return value
+
+
+# ack_redirect, modelled on MPTR's ACK redirection (Wang et al., IEEE TII
+# 2026): the weight of the delay term of an arrival's score, 0.5 as MPTR's
+# default; a redirect once an arrival scores 10 percent below the best, MPTR's
+# default; spines scored per connection, from its own arrivals; the best
+# spine kept for two base RTTs, within MPTR's cycle of one to three round
+# trips; and a header trimmed before the last hop scored as a marked arrival
+# on its spine. The last two only per connection: per receiver, the host's
+# grader scores the spines once per report interval and counts trims.
+ACK_REDIRECT_PARAMETERS: tuple[BalancingParameter, ...] = (
+    BalancingParameter("omega", "ACK_REDIRECT_OMEGA", 0.5, _probability),
+    BalancingParameter("flag", "ACK_REDIRECT_FLAG", 0.1, _nonnegative_number),
+    BalancingParameter("scope", "ACK_REDIRECT_SCOPE", "per_connection", _grade_scope),
+    BalancingParameter(
+        "validity_base_rtts", "ACK_REDIRECT_VALIDITY_BASE_RTTS", 2.0, _positive_number
+    ),
+    BalancingParameter(
+        "trim_scoring", "ACK_REDIRECT_TRIM_SCORING", "mark", _trim_scoring
+    ),
+)
+
+
 def _window_penalty(value: Any, field: str) -> int:
     # UEC 1.0.3 section 3.6.13.2's Rcv_Cwnd_Pend is seven bits.
     if _nonnegative_int(value, field) > 127:
@@ -828,6 +879,14 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "grade_reference", "SPRAY_GRADE_REFERENCE", "median", _grade_reference
     ),
+    BalancingParameter(
+        "grade_scope", "SPRAY_GRADE_SCOPE", "per_receiver", _grade_scope
+    ),
+    # Simulation only: switch_queue grades the paths from the switches' own
+    # queue, marking, rate and loss state, which no receiver can read.
+    BalancingParameter(
+        "grade_cost_source", "SPRAY_GRADE_COST_SOURCE", "estimate", _grade_cost_source
+    ),
     BalancingParameter("one_way_delay", "SPRAY_ONE_WAY_DELAY", False, _flag),
     BalancingParameter(
         "delay_cusum_slack_base_rtts",
@@ -865,11 +924,38 @@ ONE_WAY_DELAY_PARAMETERS = {
 }
 
 
+# The parameters of spray_policy's receiver-side grader, which ack_redirect
+# also takes at scope per_receiver, where the host's grader scores the
+# spines.
+GRADER_PARAMETERS = tuple(
+    parameter
+    for parameter in POLICY_PARAMETERS
+    if parameter.name
+    in {
+        "report_interval_base_rtts",
+        "estimator_gain",
+        "estimator_interval_samples",
+        "fraction_cusum_slack",
+        "fraction_cusum_threshold",
+        "absence_fraction_of_median",
+        "absence_minimum_median",
+        "release_fraction_of_floor",
+        "one_way_delay",
+        "delay_cusum_slack_base_rtts",
+        "delay_cusum_threshold_base_rtts",
+    }
+)
+# The parameters only ack_redirect's per_connection scope reads.
+ACK_REDIRECT_CONNECTION_PARAMETERS = {"validity_base_rtts", "trim_scoring"}
+
+
 def _parameters_of(mode: str, selector: str) -> tuple[BalancingParameter, ...]:
     if mode == "ev_hash":
         return SELECTOR_PARAMETERS[selector]
     if mode == "spray_policy":
         return POLICY_PARAMETERS
+    if selector == "ack_redirect":
+        return ACK_REDIRECT_PARAMETERS + GRADER_PARAMETERS
     return ()
 
 
@@ -892,10 +978,13 @@ def _load_load_balancing(
         )
     if mode == "spray_policy":
         return _load_spray_policy(balancing, recovery, trimming)
+    if mode == "spray_uniform" and balancing.get("selector") in SPINE_SELECTORS:
+        return _load_spine_selector(balancing, recovery, trimming)
     if mode != "ev_hash" and set(balancing) != {"mode"}:
         raise ValueError(
             f"network.load_balancing.mode '{mode}' takes no other key; a selector "
-            "and its parameters require mode 'ev_hash'"
+            "and its parameters require mode 'ev_hash', or mode 'spray_uniform' "
+            f"for a selector in {list(SPINE_SELECTORS)}"
         )
     selector = balancing.get("selector", "ops")
     if selector not in PATH_SELECTORS:
@@ -912,6 +1001,43 @@ def _load_load_balancing(
     _require_reorder_tolerance(mode, recovery, trimming)
     return LoadBalancing(
         mode=mode,
+        selector=selector,
+        parameters=_parsed(balancing, parameters),
+    )
+
+
+def _load_spine_selector(
+    balancing: dict[str, Any],
+    recovery: TransportRecovery | None,
+    trimming: PacketTrimming | None,
+) -> LoadBalancing:
+    """spray_uniform with a selector that chooses each spine, and its
+    parameters."""
+    selector = balancing["selector"]
+    scope = _grade_scope(
+        balancing.get("scope", "per_connection"), "network.load_balancing.scope"
+    )
+    one_way_delay = _flag(
+        balancing.get("one_way_delay", False), "network.load_balancing.one_way_delay"
+    )
+    if scope == "per_connection":
+        parameters = ACK_REDIRECT_PARAMETERS
+    else:
+        parameters = tuple(
+            parameter
+            for parameter in ACK_REDIRECT_PARAMETERS + GRADER_PARAMETERS
+            if parameter.name not in ACK_REDIRECT_CONNECTION_PARAMETERS
+            and (one_way_delay or parameter.name not in ONE_WAY_DELAY_PARAMETERS)
+        )
+    unknown = set(balancing) - {"mode", "selector"} - {p.name for p in parameters}
+    if unknown:
+        raise ValueError(
+            f"network.load_balancing.selector '{selector}' with scope '{scope}' "
+            f"does not take {sorted(unknown)}"
+        )
+    _require_reorder_tolerance("spray_uniform", recovery, trimming)
+    return LoadBalancing(
+        mode="spray_uniform",
         selector=selector,
         parameters=_parsed(balancing, parameters),
     )
@@ -935,6 +1061,13 @@ def _load_spray_policy(
     delay_only = sorted(set(balancing) & ONE_WAY_DELAY_PARAMETERS)
     if not one_way_delay and delay_only:
         raise ValueError(f"network.load_balancing {delay_only} require one_way_delay")
+    if balancing.get("grade_cost_source") == "switch_queue" and balancing.get(
+        "grade_scope", "per_receiver"
+    ) != "per_receiver":
+        raise ValueError(
+            "network.load_balancing.grade_cost_source 'switch_queue' requires "
+            "grade_scope 'per_receiver'"
+        )
     _require_reorder_tolerance("spray_policy", recovery, trimming)
     return LoadBalancing(
         mode="spray_policy",
@@ -1498,7 +1631,8 @@ def _require_acknowledged_packets(network: PhysicalNetwork) -> None:
 
 
 def _require_reported_spines(network: ClosNetwork) -> None:
-    """Refuse a spray_policy report over more spines than it can grade."""
+    """Refuse a spray_policy report over more spines than it can grade, and an
+    ack_redirect field over more spines than it can name."""
     if (
         network.load_balancing.mode == "spray_policy"
         and network.live_spine_count > MAX_REPORTED_SPINES
@@ -1506,6 +1640,23 @@ def _require_reported_spines(network: ClosNetwork) -> None:
         raise ValueError(
             "network.load_balancing.mode 'spray_policy' grades at most "
             f"{MAX_REPORTED_SPINES} spines"
+        )
+    if (
+        network.load_balancing.selector == "ack_redirect"
+        and dict(network.load_balancing.parameters).get("scope") == "per_receiver"
+        and network.live_spine_count > MAX_REPORTED_SPINES
+    ):
+        raise ValueError(
+            "network.load_balancing.selector 'ack_redirect' with scope "
+            f"'per_receiver' grades at most {MAX_REPORTED_SPINES} spines"
+        )
+    if (
+        network.load_balancing.selector == "ack_redirect"
+        and network.live_spine_count >= MAX_REDIRECT_SPINES
+    ):
+        raise ValueError(
+            "network.load_balancing.selector 'ack_redirect' names at most "
+            f"{MAX_REDIRECT_SPINES - 1} spines"
         )
 
 

@@ -1903,6 +1903,8 @@ class Ring3DGeneratorTests(unittest.TestCase):
                     "absence_minimum_median": 16,
                     "release_fraction_of_floor": 0.5,
                     "grade_reference": "median",
+                    "grade_scope": "per_receiver",
+                    "grade_cost_source": "estimate",
                     "one_way_delay": False,
                     "gamma": 0.25,
                     "epsilon": 0.02,
@@ -1923,6 +1925,8 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 "SPRAY_ABSENCE_MINIMUM_MEDIAN 16\n"
                 "SPRAY_RELEASE_FRACTION_OF_FLOOR 0.5\n"
                 "SPRAY_GRADE_REFERENCE median\n"
+                "SPRAY_GRADE_SCOPE per_receiver\n"
+                "SPRAY_GRADE_COST_SOURCE estimate\n"
                 "SPRAY_ONE_WAY_DELAY 0\n"
                 "SPRAY_GAMMA 0.25\n"
                 "SPRAY_EPSILON 0.02\n"
@@ -1949,6 +1953,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
                     "absence_minimum_median": 8,
                     "release_fraction_of_floor": 2,
                     "grade_reference": "absolute",
+                    "grade_scope": "per_connection",
                     "gamma": 1,
                     "epsilon": 0,
                     "candidates": 3,
@@ -1972,6 +1977,8 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 "SPRAY_ABSENCE_MINIMUM_MEDIAN 8\n"
                 "SPRAY_RELEASE_FRACTION_OF_FLOOR 2.0\n"
                 "SPRAY_GRADE_REFERENCE absolute\n"
+                "SPRAY_GRADE_SCOPE per_connection\n"
+                "SPRAY_GRADE_COST_SOURCE estimate\n"
                 "SPRAY_ONE_WAY_DELAY 1\n"
                 "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS 0.25\n"
                 "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS 2.0\n"
@@ -1981,6 +1988,16 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 "SPRAY_CANDIDATES 3\n"
                 "SPRAY_CANDIDATE_DRAW uniform\n"
                 "SPRAY_EDGE_WINDOW_PENALTY 127\n",
+                config,
+            )
+
+            manifest, config = generated(
+                {"mode": "spray_policy", "grade_cost_source": "switch_queue"}
+            )
+            self.assertEqual(manifest["grade_cost_source"], "switch_queue")
+            self.assertIn(
+                "\nSPRAY_GRADE_SCOPE per_receiver\n"
+                "SPRAY_GRADE_COST_SOURCE switch_queue\n",
                 config,
             )
 
@@ -2009,6 +2026,34 @@ class Ring3DGeneratorTests(unittest.TestCase):
             ({**policy, "one_way_delay": 1}, "one_way_delay must be a boolean"),
             ({**policy, "candidate_draw": "best"}, "candidate_draw must be"),
             ({**policy, "grade_reference": "rank"}, "grade_reference must be"),
+            ({**policy, "grade_scope": "per_host"}, "grade_scope must be"),
+            ({**policy, "grade_cost_source": "queues"}, "grade_cost_source must be"),
+            (
+                {
+                    **policy,
+                    "grade_cost_source": "switch_queue",
+                    "grade_scope": "per_connection",
+                },
+                "requires grade_scope 'per_receiver'",
+            ),
+            (
+                {"mode": "spray_uniform", "grade_cost_source": "switch_queue"},
+                "takes no other key",
+            ),
+            (
+                {
+                    "mode": "spray_uniform",
+                    "selector": "ack_redirect",
+                    "scope": "per_receiver",
+                    "grade_cost_source": "switch_queue",
+                },
+                "does not take",
+            ),
+            (
+                {"mode": "spray_uniform", "grade_scope": "per_connection"},
+                "takes no other key",
+            ),
+            ({"mode": "ev_hash", "grade_scope": "per_receiver"}, "'ops' does not take"),
             ({**policy, "congestion_thresholds": [0.5, 0.25, 0.75]}, "must increase"),
             ({**policy, "congestion_thresholds": [0.25, 0.5]}, "three thresholds"),
             (
@@ -2118,6 +2163,211 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 profile_path.write_text(json.dumps(document), encoding="utf-8")
                 with self.subTest(balancing=balancing):
                     with self.assertRaisesRegex(ValueError, message):
+                        load_profile(profile_path)
+
+    def test_ack_redirect_and_its_parameters_reach_the_configuration(self) -> None:
+        """ack_redirect under spray_uniform writes its key and every parameter,
+        defaults filled in; spray_uniform without it writes neither."""
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            runs = itertools.count()
+
+            def generated(balancing: dict[str, object]) -> tuple[dict, str]:
+                document["network"]["load_balancing"] = balancing
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                output = Path(temporary_directory) / f"run{next(runs)}"
+                manifest = materialize(profile_path, output)
+                config = (output / "network_config.txt").read_text(encoding="utf-8")
+                return manifest["load_balancing"], config.replace(str(output), "<o>")
+
+            manifest, config = generated({"mode": "spray_uniform"})
+            self.assertEqual(manifest, {"mode": "spray_uniform"})
+            self.assertNotIn("PATH_SELECTOR", config)
+            self.assertNotIn("ACK_REDIRECT", config)
+
+            manifest, config = generated(
+                {"mode": "spray_uniform", "selector": "ack_redirect"}
+            )
+            self.assertEqual(
+                manifest,
+                {
+                    "mode": "spray_uniform",
+                    "selector": "ack_redirect",
+                    "omega": 0.5,
+                    "flag": 0.1,
+                    "scope": "per_connection",
+                    "validity_base_rtts": 2.0,
+                    "trim_scoring": "mark",
+                },
+            )
+            self.assertIn(
+                "\nLOAD_BALANCING spray_uniform\n"
+                "PATH_SELECTOR ack_redirect\n"
+                "ACK_REDIRECT_OMEGA 0.5\n"
+                "ACK_REDIRECT_FLAG 0.1\n"
+                "ACK_REDIRECT_SCOPE per_connection\n"
+                "ACK_REDIRECT_VALIDITY_BASE_RTTS 2.0\n"
+                "ACK_REDIRECT_TRIM_SCORING mark\n",
+                config,
+            )
+            self.assertNotIn("SPRAY_", config)
+
+            manifest, config = generated(
+                {
+                    "mode": "spray_uniform",
+                    "selector": "ack_redirect",
+                    "omega": 0.3,
+                    "flag": 0.15,
+                    "validity_base_rtts": 3,
+                    "trim_scoring": "ignore",
+                }
+            )
+            self.assertIn(
+                "\nPATH_SELECTOR ack_redirect\n"
+                "ACK_REDIRECT_OMEGA 0.3\n"
+                "ACK_REDIRECT_FLAG 0.15\n"
+                "ACK_REDIRECT_SCOPE per_connection\n"
+                "ACK_REDIRECT_VALIDITY_BASE_RTTS 3.0\n"
+                "ACK_REDIRECT_TRIM_SCORING ignore\n",
+                config,
+            )
+
+    def test_ack_redirect_per_receiver_takes_the_grader_parameters(self) -> None:
+        """At scope per_receiver ack_redirect writes the host grader's
+        parameters, defaults filled in, and none of the per-connection ones."""
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            document["network"]["load_balancing"] = {
+                "mode": "spray_uniform",
+                "selector": "ack_redirect",
+                "scope": "per_receiver",
+                "estimator_gain": 0.25,
+            }
+            profile_path.write_text(json.dumps(document), encoding="utf-8")
+            output = Path(temporary_directory) / "run"
+            manifest = materialize(profile_path, output)
+            config = (output / "network_config.txt").read_text(encoding="utf-8")
+        self.assertEqual(
+            manifest["load_balancing"],
+            {
+                "mode": "spray_uniform",
+                "selector": "ack_redirect",
+                "omega": 0.5,
+                "flag": 0.1,
+                "scope": "per_receiver",
+                "report_interval_base_rtts": 2.0,
+                "estimator_gain": 0.25,
+                "estimator_interval_samples": 32,
+                "fraction_cusum_slack": 0.125,
+                "fraction_cusum_threshold": 0.5,
+                "absence_fraction_of_median": 0.125,
+                "absence_minimum_median": 16,
+                "release_fraction_of_floor": 0.5,
+                "one_way_delay": False,
+            },
+        )
+        self.assertIn(
+            "\nPATH_SELECTOR ack_redirect\n"
+            "ACK_REDIRECT_OMEGA 0.5\n"
+            "ACK_REDIRECT_FLAG 0.1\n"
+            "ACK_REDIRECT_SCOPE per_receiver\n"
+            "SPRAY_REPORT_INTERVAL_BASE_RTTS 2.0\n"
+            "SPRAY_ESTIMATOR_GAIN 0.25\n",
+            config,
+        )
+        self.assertNotIn("ACK_REDIRECT_VALIDITY", config)
+        self.assertNotIn("SPRAY_GAMMA", config)
+
+    def test_ack_redirect_refuses_what_nothing_would_read(self) -> None:
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        redirect = {"mode": "spray_uniform", "selector": "ack_redirect"}
+        host = {**redirect, "scope": "per_receiver"}
+        refusals = [
+            (
+                {"mode": "ev_hash", "selector": "ack_redirect"},
+                "selector must be one of",
+            ),
+            ({"mode": "ecmp", "selector": "ack_redirect"}, "takes no other key"),
+            ({"mode": "spray_policy", "selector": "ack_redirect"}, "does not take"),
+            ({"mode": "spray_policy", "omega": 0.5}, "does not take"),
+            ({"mode": "spray_uniform", "flag": 0.1}, "takes no other key"),
+            ({"mode": "ev_hash", "selector": "reps", "omega": 0.5}, "does not take"),
+            (
+                {**redirect, "gamma": 0.25},
+                "'ack_redirect' with scope 'per_connection' does not take",
+            ),
+            ({**redirect, "grade_scope": "per_connection"}, "does not take"),
+            ({**redirect, "trim_scoring": "drop"}, "trim_scoring must be"),
+            ({**redirect, "scope": "per_host"}, "scope must be"),
+            ({**redirect, "estimator_gain": 0.5}, "does not take"),
+            ({"mode": "spray_policy", "scope": "per_receiver"}, "does not take"),
+            ({**host, "validity_base_rtts": 1}, "does not take"),
+            ({**host, "trim_scoring": "mark"}, "does not take"),
+            ({**host, "gamma": 0.5}, "does not take"),
+            ({**host, "delay_cusum_slack_base_rtts": 0.1}, "does not take"),
+            ({**host, "estimator_gain": 0}, "estimator_gain must be"),
+        ]
+        for knob, values in (
+            ("omega", (-0.1, 1.5, True, "half")),
+            ("flag", (-0.1, True, float("nan"))),
+            ("validity_base_rtts", (0, -1, True)),
+        ):
+            refusals += [
+                ({**redirect, knob: value}, f"{knob} must be") for value in values
+            ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            for balancing, message in refusals:
+                document["network"]["load_balancing"] = balancing
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                with self.subTest(balancing=balancing):
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_profile(profile_path)
+
+            without_repair = json.loads(json.dumps(document))
+            without_repair["network"]["load_balancing"] = redirect
+            del without_repair["network"]["transport_recovery"]["selective_repair"]
+            profile_path.write_text(json.dumps(without_repair), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "selective_repair"):
+                load_profile(profile_path)
+
+            # The field names a spine below 255.
+            for spines, refused in ((254, False), (255, True)):
+                wide = json.loads(json.dumps(document))
+                wide["network"]["spine_count"] = spines
+                wide["network"]["load_balancing"] = redirect
+                profile_path.write_text(json.dumps(wide), encoding="utf-8")
+                with self.subTest(spines=spines):
+                    if refused:
+                        with self.assertRaisesRegex(ValueError, "at most 254 spines"):
+                            load_profile(profile_path)
+                    else:
+                        load_profile(profile_path)
+            # The host's grader grades at most 32 spines.
+            for spines, refused in ((32, False), (33, True)):
+                wide = json.loads(json.dumps(document))
+                wide["network"]["spine_count"] = spines
+                wide["network"]["load_balancing"] = host
+                profile_path.write_text(json.dumps(wide), encoding="utf-8")
+                with self.subTest(spines=spines, scope="per_receiver"):
+                    if refused:
+                        with self.assertRaisesRegex(ValueError, "at most 32 spines"):
+                            load_profile(profile_path)
+                    else:
                         load_profile(profile_path)
 
     def test_load_balancing_refuses_a_transport_that_cannot_carry_it(self) -> None:
