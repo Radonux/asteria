@@ -2165,6 +2165,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
                     "selector": "ack_redirect",
                     "omega": 0.5,
                     "flag": 0.1,
+                    "scope": "per_connection",
                     "validity_base_rtts": 2.0,
                     "trim_scoring": "mark",
                 },
@@ -2174,6 +2175,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 "PATH_SELECTOR ack_redirect\n"
                 "ACK_REDIRECT_OMEGA 0.5\n"
                 "ACK_REDIRECT_FLAG 0.1\n"
+                "ACK_REDIRECT_SCOPE per_connection\n"
                 "ACK_REDIRECT_VALIDITY_BASE_RTTS 2.0\n"
                 "ACK_REDIRECT_TRIM_SCORING mark\n",
                 config,
@@ -2194,10 +2196,62 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 "\nPATH_SELECTOR ack_redirect\n"
                 "ACK_REDIRECT_OMEGA 0.3\n"
                 "ACK_REDIRECT_FLAG 0.15\n"
+                "ACK_REDIRECT_SCOPE per_connection\n"
                 "ACK_REDIRECT_VALIDITY_BASE_RTTS 3.0\n"
                 "ACK_REDIRECT_TRIM_SCORING ignore\n",
                 config,
             )
+
+    def test_ack_redirect_per_receiver_takes_the_grader_parameters(self) -> None:
+        """At scope per_receiver ack_redirect writes the host grader's
+        parameters, defaults filled in, and none of the per-connection ones."""
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            document["network"]["load_balancing"] = {
+                "mode": "spray_uniform",
+                "selector": "ack_redirect",
+                "scope": "per_receiver",
+                "estimator_gain": 0.25,
+            }
+            profile_path.write_text(json.dumps(document), encoding="utf-8")
+            output = Path(temporary_directory) / "run"
+            manifest = materialize(profile_path, output)
+            config = (output / "network_config.txt").read_text(encoding="utf-8")
+        self.assertEqual(
+            manifest["load_balancing"],
+            {
+                "mode": "spray_uniform",
+                "selector": "ack_redirect",
+                "omega": 0.5,
+                "flag": 0.1,
+                "scope": "per_receiver",
+                "report_interval_base_rtts": 2.0,
+                "estimator_gain": 0.25,
+                "estimator_interval_samples": 32,
+                "fraction_cusum_slack": 0.125,
+                "fraction_cusum_threshold": 0.5,
+                "absence_fraction_of_median": 0.125,
+                "absence_minimum_median": 16,
+                "release_fraction_of_floor": 0.5,
+                "one_way_delay": False,
+            },
+        )
+        self.assertIn(
+            "\nPATH_SELECTOR ack_redirect\n"
+            "ACK_REDIRECT_OMEGA 0.5\n"
+            "ACK_REDIRECT_FLAG 0.1\n"
+            "ACK_REDIRECT_SCOPE per_receiver\n"
+            "SPRAY_REPORT_INTERVAL_BASE_RTTS 2.0\n"
+            "SPRAY_ESTIMATOR_GAIN 0.25\n",
+            config,
+        )
+        self.assertNotIn("ACK_REDIRECT_VALIDITY", config)
+        self.assertNotIn("SPRAY_GAMMA", config)
 
     def test_ack_redirect_refuses_what_nothing_would_read(self) -> None:
         document = json.loads(
@@ -2206,16 +2260,31 @@ class Ring3DGeneratorTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
         )
         redirect = {"mode": "spray_uniform", "selector": "ack_redirect"}
+        host = {**redirect, "scope": "per_receiver"}
         refusals = [
-            ({"mode": "ev_hash", "selector": "ack_redirect"}, "selector must be one of"),
+            (
+                {"mode": "ev_hash", "selector": "ack_redirect"},
+                "selector must be one of",
+            ),
             ({"mode": "ecmp", "selector": "ack_redirect"}, "takes no other key"),
             ({"mode": "spray_policy", "selector": "ack_redirect"}, "does not take"),
             ({"mode": "spray_policy", "omega": 0.5}, "does not take"),
             ({"mode": "spray_uniform", "flag": 0.1}, "takes no other key"),
             ({"mode": "ev_hash", "selector": "reps", "omega": 0.5}, "does not take"),
-            ({**redirect, "gamma": 0.25}, "'ack_redirect' does not take"),
+            (
+                {**redirect, "gamma": 0.25},
+                "'ack_redirect' with scope 'per_connection' does not take",
+            ),
             ({**redirect, "grade_scope": "per_connection"}, "does not take"),
             ({**redirect, "trim_scoring": "drop"}, "trim_scoring must be"),
+            ({**redirect, "scope": "per_host"}, "scope must be"),
+            ({**redirect, "estimator_gain": 0.5}, "does not take"),
+            ({"mode": "spray_policy", "scope": "per_receiver"}, "does not take"),
+            ({**host, "validity_base_rtts": 1}, "does not take"),
+            ({**host, "trim_scoring": "mark"}, "does not take"),
+            ({**host, "gamma": 0.5}, "does not take"),
+            ({**host, "delay_cusum_slack_base_rtts": 0.1}, "does not take"),
+            ({**host, "estimator_gain": 0}, "estimator_gain must be"),
         ]
         for knob, values in (
             ("omega", (-0.1, 1.5, True, "half")),
@@ -2250,6 +2319,18 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 with self.subTest(spines=spines):
                     if refused:
                         with self.assertRaisesRegex(ValueError, "at most 254 spines"):
+                            load_profile(profile_path)
+                    else:
+                        load_profile(profile_path)
+            # The host's grader grades at most 32 spines.
+            for spines, refused in ((32, False), (33, True)):
+                wide = json.loads(json.dumps(document))
+                wide["network"]["spine_count"] = spines
+                wide["network"]["load_balancing"] = host
+                profile_path.write_text(json.dumps(wide), encoding="utf-8")
+                with self.subTest(spines=spines, scope="per_receiver"):
+                    if refused:
+                        with self.assertRaisesRegex(ValueError, "at most 32 spines"):
                             load_profile(profile_path)
                     else:
                         load_profile(profile_path)

@@ -788,12 +788,15 @@ def _trim_scoring(value: Any, field: str) -> str:
 # ack_redirect, modelled on MPTR's ACK redirection (Wang et al., IEEE TII
 # 2026): the weight of the delay term of an arrival's score, 0.5 as MPTR's
 # default; a redirect once an arrival scores 10 percent below the best, MPTR's
-# default; the best spine kept for two base RTTs, within MPTR's cycle of one to
-# three round trips; and a header trimmed before the last hop scored as a
-# marked arrival on its spine.
+# default; spines scored per connection, from its own arrivals; the best
+# spine kept for two base RTTs, within MPTR's cycle of one to three round
+# trips; and a header trimmed before the last hop scored as a marked arrival
+# on its spine. The last two only per connection: per receiver, the host's
+# grader scores the spines once per report interval and counts trims.
 ACK_REDIRECT_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter("omega", "ACK_REDIRECT_OMEGA", 0.5, _probability),
     BalancingParameter("flag", "ACK_REDIRECT_FLAG", 0.1, _nonnegative_number),
+    BalancingParameter("scope", "ACK_REDIRECT_SCOPE", "per_connection", _grade_scope),
     BalancingParameter(
         "validity_base_rtts", "ACK_REDIRECT_VALIDITY_BASE_RTTS", 2.0, _positive_number
     ),
@@ -910,13 +913,38 @@ ONE_WAY_DELAY_PARAMETERS = {
 }
 
 
+# The parameters of spray_policy's receiver-side grader, which ack_redirect
+# also takes at scope per_receiver, where the host's grader scores the
+# spines.
+GRADER_PARAMETERS = tuple(
+    parameter
+    for parameter in POLICY_PARAMETERS
+    if parameter.name
+    in {
+        "report_interval_base_rtts",
+        "estimator_gain",
+        "estimator_interval_samples",
+        "fraction_cusum_slack",
+        "fraction_cusum_threshold",
+        "absence_fraction_of_median",
+        "absence_minimum_median",
+        "release_fraction_of_floor",
+        "one_way_delay",
+        "delay_cusum_slack_base_rtts",
+        "delay_cusum_threshold_base_rtts",
+    }
+)
+# The parameters only ack_redirect's per_connection scope reads.
+ACK_REDIRECT_CONNECTION_PARAMETERS = {"validity_base_rtts", "trim_scoring"}
+
+
 def _parameters_of(mode: str, selector: str) -> tuple[BalancingParameter, ...]:
     if mode == "ev_hash":
         return SELECTOR_PARAMETERS[selector]
     if mode == "spray_policy":
         return POLICY_PARAMETERS
     if selector == "ack_redirect":
-        return ACK_REDIRECT_PARAMETERS
+        return ACK_REDIRECT_PARAMETERS + GRADER_PARAMETERS
     return ()
 
 
@@ -975,19 +1003,32 @@ def _load_spine_selector(
     """spray_uniform with a selector that chooses each spine, and its
     parameters."""
     selector = balancing["selector"]
-    unknown = set(balancing) - {"mode", "selector"} - {
-        p.name for p in ACK_REDIRECT_PARAMETERS
-    }
+    scope = _grade_scope(
+        balancing.get("scope", "per_connection"), "network.load_balancing.scope"
+    )
+    one_way_delay = _flag(
+        balancing.get("one_way_delay", False), "network.load_balancing.one_way_delay"
+    )
+    if scope == "per_connection":
+        parameters = ACK_REDIRECT_PARAMETERS
+    else:
+        parameters = tuple(
+            parameter
+            for parameter in ACK_REDIRECT_PARAMETERS + GRADER_PARAMETERS
+            if parameter.name not in ACK_REDIRECT_CONNECTION_PARAMETERS
+            and (one_way_delay or parameter.name not in ONE_WAY_DELAY_PARAMETERS)
+        )
+    unknown = set(balancing) - {"mode", "selector"} - {p.name for p in parameters}
     if unknown:
         raise ValueError(
-            f"network.load_balancing.selector '{selector}' does not take "
-            f"{sorted(unknown)}"
+            f"network.load_balancing.selector '{selector}' with scope '{scope}' "
+            f"does not take {sorted(unknown)}"
         )
     _require_reorder_tolerance("spray_uniform", recovery, trimming)
     return LoadBalancing(
         mode="spray_uniform",
         selector=selector,
-        parameters=_parsed(balancing, ACK_REDIRECT_PARAMETERS),
+        parameters=_parsed(balancing, parameters),
     )
 
 
@@ -1581,6 +1622,15 @@ def _require_reported_spines(network: ClosNetwork) -> None:
         raise ValueError(
             "network.load_balancing.mode 'spray_policy' grades at most "
             f"{MAX_REPORTED_SPINES} spines"
+        )
+    if (
+        network.load_balancing.selector == "ack_redirect"
+        and dict(network.load_balancing.parameters).get("scope") == "per_receiver"
+        and network.live_spine_count > MAX_REPORTED_SPINES
+    ):
+        raise ValueError(
+            "network.load_balancing.selector 'ack_redirect' with scope "
+            f"'per_receiver' grades at most {MAX_REPORTED_SPINES} spines"
         )
     if (
         network.load_balancing.selector == "ack_redirect"
