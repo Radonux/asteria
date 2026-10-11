@@ -779,6 +779,12 @@ def _grade_scope(value: Any, field: str) -> str:
     return value
 
 
+def _grade_cost_source(value: Any, field: str) -> str:
+    if value not in ("estimate", "switch_queue"):
+        raise ValueError(f"{field} must be 'estimate' or 'switch_queue'")
+    return value
+
+
 def _trim_scoring(value: Any, field: str) -> str:
     if value not in ("mark", "ignore"):
         raise ValueError(f"{field} must be 'mark' or 'ignore'")
@@ -875,6 +881,11 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     ),
     BalancingParameter(
         "grade_scope", "SPRAY_GRADE_SCOPE", "per_receiver", _grade_scope
+    ),
+    # Simulation only: switch_queue grades the paths from the switches' own
+    # queue, marking, rate and loss state, which no receiver can read.
+    BalancingParameter(
+        "grade_cost_source", "SPRAY_GRADE_COST_SOURCE", "estimate", _grade_cost_source
     ),
     BalancingParameter("one_way_delay", "SPRAY_ONE_WAY_DELAY", False, _flag),
     BalancingParameter(
@@ -1050,6 +1061,13 @@ def _load_spray_policy(
     delay_only = sorted(set(balancing) & ONE_WAY_DELAY_PARAMETERS)
     if not one_way_delay and delay_only:
         raise ValueError(f"network.load_balancing {delay_only} require one_way_delay")
+    if balancing.get("grade_cost_source") == "switch_queue" and balancing.get(
+        "grade_scope", "per_receiver"
+    ) != "per_receiver":
+        raise ValueError(
+            "network.load_balancing.grade_cost_source 'switch_queue' requires "
+            "grade_scope 'per_receiver'"
+        )
     _require_reorder_tolerance("spray_policy", recovery, trimming)
     return LoadBalancing(
         mode="spray_policy",

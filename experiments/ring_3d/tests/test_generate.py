@@ -1904,6 +1904,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
                     "release_fraction_of_floor": 0.5,
                     "grade_reference": "median",
                     "grade_scope": "per_receiver",
+                    "grade_cost_source": "estimate",
                     "one_way_delay": False,
                     "gamma": 0.25,
                     "epsilon": 0.02,
@@ -1925,6 +1926,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 "SPRAY_RELEASE_FRACTION_OF_FLOOR 0.5\n"
                 "SPRAY_GRADE_REFERENCE median\n"
                 "SPRAY_GRADE_SCOPE per_receiver\n"
+                "SPRAY_GRADE_COST_SOURCE estimate\n"
                 "SPRAY_ONE_WAY_DELAY 0\n"
                 "SPRAY_GAMMA 0.25\n"
                 "SPRAY_EPSILON 0.02\n"
@@ -1976,6 +1978,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 "SPRAY_RELEASE_FRACTION_OF_FLOOR 2.0\n"
                 "SPRAY_GRADE_REFERENCE absolute\n"
                 "SPRAY_GRADE_SCOPE per_connection\n"
+                "SPRAY_GRADE_COST_SOURCE estimate\n"
                 "SPRAY_ONE_WAY_DELAY 1\n"
                 "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS 0.25\n"
                 "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS 2.0\n"
@@ -1985,6 +1988,16 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 "SPRAY_CANDIDATES 3\n"
                 "SPRAY_CANDIDATE_DRAW uniform\n"
                 "SPRAY_EDGE_WINDOW_PENALTY 127\n",
+                config,
+            )
+
+            manifest, config = generated(
+                {"mode": "spray_policy", "grade_cost_source": "switch_queue"}
+            )
+            self.assertEqual(manifest["grade_cost_source"], "switch_queue")
+            self.assertIn(
+                "\nSPRAY_GRADE_SCOPE per_receiver\n"
+                "SPRAY_GRADE_COST_SOURCE switch_queue\n",
                 config,
             )
 
@@ -2014,6 +2027,28 @@ class Ring3DGeneratorTests(unittest.TestCase):
             ({**policy, "candidate_draw": "best"}, "candidate_draw must be"),
             ({**policy, "grade_reference": "rank"}, "grade_reference must be"),
             ({**policy, "grade_scope": "per_host"}, "grade_scope must be"),
+            ({**policy, "grade_cost_source": "queues"}, "grade_cost_source must be"),
+            (
+                {
+                    **policy,
+                    "grade_cost_source": "switch_queue",
+                    "grade_scope": "per_connection",
+                },
+                "requires grade_scope 'per_receiver'",
+            ),
+            (
+                {"mode": "spray_uniform", "grade_cost_source": "switch_queue"},
+                "takes no other key",
+            ),
+            (
+                {
+                    "mode": "spray_uniform",
+                    "selector": "ack_redirect",
+                    "scope": "per_receiver",
+                    "grade_cost_source": "switch_queue",
+                },
+                "does not take",
+            ),
             (
                 {"mode": "spray_uniform", "grade_scope": "per_connection"},
                 "takes no other key",
