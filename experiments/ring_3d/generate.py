@@ -13,6 +13,7 @@ import json
 import re
 import shutil
 import sys
+from collections import Counter
 from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
@@ -1929,10 +1930,25 @@ def write_experiment_config(
     path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
 
 
+def sends_per_rank(profile: Profile) -> int:
+    """The most messages one rank sends in an incast, which all start at
+    once; one for every other workload."""
+    incast = profile.workload.incast
+    if incast is None:
+        return 1
+    hosts_per_leaf = profile.network.hosts_per_leaf
+    sources = Counter(
+        source
+        for source, _, _ in incast.messages(hosts_per_leaf, profile.ranks // hosts_per_leaf)
+    )
+    return max(sources.values())
+
+
 def write_system_config(
     path: Path,
     dp_group_ids: Iterable[int] = (),
     dp_all_reduce_implementation: str = "ring",
+    comm_ops_in_flight: int = 1,
 ) -> None:
     configuration: dict[str, Any] = {
         "scheduling-policy": "LIFO",
@@ -1949,6 +1965,11 @@ def write_system_config(
         "roofline-enabled": 0,
         "peak-perf": 900,
     }
+    # The workload layer runs one send or collective at a time per rank
+    # unless told otherwise; a rank whose messages must all start at once
+    # needs that many in flight. One is the layer's default and stays out.
+    if comm_ops_in_flight > 1:
+        configuration["comm-ops-in-flight"] = comm_ops_in_flight
     if dp_all_reduce_implementation != "ring":
         # Override only the DP communicator groups: TP and PP keep the
         # global ring while every DP all-reduce runs the incast-forming
@@ -2104,6 +2125,7 @@ def materialize(
         system_config,
         dp_group_ids=set(dp_groups.values()),
         dp_all_reduce_implementation=profile.dp_all_reduce_implementation,
+        comm_ops_in_flight=sends_per_rank(profile),
     )
     (output_dir / "communicator_groups.json").write_text(
         json.dumps(groups, indent=2) + "\n", encoding="utf-8"

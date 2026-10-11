@@ -320,6 +320,9 @@ class Sys : public Callable {
     InterDimensionScheduling inter_dimension_scheduling;
     int round_robin_inter_dimension_scheduler;
     int active_chunks_per_dimension;
+    // Sends and collectives a rank may have in flight at once; receives
+    // never count. One serializes them, as the workload layer always has.
+    uint32_t comm_ops_in_flight = 1;
     int priority_counter;
     uint64_t pending_events;
     int preferred_dataset_splits;

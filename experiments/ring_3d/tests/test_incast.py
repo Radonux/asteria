@@ -133,6 +133,7 @@ class IncastTraceTests(unittest.TestCase):
                 rank: _nodes(output / f"workload/ring_3d.{rank}.et")
                 for rank in range(64)
             }
+            system = json.loads((output / "system.json").read_text(encoding="utf-8"))
         self.assertEqual(
             manifest["workload"],
             {
@@ -142,6 +143,9 @@ class IncastTraceTests(unittest.TestCase):
                 "message_bytes": 2_097_152,
             },
         )
+        # 256 messages over 56 sending hosts: every message starts at once only
+        # if a rank may hold its most, five, in flight.
+        self.assertEqual(system["comm-ops-in-flight"], 5)
         expected = Incast(0, 32, 2_097_152).messages(8, 8)
         sends = sorted(
             _ends(node)[:3]
