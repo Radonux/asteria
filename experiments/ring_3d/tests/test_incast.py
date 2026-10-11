@@ -15,6 +15,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from chakra.schema.protobuf.et_def_pb2 import (
+    COMP_NODE,
     COMM_RECV_NODE,
     COMM_SEND_NODE,
     GlobalMetadata,
@@ -330,6 +331,32 @@ class IncastTraceTests(unittest.TestCase):
         )
         # Hosts 6 and 7 of a receiving leaf receive nothing.
         self.assertFalse([node for node in traces[14] if node.type == COMM_RECV_NODE])
+
+    def test_a_rank_with_no_message_still_has_a_node(self) -> None:
+        document = _incast(fan_in=8)
+        del document["workload"]["receiver_leaf"]
+        document["workload"].update({"receiver_leaves": [0, 1], "receiver_count": 6})
+        messages = Incast((0, 1), 8, 2_097_152, 6).messages(8, 8)
+        busy = {rank for message in messages for rank in message[:2]}
+        self.assertIn(7, set(range(64)) - busy)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "profile.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            output = Path(temporary_directory) / "out"
+            materialize(path, output)
+            traces = {
+                rank: _nodes(output / f"workload/ring_3d.{rank}.et")
+                for rank in range(64)
+            }
+        for rank, nodes in traces.items():
+            with self.subTest(rank=rank):
+                self.assertTrue(nodes)
+                if rank not in busy:
+                    self.assertEqual(
+                        [(node.type, node.duration_micros) for node in nodes],
+                        [(COMP_NODE, 0)],
+                    )
+                    self.assertEqual(list(nodes[0].ctrl_deps), [])
 
 
 if __name__ == "__main__":

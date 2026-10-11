@@ -1613,9 +1613,17 @@ class TraceWriter:
 
     def _build_incast_trace(self, incast: Incast) -> None:
         """This rank's sends and receives of the incast, none waiting for
-        anything. No parallel dimension owns them, so they carry no domain."""
+        anything. No parallel dimension owns them, so they carry no domain.
+
+        A rank that neither sends nor receives gets one compute node of zero
+        duration (an incast's compute_duration_us is zero) with no
+        dependencies, since the workload layer refuses a trace with no
+        node."""
         hosts_per_leaf = self.profile.network.hosts_per_leaf
         messages = incast.messages(hosts_per_leaf, self.profile.ranks // hosts_per_leaf)
+        if not any(self.rank in message[:2] for message in messages):
+            self.compute("incast_idle", [])
+            return
         for source, destination, tag in messages:
             if source == self.rank:
                 name, node_type = f"incast_send_to_{destination}_{tag}", COMM_SEND_NODE
