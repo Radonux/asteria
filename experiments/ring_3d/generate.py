@@ -26,6 +26,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from chakra.schema.protobuf.et_def_pb2 import (  # noqa: E402
     ALL_REDUCE,
+    ALL_TO_ALL,
     COMM_COLL_NODE,
     COMM_RECV_NODE,
     COMM_SEND_NODE,
@@ -152,14 +153,22 @@ DP_ALL_REDUCE_IMPLEMENTATION_PATTERN = re.compile(
 SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD = "sequential_dp_all_reduce"
 PERMUTATION_WORKLOAD = "permutation"
 INCAST_WORKLOAD = "incast"
+ALL_TO_ALL_WORKLOAD = "all_to_all"
 WORKLOAD_KINDS = frozenset(
     {
         DEFAULT_WORKLOAD_KIND,
         SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD,
         PERMUTATION_WORKLOAD,
         INCAST_WORKLOAD,
+        ALL_TO_ALL_WORKLOAD,
     }
 )
+# The system layer splits every collective into this many chunks
+# (system.json preferred-dataset-splits).
+PREFERRED_DATASET_SPLITS = 4
+# The native algorithm an all-to-all workload's group runs: every member sends
+# to every other member at once (CollectiveImplLookup "direct", no window).
+ALL_TO_ALL_IMPLEMENTATION = "direct"
 # The tag every permutation message carries; one pair of ranks exchanges one.
 PERMUTATION_TAG = 1
 
@@ -381,6 +390,39 @@ class Incast:
 
 
 @dataclass(frozen=True)
+class AllToAll:
+    """Every member of the group runs ``iterations`` native all-to-all
+    collectives, each sending ``message_bytes`` to every other member, with a
+    compute of ``compute_ns`` between consecutive iterations.
+
+    ``leaves`` None is every host; otherwise the group is every host on the
+    listed leaves, in rank order.
+    """
+
+    message_bytes: int
+    iterations: int
+    compute_ns: int
+    leaves: tuple[int, ...] | None = None
+
+    def members(self, ranks: int, hosts_per_leaf: int | None) -> tuple[int, ...]:
+        if self.leaves is None:
+            return tuple(range(ranks))
+        if hosts_per_leaf is None:
+            raise ValueError("workload.group.leaves needs a Clos fabric")
+        return tuple(
+            rank for rank in range(ranks) if rank // hosts_per_leaf in self.leaves
+        )
+
+    def collective_bytes(self, group_size: int) -> int:
+        """The collective's comm_size: the system layer sends each other
+        member one group_size-th of it."""
+        return self.message_bytes * group_size
+
+    def manifest_group(self) -> str | dict[str, list[int]]:
+        return "all" if self.leaves is None else {"leaves": list(self.leaves)}
+
+
+@dataclass(frozen=True)
 class Workload:
     """Trace-shape selector retained in the profile provenance."""
 
@@ -389,6 +431,8 @@ class Workload:
     permutation: Permutation | None = None
     # Present exactly when the kind is the incast.
     incast: Incast | None = None
+    # Present exactly when the kind is the all-to-all.
+    all_to_all: AllToAll | None = None
 
     def __post_init__(self) -> None:
         if (self.kind == PERMUTATION_WORKLOAD) != (self.permutation is not None):
@@ -397,12 +441,22 @@ class Workload:
             )
         if (self.kind == INCAST_WORKLOAD) != (self.incast is not None):
             raise ValueError("an incast workload, and no other, carries an incast")
+        if (self.kind == ALL_TO_ALL_WORKLOAD) != (self.all_to_all is not None):
+            raise ValueError(
+                "an all_to_all workload, and no other, carries an all-to-all"
+            )
 
     @property
     def point_to_point(self) -> bool:
         """Whether the trace is bare messages of the workload's own size, with
         no training step around them."""
         return self.permutation is not None or self.incast is not None
+
+    @property
+    def communication_only(self) -> bool:
+        """Whether the trace is communication of the workload's own size alone:
+        no compute or TP/PP bytes of a training step, and no DP bucket."""
+        return self.point_to_point or self.all_to_all is not None
 
     def manifest(self) -> dict[str, Any]:
         if self.permutation is not None:
@@ -418,6 +472,14 @@ class Workload:
                 "receiver_count": self.incast.receiver_count,
                 "fan_in": self.incast.fan_in,
                 "message_bytes": self.incast.message_bytes,
+            }
+        if self.all_to_all is not None:
+            return {
+                "kind": self.kind,
+                "group": self.all_to_all.manifest_group(),
+                "message_bytes": self.all_to_all.message_bytes,
+                "iterations": self.all_to_all.iterations,
+                "compute_ns": self.all_to_all.compute_ns,
             }
         return {"kind": self.kind}
 
@@ -605,6 +667,8 @@ def _load_workload(document: dict[str, Any]) -> Workload:
         raise ValueError(f"workload.kind must be one of {sorted(WORKLOAD_KINDS)}")
     if kind == INCAST_WORKLOAD:
         return Workload(kind, incast=_load_incast(value))
+    if kind == ALL_TO_ALL_WORKLOAD:
+        return Workload(kind, all_to_all=_load_all_to_all(value))
     if kind != PERMUTATION_WORKLOAD:
         if set(value) != {"kind"}:
             raise ValueError(f"workload.kind '{kind}' takes no other key")
@@ -666,6 +730,45 @@ def _load_incast(value: dict[str, Any]) -> Incast:
             if "receiver_count" in value
             else None
         ),
+    )
+
+
+def _load_all_to_all(value: dict[str, Any]) -> AllToAll:
+    """The all-to-all's keys; the group and the sizes are bounded by the
+    fabric later."""
+    if set(value) != {"kind", "group", "message_bytes", "iterations", "compute_ns"}:
+        raise ValueError(
+            "workload.kind 'all_to_all' must contain exactly "
+            "['compute_ns', 'group', 'iterations', 'kind', 'message_bytes']"
+        )
+    group = value["group"]
+    if group == "all":
+        leaves = None
+    else:
+        if not isinstance(group, dict) or set(group) != {"leaves"}:
+            raise ValueError(
+                "workload.group must be 'all' or an object of exactly ['leaves']"
+            )
+        listed = group["leaves"]
+        if not isinstance(listed, list) or not listed:
+            raise ValueError("workload.group.leaves must be a nonempty array")
+        leaves = tuple(
+            _require_nonnegative_int(leaf, "workload.group.leaves")
+            for leaf in listed
+        )
+        if len(set(leaves)) != len(leaves):
+            raise ValueError("workload.group.leaves must be distinct")
+    compute_ns = _require_nonnegative_int(value["compute_ns"], "workload.compute_ns")
+    # A Chakra compute node's duration is whole microseconds.
+    if compute_ns % 1_000:
+        raise ValueError("workload.compute_ns must be a multiple of 1000")
+    return AllToAll(
+        message_bytes=_require_positive_int(
+            value["message_bytes"], "workload.message_bytes"
+        ),
+        iterations=_require_positive_int(value["iterations"], "workload.iterations"),
+        compute_ns=compute_ns,
+        leaves=leaves,
     )
 
 
@@ -806,17 +909,17 @@ def parse_profile_document(document: Any) -> Profile:
     if unknown_keys:
         raise ValueError(f"unknown profile keys: {sorted(unknown_keys)}")
     workload = _load_workload(document)
-    # A point-to-point workload's message size is its own, so it takes no DP
-    # bucket size.
+    # A communication-only workload's message size is its own, so it takes no
+    # DP bucket size.
     required_keys = (
         REQUIRED_PROFILE_KEYS - {"dp_all_reduce_bytes"}
-        if workload.point_to_point
+        if workload.communication_only
         else REQUIRED_PROFILE_KEYS
     )
     missing_keys = required_keys - set(document)
     if missing_keys:
         raise ValueError(f"missing profile keys: {sorted(missing_keys)}")
-    if workload.point_to_point and "dp_all_reduce_bytes" in document:
+    if workload.communication_only and "dp_all_reduce_bytes" in document:
         raise ValueError(
             f"workload.kind '{workload.kind}' sends workload.message_bytes and "
             "takes no dp_all_reduce_bytes"
@@ -961,7 +1064,7 @@ def parse_profile_document(document: Any) -> Profile:
         pp_bytes=_require_nonnegative_int(document.get("pp_bytes"), "pp_bytes"),
         dp_all_reduce_bytes=(
             0
-            if workload.point_to_point
+            if workload.communication_only
             else _require_positive_int(
                 document.get("dp_all_reduce_bytes"), "dp_all_reduce_bytes"
             )
@@ -986,10 +1089,11 @@ def parse_profile_document(document: Any) -> Profile:
         dp_all_reduce_implementation=dp_all_reduce_implementation,
         model=model,
     )
-    if profile.workload.point_to_point:
+    if profile.workload.communication_only:
         kind = profile.workload.kind
         permutation = profile.workload.permutation
         incast = profile.workload.incast
+        all_to_all = profile.workload.all_to_all
         if permutation is not None and permutation.shift >= profile.ranks:
             raise ValueError("workload.shift must be below the rank count")
         if incast is not None:
@@ -1010,7 +1114,9 @@ def parse_profile_document(document: Any) -> Profile:
                 raise ValueError(
                     "workload.receiver_count must be at most network.hosts_per_leaf"
                 )
-        if profile.steps != 1:
+        if all_to_all is not None:
+            _check_all_to_all(all_to_all, profile)
+        elif profile.steps != 1:
             raise ValueError(f"workload.kind '{kind}' sends once and needs steps 1")
         if (
             profile.compute_duration_us != 0
@@ -1081,6 +1187,66 @@ def parse_profile_document(document: Any) -> Profile:
                 "per-rank gradient bucket bytes"
             )
     return profile
+
+
+def _check_all_to_all(all_to_all: AllToAll, profile: Profile) -> None:
+    """The group fits the fabric, and the system layer sends each pair
+    exactly message_bytes."""
+    if all_to_all.leaves is not None:
+        if profile.network.kind != "clos":
+            raise ValueError("workload.group.leaves needs a Clos fabric")
+        leaf_count = profile.ranks // profile.network.hosts_per_leaf
+        if max(all_to_all.leaves) >= leaf_count:
+            raise ValueError(
+                "each of workload.group.leaves must be below the leaf count"
+            )
+    group_size = len(all_to_all_members(profile))
+    if group_size < 2:
+        raise ValueError(
+            "workload.kind 'all_to_all' needs a group of two ranks or more"
+        )
+    # Iteration i is training step i, so the CLR mask and the experiment's
+    # scale cover every step the trace names.
+    if profile.steps != all_to_all.iterations:
+        raise ValueError(
+            "workload.kind 'all_to_all' runs one iteration per step and needs "
+            "steps equal to workload.iterations"
+        )
+    # The system layer cuts the collective into PREFERRED_DATASET_SPLITS
+    # chunks and each chunk into group_size messages, one per member, with
+    # integer division; a chunk below the rank count is resized. Either would
+    # send a pair other than message_bytes.
+    if all_to_all.message_bytes % PREFERRED_DATASET_SPLITS:
+        raise ValueError(
+            "workload.message_bytes must be a multiple of "
+            f"{PREFERRED_DATASET_SPLITS} for 'all_to_all'"
+        )
+    chunk_bytes = all_to_all.collective_bytes(group_size) // PREFERRED_DATASET_SPLITS
+    if chunk_bytes < profile.ranks:
+        raise ValueError(
+            "workload.message_bytes times the group size must be at least "
+            f"{PREFERRED_DATASET_SPLITS} times the rank count for 'all_to_all'"
+        )
+
+
+def all_to_all_members(profile: Profile) -> tuple[int, ...]:
+    """The ranks of the all-to-all's group, in rank order."""
+    all_to_all = profile.workload.all_to_all
+    if all_to_all is None:
+        raise ValueError("the workload is not an all-to-all")
+    return all_to_all.members(
+        profile.ranks,
+        profile.network.hosts_per_leaf if profile.network.kind == "clos" else None,
+    )
+
+
+def all_to_all_group_id(profile: Profile) -> int | None:
+    """The communicator group of the all-to-all, numbered after every TP, PP
+    and DP group; None for every other workload."""
+    if profile.workload.all_to_all is None:
+        return None
+    tp, pp, dp = profile.tp, profile.pp, profile.dp
+    return dp * pp + dp * tp + pp * tp + 1
 
 
 def rank_for(tp_rank: int, pp_rank: int, dp_rank: int, profile: Profile) -> int:
@@ -1166,6 +1332,10 @@ def generate_groups(
     expected_group_count = (
         profile.dp * profile.pp + profile.dp * profile.tp + profile.pp * profile.tp
     )
+    all_to_all_group = all_to_all_group_id(profile)
+    if all_to_all_group is not None:
+        groups[str(all_to_all_group)] = list(all_to_all_members(profile))
+        expected_group_count += 1
     if len(groups) != expected_group_count:
         raise AssertionError("unexpected communicator group count")
     return groups, tp_group_for_rank, pp_group_for_rank, dp_group_for_rank
@@ -1200,9 +1370,18 @@ class TraceWriter:
         self.nodes.append(node)
         return node
 
-    def compute(self, name: str, dependencies: Iterable[int]) -> int:
+    def compute(
+        self,
+        name: str,
+        dependencies: Iterable[int],
+        duration_us: int | None = None,
+    ) -> int:
+        """A compute node of duration_us, the profile's compute_duration_us
+        when None."""
         node = self._new_node(name, COMP_NODE, dependencies)
-        node.duration_micros = self.profile.compute_duration_us
+        node.duration_micros = (
+            self.profile.compute_duration_us if duration_us is None else duration_us
+        )
         node.attr.append(_attribute("is_cpu_op", bool_val=False))
         return node.id
 
@@ -1215,17 +1394,32 @@ class TraceWriter:
         size_bytes: int,
         step: int,
     ) -> int:
+        return self.collective(
+            name, dependencies, ALL_REDUCE, group_id, size_bytes, step, domain
+        )
+
+    def collective(
+        self,
+        name: str,
+        dependencies: Iterable[int],
+        comm_type: int,
+        group_id: int,
+        size_bytes: int,
+        step: int,
+        domain: str | None,
+    ) -> int:
         node = self._new_node(name, COMM_COLL_NODE, dependencies)
         node.attr.extend(
             [
                 _attribute("is_cpu_op", bool_val=False),
-                _attribute("comm_type", int64_val=ALL_REDUCE),
+                _attribute("comm_type", int64_val=comm_type),
                 _attribute("comm_size", uint64_val=size_bytes),
                 _attribute("pg_name", string_val=str(group_id)),
-                _attribute("parallelism_domain", string_val=domain),
-                _attribute("training_step", uint64_val=step),
             ]
         )
+        if domain is not None:
+            node.attr.append(_attribute("parallelism_domain", string_val=domain))
+        node.attr.append(_attribute("training_step", uint64_val=step))
         return node.id
 
     def point_to_point_node(
@@ -1643,11 +1837,43 @@ class TraceWriter:
                 None,
             )
 
+    def _build_all_to_all_trace(self, all_to_all: AllToAll) -> None:
+        """A member's chain of all-to-all collectives over the group, the i-th
+        carrying training step i and no domain, each after the previous one
+        and, when compute_ns is positive, a compute of that length between
+        them. A rank outside the group gets one compute node of zero
+        duration with no dependencies, as an idle incast rank does."""
+        members = all_to_all_members(self.profile)
+        if self.rank not in members:
+            self.compute("all_to_all_idle", [])
+            return
+        group_id = all_to_all_group_id(self.profile)
+        assert group_id is not None
+        predecessor: int | None = None
+        for iteration in range(1, all_to_all.iterations + 1):
+            if predecessor is not None and all_to_all.compute_ns:
+                predecessor = self.compute(
+                    f"iteration_{iteration - 1}_compute",
+                    [predecessor],
+                    all_to_all.compute_ns // 1_000,
+                )
+            predecessor = self.collective(
+                f"iteration_{iteration}_all_to_all",
+                [] if predecessor is None else [predecessor],
+                ALL_TO_ALL,
+                group_id,
+                all_to_all.collective_bytes(len(members)),
+                iteration,
+                None,
+            )
+
     def build(self) -> None:
         if self.profile.workload.permutation is not None:
             self._build_permutation_trace(self.profile.workload.permutation)
         elif self.profile.workload.incast is not None:
             self._build_incast_trace(self.profile.workload.incast)
+        elif self.profile.workload.all_to_all is not None:
+            self._build_all_to_all_trace(self.profile.workload.all_to_all)
         elif self.profile.workload.kind == SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD:
             self._build_sequential_dp_all_reduce_trace()
         elif self.profile.model is None:
@@ -1827,6 +2053,8 @@ def counter_files(load_balancing: LoadBalancing, output_dir: Path) -> dict[str, 
         files["SPINE_ARRIVAL_OUTPUT_FILE"] = output_dir / "spine_arrivals.csv"
     if load_balancing.mode == "spray_policy":
         files["SPINE_REPORT_OUTPUT_FILE"] = output_dir / "spine_reports.csv"
+    if load_balancing.traces_spine_loss():
+        files["SPINE_LOSS_OUTPUT_FILE"] = output_dir / "spine_losses.csv"
     return files
 
 
@@ -2017,12 +2245,13 @@ def write_system_config(
     dp_group_ids: Iterable[int] = (),
     dp_all_reduce_implementation: str = "ring",
     comm_ops_in_flight: int = 1,
+    all_to_all_group_id: int | None = None,
 ) -> None:
     configuration: dict[str, Any] = {
         "scheduling-policy": "LIFO",
         "endpoint-delay": 10,
         "active-chunks-per-dimension": 1,
-        "preferred-dataset-splits": 4,
+        "preferred-dataset-splits": PREFERRED_DATASET_SPLITS,
         "all-reduce-implementation": ["ring"],
         "all-gather-implementation": ["ring"],
         "reduce-scatter-implementation": ["ring"],
@@ -2046,7 +2275,35 @@ def write_system_config(
             str(group_id): dp_all_reduce_implementation
             for group_id in sorted(dp_group_ids)
         }
+    if all_to_all_group_id is not None:
+        # The all-to-all workload's group runs the direct algorithm, every
+        # member sending to every other at once, over its own members; the
+        # global ring stays for everything else.
+        configuration["all-to-all-implementation-per-group"] = {
+            str(all_to_all_group_id): ALL_TO_ALL_IMPLEMENTATION
+        }
     path.write_text(json.dumps(configuration, indent=2) + "\n", encoding="utf-8")
+
+
+def workload_manifest(profile: Profile) -> dict[str, Any]:
+    """The workload's manifest entry; an all-to-all adds its group's size and
+    communicator group, which collective_events.csv rows do not name."""
+    manifest = profile.workload.manifest()
+    if profile.workload.all_to_all is not None:
+        manifest["group_size"] = len(all_to_all_members(profile))
+        manifest["communicator_group"] = all_to_all_group_id(profile)
+    return manifest
+
+
+def collective_implementations(profile: Profile) -> dict[str, Any]:
+    implementations: dict[str, Any] = {
+        "default_all_reduce": "ring",
+        "dp_all_reduce": profile.dp_all_reduce_implementation,
+        "dp_fan_in": dp_fan_in(profile.dp, profile.dp_all_reduce_implementation),
+    }
+    if profile.workload.all_to_all is not None:
+        implementations["all_to_all"] = ALL_TO_ALL_IMPLEMENTATION
+    return implementations
 
 
 def model_trace_metadata(profile: Profile) -> dict[str, int | float | str] | None:
@@ -2194,6 +2451,7 @@ def materialize(
         dp_group_ids=set(dp_groups.values()),
         dp_all_reduce_implementation=profile.dp_all_reduce_implementation,
         comm_ops_in_flight=sends_per_rank(profile),
+        all_to_all_group_id=all_to_all_group_id(profile),
     )
     (output_dir / "communicator_groups.json").write_text(
         json.dumps(groups, indent=2) + "\n", encoding="utf-8"
@@ -2228,14 +2486,8 @@ def materialize(
             "p_low_threshold": scaled_threshold(selection_policy.p_low),
             "p_high_threshold": scaled_threshold(selection_policy.p_high),
         },
-        "workload": profile.workload.manifest(),
-        "collective_implementations": {
-            "default_all_reduce": "ring",
-            "dp_all_reduce": profile.dp_all_reduce_implementation,
-            "dp_fan_in": dp_fan_in(
-                profile.dp, profile.dp_all_reduce_implementation
-            ),
-        },
+        "workload": workload_manifest(profile),
+        "collective_implementations": collective_implementations(profile),
         "clr_schedule_source": (
             {
                 "kind": "explicit_critical_steps",

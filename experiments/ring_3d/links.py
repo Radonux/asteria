@@ -20,6 +20,9 @@ from math import isfinite
 from typing import Any
 
 FAILURE_MODELS = ("graceful", "silent", "gray")
+# A failure's direction on its leaf-spine link: "up" is what the leaf sends
+# the spine, "down" what the spine sends the leaf, "both" the two.
+FAILURE_DIRECTIONS = ("up", "down", "both")
 
 
 @dataclass(frozen=True)
@@ -60,8 +63,12 @@ class LinkFailure:
     """A spine's links, or one leaf-spine link, failing at start_ns.
 
     ``graceful`` takes the links down, so the routing and every leaf see it.
-    ``silent`` leaves them up while the spine drops every packet arriving from
-    the leaves. ``gray`` gives the links an error rate or a lower rate.
+    ``silent`` leaves them up while a switch drops every packet arriving over
+    them: the spine what arrives from the leaf under ``direction`` "up", the
+    leaf what arrives from the spine under "down", both under "both". ``gray``
+    gives the links an error rate or a lower rate in the same direction or
+    directions: a loss is dropped by the receiving end, and a lower rate is
+    the sending end's.
 
     With ``duration_ns`` the links are restored that long after each failure,
     and the failure happens ``repeat`` times, ``period_ns`` apart; without it
@@ -78,6 +85,16 @@ class LinkFailure:
     duration_ns: int | None = None
     repeat: int | None = None
     period_ns: int | None = None
+    # As the profile gives it; None when it leaves it out.
+    direction: str | None = None
+
+    def effective_direction(self) -> str:
+        """The direction the failure applies in: "up" for an unspecified
+        silent failure, as one has always been written, and "both" for the
+        others, which have always applied to the link as a whole."""
+        if self.direction is not None:
+            return self.direction
+        return "up" if self.model == "silent" else "both"
 
     def occurrences(self) -> list[tuple[int, int | None]]:
         """Each occurrence's (start, end) in ns; the end is None when the
@@ -120,22 +137,52 @@ class LinkFailure:
             return "loss", " " + format(self.error_rate, ".17g")
         return "rate", f" {self.rate}"
 
+    def _ends(self, leaf: int, spine: int) -> list[tuple[int, int]]:
+        """The node pairs written for one link, in the order written. A
+        blackhole, and a loss or rate fault marked forward, applies from its
+        first node to its second, so the leaf is named first for "up" and the
+        spine first for "down". Under "both" a silent failure writes both
+        orders, and the others name the leaf first and apply both ways."""
+        direction = self.effective_direction()
+        if direction == "up":
+            return [(leaf, spine)]
+        if direction == "down":
+            return [(spine, leaf)]
+        if self.model == "silent":
+            return [(leaf, spine), (spine, leaf)]
+        return [(leaf, spine)]
+
+    def _backend_direction_token(self) -> str:
+        """The direction token after a gray failure's LINK_FAILURE line, the
+        only place one is written: " forward" for "up" and "down", which
+        _ends turns into the order of the two nodes, and none for "both", the
+        backend's default, so a failure without a direction is written as
+        before. LINK_RESTORE takes no token."""
+        if self.model == "gray" and self.effective_direction() != "both":
+            return " forward"
+        return ""
+
     def config_lines(self, index: ClosIndex) -> list[str]:
-        """Per affected link and per occurrence, one LINK_FAILURE line and,
-        with a duration, one LINK_RESTORE line; the leaf named before the
-        spine, so that a silent spine drops what arrives from the leaf."""
+        """Per affected link, per node pair _ends gives and per occurrence,
+        one LINK_FAILURE line and, with a duration, one LINK_RESTORE line
+        naming the two nodes in the same order, which the backend restores
+        that failure by."""
         kind, value = self._action()
+        token = self._backend_direction_token()
         lines = []
         for leaf in self.leaves(index.leaf_count):
-            link = f"{index.leaf(leaf)} {index.spine(self.spine)}"
-            for start, end in self.occurrences():
-                lines.append(f"LINK_FAILURE {start} {kind} {link}{value}\n")
-                if end is not None:
-                    lines.append(f"LINK_RESTORE {end} {link}\n")
+            for a, b in self._ends(index.leaf(leaf), index.spine(self.spine)):
+                link = f"{a} {b}"
+                for start, end in self.occurrences():
+                    lines.append(f"LINK_FAILURE {start} {kind} {link}{value}{token}\n")
+                    if end is not None:
+                        lines.append(f"LINK_RESTORE {end} {link}\n")
         return lines
 
     def manifest(self) -> dict[str, Any]:
-        return {
+        """The failure as given; direction only when the profile sets it, so
+        a manifest without it is unchanged."""
+        recorded: dict[str, Any] = {
             "model": self.model,
             "start_ns": self.start_ns,
             "spine": self.spine,
@@ -146,6 +193,24 @@ class LinkFailure:
             "repeat": self.repeat,
             "period_ns": self.period_ns,
         }
+        if self.direction is not None:
+            recorded["direction"] = self.direction
+        return recorded
+
+
+def _direction(entry: dict[str, Any], field: str, model: str) -> str | None:
+    """The failure's direction as given, None when absent."""
+    if "direction" not in entry:
+        return None
+    direction = entry["direction"]
+    if direction not in FAILURE_DIRECTIONS:
+        raise ValueError(f"{field}.direction must be one of {list(FAILURE_DIRECTIONS)}")
+    if model == "graceful" and direction != "both":
+        raise ValueError(
+            f"{field}.direction must be 'both' for a graceful failure, which "
+            "takes the links down in both directions"
+        )
+    return direction
 
 
 def _positive(value: Any, field: str) -> int:
@@ -284,7 +349,7 @@ def load_link_failures(
         model = entry.get("model")
         if model not in FAILURE_MODELS:
             raise ValueError(f"{field}.model must be one of {list(FAILURE_MODELS)}")
-        allowed = {"model", "start_ns", "spine", "leaf"}
+        allowed = {"model", "start_ns", "spine", "leaf", "direction"}
         if model == "gray":
             allowed |= {"error_rate", "rate"}
             if len({"error_rate", "rate"} & set(entry)) != 1:
@@ -341,6 +406,7 @@ def load_link_failures(
             duration_ns=duration_ns,
             repeat=repeat,
             period_ns=period_ns,
+            direction=_direction(entry, field, model),
         )
         for leaf in failure.leaves(clos.leaf_count):
             earlier = failed.setdefault((leaf, failure.spine), [])
