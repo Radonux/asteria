@@ -861,6 +861,14 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
         (0.25, 0.5, 0.75),
         _increasing_thresholds(_fraction),
     ),
+    # Absent, the simulator grades the trimmed fraction through
+    # congestion_thresholds.
+    BalancingParameter(
+        "trim_thresholds",
+        "SPRAY_TRIM_THRESHOLDS",
+        (0.25, 0.5, 0.75),
+        _increasing_thresholds(_fraction),
+    ),
     BalancingParameter(
         "absence_fraction_of_median",
         "SPRAY_ABSENCE_FRACTION_OF_MEDIAN",
@@ -922,7 +930,7 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
 )
 # The parameters written, and recorded in the manifest, only when the profile
 # sets them; the simulator's defaults are the defaults above.
-WRITTEN_WHEN_SET_PARAMETERS = {"edge_freeze", "sender_pool_weight"}
+WRITTEN_WHEN_SET_PARAMETERS = {"edge_freeze", "sender_pool_weight", "trim_thresholds"}
 # The parameters only one-way delay reads.
 ONE_WAY_DELAY_PARAMETERS = {
     "delay_cusum_slack_base_rtts",
