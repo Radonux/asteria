@@ -869,6 +869,20 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
         (0.25, 0.5, 0.75),
         _increasing_thresholds(_fraction),
     ),
+    # Absent, the sender counts no loss. With them, the sender counts per
+    # spine the sends drawn from its scores and the sends declared lost, and
+    # grades each spine at no more than its lost fraction earns.
+    BalancingParameter(
+        "loss_thresholds",
+        "SPRAY_LOSS_THRESHOLDS",
+        (0.25, 0.5, 0.75),
+        _increasing_thresholds(_fraction),
+    ),
+    # The host-wide pool's loss interval, 0 for the report interval; read only
+    # with loss_thresholds.
+    BalancingParameter(
+        "loss_interval_ns", "SPRAY_LOSS_INTERVAL_NS", 0, _nonnegative_int
+    ),
     BalancingParameter(
         "absence_fraction_of_median",
         "SPRAY_ABSENCE_FRACTION_OF_MEDIAN",
@@ -930,7 +944,13 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
 )
 # The parameters written, and recorded in the manifest, only when the profile
 # sets them; the simulator's defaults are the defaults above.
-WRITTEN_WHEN_SET_PARAMETERS = {"edge_freeze", "sender_pool_weight", "trim_thresholds"}
+WRITTEN_WHEN_SET_PARAMETERS = {
+    "edge_freeze",
+    "sender_pool_weight",
+    "trim_thresholds",
+    "loss_thresholds",
+    "loss_interval_ns",
+}
 # The parameters only one-way delay reads.
 ONE_WAY_DELAY_PARAMETERS = {
     "delay_cusum_slack_base_rtts",
@@ -1076,6 +1096,10 @@ def _load_spray_policy(
     delay_only = sorted(set(balancing) & ONE_WAY_DELAY_PARAMETERS)
     if not one_way_delay and delay_only:
         raise ValueError(f"network.load_balancing {delay_only} require one_way_delay")
+    if "loss_interval_ns" in balancing and "loss_thresholds" not in balancing:
+        raise ValueError(
+            "network.load_balancing.loss_interval_ns requires loss_thresholds"
+        )
     if balancing.get("grade_cost_source") == "switch_queue" and balancing.get(
         "grade_scope", "per_receiver"
     ) != "per_receiver":
