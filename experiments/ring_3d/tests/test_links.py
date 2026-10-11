@@ -285,6 +285,14 @@ def _failure_lines(config: str) -> list[str]:
     return [line for line in config.splitlines() if line.startswith("LINK_FAILURE")]
 
 
+def _change_lines(config: str) -> list[str]:
+    return [
+        line
+        for line in config.splitlines()
+        if line.startswith(("LINK_FAILURE", "LINK_RESTORE"))
+    ]
+
+
 class LinkFailureTests(LinkTests):
     def test_absent_failures_write_no_line(self) -> None:
         document = _sprayed_clos()
@@ -320,8 +328,98 @@ class LinkFailureTests(LinkTests):
                 "leaf": 0,
                 "error_rate": 0.01,
                 "rate": None,
+                "duration_ns": None,
+                "repeat": None,
+                "period_ns": None,
             },
         )
+        self.assertNotIn("LINK_RESTORE", self._config(document))
+
+    def test_a_timed_failure_is_restored_after_each_occurrence(self) -> None:
+        document = _sprayed_clos()
+        document["network"]["link_failures"] = [
+            {
+                "model": "gray",
+                "spine": 2,
+                "leaf": 1,
+                "start_ns": 1_000,
+                "rate": "200Gbps",
+                "duration_ns": 300,
+                "repeat": 3,
+                "period_ns": 500,
+            },
+            {"model": "silent", "spine": 5, "start_ns": 7, "duration_ns": 10},
+        ]
+        link = f"{LEAF + 1} {SPINE + 2}"
+        self.assertEqual(
+            _change_lines(self._config(document)),
+            [
+                f"LINK_FAILURE 1000 rate {link} 200Gbps",
+                f"LINK_RESTORE 1300 {link}",
+                f"LINK_FAILURE 1500 rate {link} 200Gbps",
+                f"LINK_RESTORE 1800 {link}",
+                f"LINK_FAILURE 2000 rate {link} 200Gbps",
+                f"LINK_RESTORE 2300 {link}",
+            ]
+            + [
+                line
+                for leaf in range(8)
+                for line in (
+                    f"LINK_FAILURE 7 blackhole {LEAF + leaf} {SPINE + 5}",
+                    f"LINK_RESTORE 17 {LEAF + leaf} {SPINE + 5}",
+                )
+            ],
+        )
+        manifest, _ = self._materialize(document)
+        self.assertEqual(
+            [
+                (failure["duration_ns"], failure["repeat"], failure["period_ns"])
+                for failure in manifest["link_failures"]
+            ],
+            [(300, 3, 500), (10, None, None)],
+        )
+
+    def test_failures_of_one_link_may_follow_each_other(self) -> None:
+        timed = {"model": "silent", "spine": 0, "leaf": 3, "duration_ns": 100}
+        allowed = (
+            [{**timed, "start_ns": 0}, {**timed, "start_ns": 101}],
+            [
+                {**timed, "start_ns": 0, "repeat": 2, "period_ns": 300},
+                {**timed, "start_ns": 150},
+                {"model": "gray", "spine": 0, "start_ns": 450, "error_rate": 0.1},
+            ],
+            [
+                {"model": "gray", "spine": 0, "start_ns": 500, "error_rate": 0.1},
+                {**timed, "start_ns": 0},
+            ],
+        )
+        for failures in allowed:
+            document = _sprayed_clos()
+            document["network"]["link_failures"] = failures
+            with self.subTest(failures=failures):
+                self.assertIn("LINK_RESTORE", self._config(document))
+        refused = (
+            [{**timed, "start_ns": 0}, {**timed, "start_ns": 100}],
+            [{**timed, "start_ns": 100}, {**timed, "start_ns": 0}],
+            [{**timed, "start_ns": 50}, {**timed, "start_ns": 0}],
+            [
+                {**timed, "start_ns": 0, "repeat": 3, "period_ns": 300},
+                {**timed, "start_ns": 650},
+            ],
+            [
+                {"model": "silent", "spine": 0, "start_ns": 0},
+                {**timed, "start_ns": 9},
+            ],
+            [
+                {**timed, "start_ns": 900},
+                {"model": "gray", "spine": 0, "start_ns": 950, "error_rate": 0.1},
+            ],
+        )
+        for failures in refused:
+            document = _sprayed_clos()
+            document["network"]["link_failures"] = failures
+            with self.subTest(failures=failures):
+                self._refused(document, "while an earlier failure of it lasts")
 
     def test_failures_refuse_what_they_cannot_mean(self) -> None:
         cases = (
@@ -368,6 +466,63 @@ class LinkFailureTests(LinkTests):
                 {"model": "silent", "spine": 0, "start_ns": -1},
                 "start_ns must be a nonnegative",
             ),
+            (
+                {"model": "graceful", "spine": 0, "start_ns": 0, "duration_ns": 5},
+                "must contain model, start_ns and spine",
+            ),
+            (
+                {"model": "silent", "spine": 0, "start_ns": 0, "repeat": 1},
+                "must contain model, start_ns and spine",
+            ),
+            (
+                {"model": "silent", "spine": 0, "start_ns": 0, "duration_ns": 0},
+                "duration_ns must be a positive integer",
+            ),
+            (
+                {"model": "silent", "spine": 0, "start_ns": 0, "duration_ns": 1.5},
+                "duration_ns must be a positive integer",
+            ),
+            (
+                {
+                    "model": "silent",
+                    "spine": 0,
+                    "start_ns": 0,
+                    "duration_ns": 5,
+                    "repeat": 0,
+                },
+                "repeat must be a positive integer",
+            ),
+            (
+                {
+                    "model": "silent",
+                    "spine": 0,
+                    "start_ns": 0,
+                    "duration_ns": 5,
+                    "repeat": 2,
+                },
+                "period_ns is required exactly when repeat > 1",
+            ),
+            (
+                {
+                    "model": "silent",
+                    "spine": 0,
+                    "start_ns": 0,
+                    "duration_ns": 5,
+                    "period_ns": 10,
+                },
+                "period_ns is required exactly when repeat > 1",
+            ),
+            (
+                {
+                    "model": "silent",
+                    "spine": 0,
+                    "start_ns": 0,
+                    "duration_ns": 5,
+                    "repeat": 2,
+                    "period_ns": 5,
+                },
+                "period_ns must be greater than duration_ns",
+            ),
         )
         for failure, message in cases:
             document = _sprayed_clos()
@@ -379,7 +534,7 @@ class LinkFailureTests(LinkTests):
             {"model": "silent", "spine": 0, "start_ns": 0},
             {"model": "gray", "spine": 0, "leaf": 3, "start_ns": 9, "error_rate": 0.1},
         ]
-        self._refused(document, "a link an earlier failure names")
+        self._refused(document, "while an earlier failure of it lasts")
         document["network"]["link_failures"] = [
             {"model": "graceful", "spine": spine, "leaf": 2, "start_ns": 0}
             for spine in range(8)

@@ -3,7 +3,8 @@
 ``network.link_overrides`` gives chosen links their own rate, delay or error
 rate for the whole run, in the topology file. ``network.link_failures`` changes
 a spine's links, or one leaf-spine link, at a time in the run, through
-``LINK_FAILURE`` lines in the network configuration. A Clos link is named by
+``LINK_FAILURE`` lines in the network configuration, and, for a failure with a
+duration, restores them through ``LINK_RESTORE`` lines. A Clos link is named by
 its leaf and spine index, the spine index counting the spines that are built;
 any link may also be named by the node ids at its two ends.
 
@@ -61,6 +62,11 @@ class LinkFailure:
     ``graceful`` takes the links down, so the routing and every leaf see it.
     ``silent`` leaves them up while the spine drops every packet arriving from
     the leaves. ``gray`` gives the links an error rate or a lower rate.
+
+    With ``duration_ns`` the links are restored that long after each failure,
+    and the failure happens ``repeat`` times, ``period_ns`` apart; without it
+    the failure lasts to the end of the run. ``repeat`` and ``period_ns`` are
+    None when the profile leaves them out.
     """
 
     model: str
@@ -69,6 +75,35 @@ class LinkFailure:
     leaf: int | None
     error_rate: float | None
     rate: str | None
+    duration_ns: int | None = None
+    repeat: int | None = None
+    period_ns: int | None = None
+
+    def occurrences(self) -> list[tuple[int, int | None]]:
+        """Each occurrence's (start, end) in ns; the end is None when the
+        failure has no duration and so never ends."""
+        period = self.period_ns or 0
+        return [
+            (
+                self.start_ns + i * period,
+                (
+                    None
+                    if self.duration_ns is None
+                    else self.start_ns + i * period + self.duration_ns
+                ),
+            )
+            for i in range(self.repeat or 1)
+        ]
+
+    def overlaps(self, other: LinkFailure) -> bool:
+        """Whether an occurrence of this failure and one of other share an
+        instant, both taken as closed intervals."""
+        return any(
+            (end is None or other_start <= end)
+            and (other_end is None or start <= other_end)
+            for start, end in self.occurrences()
+            for other_start, other_end in other.occurrences()
+        )
 
     def leaves(self, leaf_count: int) -> range:
         return (
@@ -86,14 +121,18 @@ class LinkFailure:
         return "rate", f" {self.rate}"
 
     def config_lines(self, index: ClosIndex) -> list[str]:
-        """One LINK_FAILURE line per affected link, leaf before spine, so that
-        a silent spine drops what arrives from the leaf."""
+        """Per affected link and per occurrence, one LINK_FAILURE line and,
+        with a duration, one LINK_RESTORE line; the leaf named before the
+        spine, so that a silent spine drops what arrives from the leaf."""
         kind, value = self._action()
-        return [
-            f"LINK_FAILURE {self.start_ns} {kind} {index.leaf(leaf)} "
-            f"{index.spine(self.spine)}{value}\n"
-            for leaf in self.leaves(index.leaf_count)
-        ]
+        lines = []
+        for leaf in self.leaves(index.leaf_count):
+            link = f"{index.leaf(leaf)} {index.spine(self.spine)}"
+            for start, end in self.occurrences():
+                lines.append(f"LINK_FAILURE {start} {kind} {link}{value}\n")
+                if end is not None:
+                    lines.append(f"LINK_RESTORE {end} {link}\n")
+        return lines
 
     def manifest(self) -> dict[str, Any]:
         return {
@@ -103,7 +142,16 @@ class LinkFailure:
             "leaf": self.leaf,
             "error_rate": self.error_rate,
             "rate": self.rate,
+            "duration_ns": self.duration_ns,
+            "repeat": self.repeat,
+            "period_ns": self.period_ns,
         }
+
+
+def _positive(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return value
 
 
 def _index(value: Any, field: str, bound: int) -> int:
@@ -227,7 +275,7 @@ def load_link_failures(
     if clos is None:
         raise ValueError("network.link_failures needs a Clos fabric")
     failures: list[LinkFailure] = []
-    failed: set[tuple[int, int]] = set()
+    failed: dict[tuple[int, int], list[LinkFailure]] = {}
     down: dict[int, set[int]] = {}
     for position, entry in enumerate(value):
         field = f"network.link_failures[{position}]"
@@ -241,6 +289,10 @@ def load_link_failures(
             allowed |= {"error_rate", "rate"}
             if len({"error_rate", "rate"} & set(entry)) != 1:
                 raise ValueError(f"{field} is gray and sets one of error_rate and rate")
+        if model != "graceful":
+            allowed.add("duration_ns")
+            if "duration_ns" in entry:
+                allowed |= {"repeat", "period_ns"}
         unknown = set(entry) - allowed
         if unknown or not {"model", "start_ns", "spine"} <= set(entry):
             raise ValueError(
@@ -250,6 +302,25 @@ def load_link_failures(
         start_ns = entry["start_ns"]
         if isinstance(start_ns, bool) or not isinstance(start_ns, int) or start_ns < 0:
             raise ValueError(f"{field}.start_ns must be a nonnegative integer")
+        duration_ns = (
+            _positive(entry["duration_ns"], f"{field}.duration_ns")
+            if "duration_ns" in entry
+            else None
+        )
+        repeat = (
+            _positive(entry["repeat"], f"{field}.repeat") if "repeat" in entry else None
+        )
+        period_ns = (
+            _positive(entry["period_ns"], f"{field}.period_ns")
+            if "period_ns" in entry
+            else None
+        )
+        if (period_ns is not None) != (repeat is not None and repeat > 1):
+            raise ValueError(f"{field}.period_ns is required exactly when repeat > 1")
+        if period_ns is not None and duration_ns is not None and (
+            period_ns <= duration_ns
+        ):
+            raise ValueError(f"{field}.period_ns must be greater than duration_ns")
         failure = LinkFailure(
             model=model,
             start_ns=start_ns,
@@ -267,11 +338,17 @@ def load_link_failures(
             rate=_rate(entry["rate"], f"{field}.rate", None)
             if "rate" in entry
             else None,
+            duration_ns=duration_ns,
+            repeat=repeat,
+            period_ns=period_ns,
         )
         for leaf in failure.leaves(clos.leaf_count):
-            if (leaf, failure.spine) in failed:
-                raise ValueError(f"{field} names a link an earlier failure names")
-            failed.add((leaf, failure.spine))
+            earlier = failed.setdefault((leaf, failure.spine), [])
+            if any(failure.overlaps(other) for other in earlier):
+                raise ValueError(
+                    f"{field} fails a link while an earlier failure of it lasts"
+                )
+            earlier.append(failure)
             if model == "graceful":
                 down.setdefault(leaf, set()).add(failure.spine)
         failures.append(failure)
