@@ -2049,6 +2049,39 @@ class Ring3DGeneratorTests(unittest.TestCase):
                         set(knobs),
                     )
 
+    def test_spray_policy_writes_trim_thresholds_when_set(self) -> None:
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            runs = itertools.count()
+
+            def generated(balancing: dict[str, object]) -> tuple[dict, str]:
+                document["network"]["load_balancing"] = balancing
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                output = Path(temporary_directory) / f"run{next(runs)}"
+                manifest = materialize(profile_path, output)
+                config = (output / "network_config.txt").read_text(encoding="utf-8")
+                return manifest["load_balancing"], config
+
+            manifest, config = generated(
+                {"mode": "spray_policy", "trim_thresholds": [0.1, 0.2, 1]}
+            )
+            self.assertIn(
+                "\nSPRAY_CONGESTION_THRESHOLDS 0.25 0.5 0.75\n"
+                "SPRAY_TRIM_THRESHOLDS 0.1 0.2 1.0\n"
+                "SPRAY_ABSENCE_FRACTION_OF_MEDIAN ",
+                config,
+            )
+            self.assertEqual(manifest["trim_thresholds"], (0.1, 0.2, 1.0))
+
+            manifest, config = generated({"mode": "spray_policy"})
+            self.assertNotIn("SPRAY_TRIM_THRESHOLDS", config)
+            self.assertNotIn("trim_thresholds", manifest)
+
     def test_spray_policy_refuses_what_nothing_would_read(self) -> None:
         document = json.loads(
             (
@@ -2122,6 +2155,43 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 "does not take",
             ),
             ({**policy, "edge_freeze": 0}, "edge_freeze must be a boolean"),
+            (
+                {"mode": "spray_uniform", "trim_thresholds": [0.1, 0.2, 0.3]},
+                "takes no other key",
+            ),
+            (
+                {"mode": "ev_hash", "trim_thresholds": [0.1, 0.2, 0.3]},
+                "'ops' does not take",
+            ),
+            (
+                {
+                    "mode": "spray_uniform",
+                    "selector": "ack_redirect",
+                    "scope": "per_receiver",
+                    "trim_thresholds": [0.1, 0.2, 0.3],
+                },
+                "does not take",
+            ),
+            (
+                {**policy, "trim_thresholds": [0.2, 0.1, 0.3]},
+                "trim_thresholds must increase",
+            ),
+            (
+                {**policy, "trim_thresholds": [0.1, 0.1, 0.3]},
+                "trim_thresholds must increase",
+            ),
+            (
+                {**policy, "trim_thresholds": [0.1, 0.2]},
+                "trim_thresholds must be a list",
+            ),
+            (
+                {**policy, "trim_thresholds": [0, 0.2, 0.3]},
+                "trim_thresholds must be a number",
+            ),
+            (
+                {**policy, "trim_thresholds": [0.1, 0.2, 1.5]},
+                "trim_thresholds must be a number",
+            ),
             ({**policy, "congestion_thresholds": [0.5, 0.25, 0.75]}, "must increase"),
             ({**policy, "congestion_thresholds": [0.25, 0.5]}, "three thresholds"),
             (
