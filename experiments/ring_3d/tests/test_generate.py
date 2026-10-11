@@ -2130,6 +2130,130 @@ class Ring3DGeneratorTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, message):
                         load_profile(profile_path)
 
+    def test_ack_redirect_and_its_parameters_reach_the_configuration(self) -> None:
+        """ack_redirect under spray_uniform writes its key and every parameter,
+        defaults filled in; spray_uniform without it writes neither."""
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            runs = itertools.count()
+
+            def generated(balancing: dict[str, object]) -> tuple[dict, str]:
+                document["network"]["load_balancing"] = balancing
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                output = Path(temporary_directory) / f"run{next(runs)}"
+                manifest = materialize(profile_path, output)
+                config = (output / "network_config.txt").read_text(encoding="utf-8")
+                return manifest["load_balancing"], config.replace(str(output), "<o>")
+
+            manifest, config = generated({"mode": "spray_uniform"})
+            self.assertEqual(manifest, {"mode": "spray_uniform"})
+            self.assertNotIn("PATH_SELECTOR", config)
+            self.assertNotIn("ACK_REDIRECT", config)
+
+            manifest, config = generated(
+                {"mode": "spray_uniform", "selector": "ack_redirect"}
+            )
+            self.assertEqual(
+                manifest,
+                {
+                    "mode": "spray_uniform",
+                    "selector": "ack_redirect",
+                    "omega": 0.5,
+                    "flag": 0.1,
+                    "validity_base_rtts": 2.0,
+                    "trim_scoring": "mark",
+                },
+            )
+            self.assertIn(
+                "\nLOAD_BALANCING spray_uniform\n"
+                "PATH_SELECTOR ack_redirect\n"
+                "ACK_REDIRECT_OMEGA 0.5\n"
+                "ACK_REDIRECT_FLAG 0.1\n"
+                "ACK_REDIRECT_VALIDITY_BASE_RTTS 2.0\n"
+                "ACK_REDIRECT_TRIM_SCORING mark\n",
+                config,
+            )
+            self.assertNotIn("SPRAY_", config)
+
+            manifest, config = generated(
+                {
+                    "mode": "spray_uniform",
+                    "selector": "ack_redirect",
+                    "omega": 0.3,
+                    "flag": 0.15,
+                    "validity_base_rtts": 3,
+                    "trim_scoring": "ignore",
+                }
+            )
+            self.assertIn(
+                "\nPATH_SELECTOR ack_redirect\n"
+                "ACK_REDIRECT_OMEGA 0.3\n"
+                "ACK_REDIRECT_FLAG 0.15\n"
+                "ACK_REDIRECT_VALIDITY_BASE_RTTS 3.0\n"
+                "ACK_REDIRECT_TRIM_SCORING ignore\n",
+                config,
+            )
+
+    def test_ack_redirect_refuses_what_nothing_would_read(self) -> None:
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        redirect = {"mode": "spray_uniform", "selector": "ack_redirect"}
+        refusals = [
+            ({"mode": "ev_hash", "selector": "ack_redirect"}, "selector must be one of"),
+            ({"mode": "ecmp", "selector": "ack_redirect"}, "takes no other key"),
+            ({"mode": "spray_policy", "selector": "ack_redirect"}, "does not take"),
+            ({"mode": "spray_policy", "omega": 0.5}, "does not take"),
+            ({"mode": "spray_uniform", "flag": 0.1}, "takes no other key"),
+            ({"mode": "ev_hash", "selector": "reps", "omega": 0.5}, "does not take"),
+            ({**redirect, "gamma": 0.25}, "'ack_redirect' does not take"),
+            ({**redirect, "grade_scope": "per_connection"}, "does not take"),
+            ({**redirect, "trim_scoring": "drop"}, "trim_scoring must be"),
+        ]
+        for knob, values in (
+            ("omega", (-0.1, 1.5, True, "half")),
+            ("flag", (-0.1, True, float("nan"))),
+            ("validity_base_rtts", (0, -1, True)),
+        ):
+            refusals += [
+                ({**redirect, knob: value}, f"{knob} must be") for value in values
+            ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            for balancing, message in refusals:
+                document["network"]["load_balancing"] = balancing
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                with self.subTest(balancing=balancing):
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_profile(profile_path)
+
+            without_repair = json.loads(json.dumps(document))
+            without_repair["network"]["load_balancing"] = redirect
+            del without_repair["network"]["transport_recovery"]["selective_repair"]
+            profile_path.write_text(json.dumps(without_repair), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "selective_repair"):
+                load_profile(profile_path)
+
+            # The field names a spine below 255.
+            for spines, refused in ((254, False), (255, True)):
+                wide = json.loads(json.dumps(document))
+                wide["network"]["spine_count"] = spines
+                wide["network"]["load_balancing"] = redirect
+                profile_path.write_text(json.dumps(wide), encoding="utf-8")
+                with self.subTest(spines=spines):
+                    if refused:
+                        with self.assertRaisesRegex(ValueError, "at most 254 spines"):
+                            load_profile(profile_path)
+                    else:
+                        load_profile(profile_path)
+
     def test_load_balancing_refuses_a_transport_that_cannot_carry_it(self) -> None:
         document = json.loads(
             (
