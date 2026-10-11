@@ -761,6 +761,12 @@ def _grade_reference(value: Any, field: str) -> str:
     return value
 
 
+def _grade_scope(value: Any, field: str) -> str:
+    if value not in ("per_receiver", "per_connection"):
+        raise ValueError(f"{field} must be 'per_receiver' or 'per_connection'")
+    return value
+
+
 def _window_penalty(value: Any, field: str) -> int:
     # UEC 1.0.3 section 3.6.13.2's Rcv_Cwnd_Pend is seven bits.
     if _nonnegative_int(value, field) > 127:
@@ -827,6 +833,9 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     ),
     BalancingParameter(
         "grade_reference", "SPRAY_GRADE_REFERENCE", "median", _grade_reference
+    ),
+    BalancingParameter(
+        "grade_scope", "SPRAY_GRADE_SCOPE", "per_receiver", _grade_scope
     ),
     BalancingParameter("one_way_delay", "SPRAY_ONE_WAY_DELAY", False, _flag),
     BalancingParameter(

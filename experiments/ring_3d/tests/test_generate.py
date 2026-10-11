@@ -1903,6 +1903,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
                     "absence_minimum_median": 16,
                     "release_fraction_of_floor": 0.5,
                     "grade_reference": "median",
+                    "grade_scope": "per_receiver",
                     "one_way_delay": False,
                     "gamma": 0.25,
                     "epsilon": 0.02,
@@ -1923,6 +1924,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 "SPRAY_ABSENCE_MINIMUM_MEDIAN 16\n"
                 "SPRAY_RELEASE_FRACTION_OF_FLOOR 0.5\n"
                 "SPRAY_GRADE_REFERENCE median\n"
+                "SPRAY_GRADE_SCOPE per_receiver\n"
                 "SPRAY_ONE_WAY_DELAY 0\n"
                 "SPRAY_GAMMA 0.25\n"
                 "SPRAY_EPSILON 0.02\n"
@@ -1949,6 +1951,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
                     "absence_minimum_median": 8,
                     "release_fraction_of_floor": 2,
                     "grade_reference": "absolute",
+                    "grade_scope": "per_connection",
                     "gamma": 1,
                     "epsilon": 0,
                     "candidates": 3,
@@ -1972,6 +1975,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 "SPRAY_ABSENCE_MINIMUM_MEDIAN 8\n"
                 "SPRAY_RELEASE_FRACTION_OF_FLOOR 2.0\n"
                 "SPRAY_GRADE_REFERENCE absolute\n"
+                "SPRAY_GRADE_SCOPE per_connection\n"
                 "SPRAY_ONE_WAY_DELAY 1\n"
                 "SPRAY_DELAY_CUSUM_SLACK_BASE_RTTS 0.25\n"
                 "SPRAY_DELAY_CUSUM_THRESHOLD_BASE_RTTS 2.0\n"
@@ -2009,6 +2013,12 @@ class Ring3DGeneratorTests(unittest.TestCase):
             ({**policy, "one_way_delay": 1}, "one_way_delay must be a boolean"),
             ({**policy, "candidate_draw": "best"}, "candidate_draw must be"),
             ({**policy, "grade_reference": "rank"}, "grade_reference must be"),
+            ({**policy, "grade_scope": "per_host"}, "grade_scope must be"),
+            (
+                {"mode": "spray_uniform", "grade_scope": "per_connection"},
+                "takes no other key",
+            ),
+            ({"mode": "ev_hash", "grade_scope": "per_receiver"}, "'ops' does not take"),
             ({**policy, "congestion_thresholds": [0.5, 0.25, 0.75]}, "must increase"),
             ({**policy, "congestion_thresholds": [0.25, 0.5]}, "three thresholds"),
             (
