@@ -915,7 +915,14 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "edge_window_penalty", "SPRAY_EDGE_WINDOW_PENALTY", 64, _window_penalty
     ),
+    BalancingParameter("edge_freeze", "SPRAY_EDGE_FREEZE", True, _flag),
+    BalancingParameter(
+        "sender_pool_weight", "SPRAY_SENDER_POOL_WEIGHT", 0.0, _probability
+    ),
 )
+# The parameters written, and recorded in the manifest, only when the profile
+# sets them; the simulator's defaults are the defaults above.
+WRITTEN_WHEN_SET_PARAMETERS = {"edge_freeze", "sender_pool_weight"}
 # The parameters only one-way delay reads.
 ONE_WAY_DELAY_PARAMETERS = {
     "delay_cusum_slack_base_rtts",
@@ -1076,7 +1083,11 @@ def _load_spray_policy(
             tuple(
                 parameter
                 for parameter in POLICY_PARAMETERS
-                if one_way_delay or parameter.name not in ONE_WAY_DELAY_PARAMETERS
+                if (one_way_delay or parameter.name not in ONE_WAY_DELAY_PARAMETERS)
+                and (
+                    parameter.name not in WRITTEN_WHEN_SET_PARAMETERS
+                    or parameter.name in balancing
+                )
             ),
         ),
     )
