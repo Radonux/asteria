@@ -1,6 +1,6 @@
-"""The direction of a link failure: which way a silent failure drops, and
-the refusal of any direction but "both" for the failures the backend applies
-to a whole link."""
+"""The direction of a link failure: the order a failure names its two nodes
+in, the forward token of a loss or rate fault, and the refusal of any
+direction but "both" for a link taken down."""
 
 from __future__ import annotations
 
@@ -91,12 +91,53 @@ class LinkDirectionTests(LinkTests):
             ],
         )
 
-    def test_two_sided_failures_take_both(self) -> None:
+    def test_both_with_a_duration_restores_each_order(self) -> None:
+        self.assertEqual(
+            self._lines({**SILENT, "direction": "both", "duration_ns": 10}),
+            [
+                f"LINK_FAILURE 0 blackhole {LEAF + 4} {SPINE + 1}",
+                f"LINK_RESTORE 10 {LEAF + 4} {SPINE + 1}",
+                f"LINK_FAILURE 0 blackhole {SPINE + 1} {LEAF + 4}",
+                f"LINK_RESTORE 10 {SPINE + 1} {LEAF + 4}",
+            ],
+        )
+
+    def test_gray_both_writes_no_token(self) -> None:
         self.assertEqual(
             self._lines({**LOSS, "direction": "both"}, {**RATE, "direction": "both"}),
             [
                 f"LINK_FAILURE 5 loss {LEAF} {SPINE + 2} 0.01",
                 f"LINK_FAILURE 5 rate {LEAF + 1} {SPINE + 2} 200Gbps",
+            ],
+        )
+
+    def test_gray_up_and_down_are_forward_in_the_order_named(self) -> None:
+        self.assertEqual(
+            self._lines(
+                {**LOSS, "direction": "up"},
+                {**RATE, "direction": "down"},
+                {**LOSS, "leaf": 2, "direction": "down"},
+                {**RATE, "leaf": 3, "direction": "up"},
+            ),
+            [
+                f"LINK_FAILURE 5 loss {LEAF} {SPINE + 2} 0.01 forward",
+                f"LINK_FAILURE 5 rate {SPINE + 2} {LEAF + 1} 200Gbps forward",
+                f"LINK_FAILURE 5 loss {SPINE + 2} {LEAF + 2} 0.01 forward",
+                f"LINK_FAILURE 5 rate {LEAF + 3} {SPINE + 2} 200Gbps forward",
+            ],
+        )
+
+    def test_restores_take_no_token(self) -> None:
+        self.assertEqual(
+            self._lines(
+                {**LOSS, "direction": "down", "duration_ns": 10},
+                {**RATE, "direction": "up", "duration_ns": 20},
+            ),
+            [
+                f"LINK_FAILURE 5 loss {SPINE + 2} {LEAF} 0.01 forward",
+                f"LINK_RESTORE 15 {SPINE + 2} {LEAF}",
+                f"LINK_FAILURE 5 rate {LEAF + 1} {SPINE + 2} 200Gbps forward",
+                f"LINK_RESTORE 25 {LEAF + 1} {SPINE + 2}",
             ],
         )
 
@@ -117,15 +158,10 @@ class LinkDirectionTests(LinkTests):
         cases = [
             ({**SILENT, "direction": "sideways"}, r"direction must be one of"),
             ({**SILENT, "direction": None}, r"direction must be one of"),
-            (
-                {**SILENT, "direction": "both", "duration_ns": 10},
-                "takes no duration_ns",
-            ),
-            ({**GRACEFUL, "direction": "up"}, "'both' for a graceful failure"),
+            ({**LOSS, "direction": "forward"}, r"direction must be one of"),
         ]
         cases += [
-            ({**failure, "direction": direction}, "'both' for a gray failure")
-            for failure in (LOSS, RATE)
+            ({**GRACEFUL, "direction": direction}, "'both' for a graceful failure")
             for direction in ("up", "down")
         ]
         for failure, message in cases:

@@ -66,7 +66,9 @@ class LinkFailure:
     ``silent`` leaves them up while a switch drops every packet arriving over
     them: the spine what arrives from the leaf under ``direction`` "up", the
     leaf what arrives from the spine under "down", both under "both". ``gray``
-    gives the links an error rate or a lower rate, in both directions.
+    gives the links an error rate or a lower rate in the same direction or
+    directions: a loss is dropped by the receiving end, and a lower rate is
+    the sending end's.
 
     With ``duration_ns`` the links are restored that long after each failure,
     and the failure happens ``repeat`` times, ``period_ns`` apart; without it
@@ -89,7 +91,7 @@ class LinkFailure:
     def effective_direction(self) -> str:
         """The direction the failure applies in: "up" for an unspecified
         silent failure, as one has always been written, and "both" for the
-        others, which the backend applies to the link as a whole."""
+        others, which have always applied to the link as a whole."""
         if self.direction is not None:
             return self.direction
         return "up" if self.model == "silent" else "both"
@@ -137,28 +139,36 @@ class LinkFailure:
 
     def _ends(self, leaf: int, spine: int) -> list[tuple[int, int]]:
         """The node pairs written for one link, in the order written. A
-        blackhole's second node drops what arrives from its first, so a
-        silent failure names the leaf first for "up", the spine first for
-        "down", and both orders for "both". The others name the leaf first."""
-        if self.model != "silent" or self.effective_direction() == "up":
+        blackhole, and a loss or rate fault marked forward, applies from its
+        first node to its second, so the leaf is named first for "up" and the
+        spine first for "down". Under "both" a silent failure writes both
+        orders, and the others name the leaf first and apply both ways."""
+        direction = self.effective_direction()
+        if direction == "up":
             return [(leaf, spine)]
-        if self.effective_direction() == "down":
+        if direction == "down":
             return [(spine, leaf)]
-        return [(leaf, spine), (spine, leaf)]
+        if self.model == "silent":
+            return [(leaf, spine), (spine, leaf)]
+        return [(leaf, spine)]
 
     def _backend_direction_token(self) -> str:
-        """The direction token written after a gray failure's LINK_FAILURE and
-        LINK_RESTORE lines; the only place one is written. Empty while the
-        backend applies loss and rate faults to both directions of a link and
-        reads no token, so a gray failure is refused any direction but
-        "both"."""
+        """The direction token after a gray failure's LINK_FAILURE line, the
+        only place one is written: " forward" for "up" and "down", which
+        _ends turns into the order of the two nodes, and none for "both", the
+        backend's default, so a failure without a direction is written as
+        before. LINK_RESTORE takes no token."""
+        if self.model == "gray" and self.effective_direction() != "both":
+            return " forward"
         return ""
 
     def config_lines(self, index: ClosIndex) -> list[str]:
         """Per affected link, per node pair _ends gives and per occurrence,
-        one LINK_FAILURE line and, with a duration, one LINK_RESTORE line."""
+        one LINK_FAILURE line and, with a duration, one LINK_RESTORE line
+        naming the two nodes in the same order, which the backend restores
+        that failure by."""
         kind, value = self._action()
-        token = self._backend_direction_token() if self.model == "gray" else ""
+        token = self._backend_direction_token()
         lines = []
         for leaf in self.leaves(index.leaf_count):
             for a, b in self._ends(index.leaf(leaf), index.spine(self.spine)):
@@ -166,7 +176,7 @@ class LinkFailure:
                 for start, end in self.occurrences():
                     lines.append(f"LINK_FAILURE {start} {kind} {link}{value}{token}\n")
                     if end is not None:
-                        lines.append(f"LINK_RESTORE {end} {link}{token}\n")
+                        lines.append(f"LINK_RESTORE {end} {link}\n")
         return lines
 
     def manifest(self) -> dict[str, Any]:
@@ -199,19 +209,6 @@ def _direction(entry: dict[str, Any], field: str, model: str) -> str | None:
         raise ValueError(
             f"{field}.direction must be 'both' for a graceful failure, which "
             "takes the links down in both directions"
-        )
-    if model == "gray" and direction != "both":
-        raise ValueError(
-            f"{field}.direction must be 'both' for a gray failure: the backend "
-            "applies a loss or rate fault to both directions of a link"
-        )
-    if model == "silent" and direction == "both" and "duration_ns" in entry:
-        # The backend keeps one saved state per link, whichever node it names
-        # first, so the second black hole's state would replace the first's
-        # and both restores would clear the second alone.
-        raise ValueError(
-            f"{field}.direction 'both' of a silent failure takes no duration_ns: "
-            "the backend restores one black hole per link"
         )
     return direction
 
