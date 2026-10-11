@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=astra-gh-runner
+#SBATCH --job-name=asteria-gh-runner
 # Two, not one: the simulator is single-threaded, but the runner's own
 # streaming threads would otherwise steal cycles from the sim for days.
 # (The per-job LTO link that once wanted more cores is gone: jobs
@@ -60,9 +60,12 @@ newest_scratch_space() {
 # ENOSPC); /tmp is tmpfs billed to the job's memory limit (observed: the
 # OOM killer taking the simulator). The 16G ask is sized to survive the
 # tmpfs last resort.
-# One tidy parent per scratch base - astra-sim/<slurm job id> - so a
+# One tidy parent per scratch base - asteria/<slurm job id> - so a
 # 16-job wave presents the lab as a single directory, not sixteen
-# scattered astra-* entries.
+# scattered entries. The parent is this repository's own: another
+# repository's runners on the same account (astra-sim/ under the same
+# base, ~/astra-ci and ~/astra-sim in home) keep theirs, and no job, store,
+# outbox or reaper here ever names a path of theirs.
 network_scratch="$(newest_scratch_space || true)"
 # Single definition site for the shared runtime store's location: the
 # run's seed job publishes sealed bundle extractions under it, and every
@@ -70,7 +73,7 @@ network_scratch="$(newest_scratch_space || true)"
 # resolve-runtime.sh). Only the network scratch base is shareable, so the
 # variable is empty - store disabled, jobs extract privately - whenever
 # the node has none; job-local fallback bases below are never shared.
-export ASTRA_STORE_ROOT="${network_scratch:+${network_scratch}/astra-sim/store}"
+export ASTRA_STORE_ROOT="${network_scratch:+${network_scratch}/asteria/store}"
 # The outbox is the store's outbound twin: an arm places its results here
 # (ci/dcs/outbox.sh) and a freshly tokened courier job collects them,
 # because no GitHub upload survives a job's 24-hour token ceiling. This
@@ -79,12 +82,12 @@ export ASTRA_STORE_ROOT="${network_scratch:+${network_scratch}/astra-sim/store}"
 # of the margin this job-start resolution carries. Like `store`, the name
 # never parses as a numeric job id, so the sibling reaper below cannot
 # touch it; orphans die with the scratch generation.
-export ASTRA_OUTBOX_ROOT="${network_scratch:+${network_scratch}/astra-sim/outbox}"
+export ASTRA_OUTBOX_ROOT="${network_scratch:+${network_scratch}/asteria/outbox}"
 dir=""
 for base in "${SLURM_TMPDIR:-}" "$network_scratch" /var/tmp /tmp; do
     [[ -n "$base" ]] || continue
-    if mkdir -p "$base/astra-sim/$SLURM_JOB_ID" 2>/dev/null; then
-        dir="$base/astra-sim/$SLURM_JOB_ID"
+    if mkdir -p "$base/asteria/$SLURM_JOB_ID" 2>/dev/null; then
+        dir="$base/asteria/$SLURM_JOB_ID"
         break
     fi
 done
@@ -97,7 +100,7 @@ fi
 # one spelling, not two.
 dir=$(cd "$dir" && pwd -P)
 echo "scratch: $dir"
-# The trap also removes the shared astra-sim parent when this is the last
+# The trap also removes the shared asteria parent when this is the last
 # job out - non-empty is expected while siblings run, hence the ignore.
 cleanup() {
     rm -rf "$dir"
@@ -108,17 +111,15 @@ trap cleanup EXIT
 # dies without running it (node crash, OOM-killed shell, SIGKILL landing
 # before a multi-gigabyte NFS rm finishes its KillWait grace) leaves an
 # orphan the lab admin should never have to clean. Each new job therefore
-# reaps dead siblings - numeric-id dirs under the shared parent, plus any
-# legacy astra-runner-* dir beside it - dead iff SLURM no longer knows the
-# job id. The shared `store` directory is untouched by construction: its
+# reaps dead siblings - numeric-id dirs under the shared parent, and
+# nothing beside it, where other repositories' trees live - dead iff SLURM
+# no longer knows the job id. The shared `store` directory is untouched by construction: its
 # name never parses as a numeric job id, and its reaping (a pure age
 # sweep) belongs to the single-writer seed job in seed-store.sh. A live job always answers squeue, so this cannot touch a running
 # sibling; any other squeue failure skips the sweep - the next job retries.
-for sibling in "$(dirname "$dir")"/* \
-               "$(dirname "$(dirname "$dir")")"/astra-runner-*; do
+for sibling in "$(dirname "$dir")"/*; do
     [[ -d "$sibling" ]] || continue
     sibling_id="${sibling##*/}"
-    sibling_id="${sibling_id#astra-runner-}"
     [[ "$sibling_id" == "$SLURM_JOB_ID" ]] && continue
     [[ "$sibling_id" =~ ^[0-9]+$ ]] || continue
     if sibling_state=$(squeue -h -j "$sibling_id" -o %A 2>&1); then

@@ -16,7 +16,7 @@ key="${1:?usage: resolve-runtime.sh <key>}"
 
 candidates=("${ASTRA_STORE_ROOT:-}")
 for base in "${DCS_SCRATCH_BASE:-/scratch/scratch-space}"/expires-*; do
-    candidates+=("$base/astra-sim/store")
+    candidates+=("$base/asteria/store")
 done
 
 for root in "${candidates[@]}"; do

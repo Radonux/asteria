@@ -13,6 +13,7 @@ import json
 import re
 import shutil
 import sys
+from collections import Counter
 from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
@@ -150,8 +151,14 @@ DP_ALL_REDUCE_IMPLEMENTATION_PATTERN = re.compile(
 )
 SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD = "sequential_dp_all_reduce"
 PERMUTATION_WORKLOAD = "permutation"
+INCAST_WORKLOAD = "incast"
 WORKLOAD_KINDS = frozenset(
-    {DEFAULT_WORKLOAD_KIND, SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD, PERMUTATION_WORKLOAD}
+    {
+        DEFAULT_WORKLOAD_KIND,
+        SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD,
+        PERMUTATION_WORKLOAD,
+        INCAST_WORKLOAD,
+    }
 )
 # The tag every permutation message carries; one pair of ranks exchanges one.
 PERMUTATION_TAG = 1
@@ -328,27 +335,91 @@ class Permutation:
 
 
 @dataclass(frozen=True)
+class Incast:
+    """The first ``receiver_count`` hosts on each of ``receiver_leaves``
+    receive ``fan_in`` messages at once.
+
+    A receiver's ``j``-th sender sits on the ``j``-th leaf other than its own
+    taken round robin, so its senders span every other leaf, receiving leaves
+    included, and a host may both send and receive; within that leaf it is the
+    host ``j // (leaf_count - 1)`` places past the receiver's own position,
+    which spreads the receivers' senders over the leaf's hosts. A fan-in above
+    the hosts outside the receiver's leaf wraps, and the wrapped senders hold
+    a second message to that receiver. The tag is ``j + 1``, unique per
+    receiver and so per pair of ranks. ``receiver_count`` None is every host
+    of the leaf.
+    """
+
+    receiver_leaves: tuple[int, ...]
+    fan_in: int
+    message_bytes: int
+    receiver_count: int | None = None
+
+    def messages(
+        self, hosts_per_leaf: int, leaf_count: int
+    ) -> tuple[tuple[int, int, int], ...]:
+        """Every message as (source, destination, tag), receivers in order."""
+        receiver_count = (
+            hosts_per_leaf if self.receiver_count is None else self.receiver_count
+        )
+        messages = []
+        for receiver_leaf in self.receiver_leaves:
+            source_leaves = [
+                leaf for leaf in range(leaf_count) if leaf != receiver_leaf
+            ]
+            for position in range(receiver_count):
+                destination = receiver_leaf * hosts_per_leaf + position
+                for connection in range(self.fan_in):
+                    leaf = source_leaves[connection % len(source_leaves)]
+                    host = (
+                        position + connection // len(source_leaves)
+                    ) % hosts_per_leaf
+                    messages.append(
+                        (leaf * hosts_per_leaf + host, destination, connection + 1)
+                    )
+        return tuple(messages)
+
+
+@dataclass(frozen=True)
 class Workload:
     """Trace-shape selector retained in the profile provenance."""
 
     kind: str
     # Present exactly when the kind is the permutation.
     permutation: Permutation | None = None
+    # Present exactly when the kind is the incast.
+    incast: Incast | None = None
 
     def __post_init__(self) -> None:
         if (self.kind == PERMUTATION_WORKLOAD) != (self.permutation is not None):
             raise ValueError(
                 "a permutation workload, and no other, carries a permutation"
             )
+        if (self.kind == INCAST_WORKLOAD) != (self.incast is not None):
+            raise ValueError("an incast workload, and no other, carries an incast")
+
+    @property
+    def point_to_point(self) -> bool:
+        """Whether the trace is bare messages of the workload's own size, with
+        no training step around them."""
+        return self.permutation is not None or self.incast is not None
 
     def manifest(self) -> dict[str, Any]:
-        if self.permutation is None:
-            return {"kind": self.kind}
-        return {
-            "kind": self.kind,
-            "shift": self.permutation.shift,
-            "message_bytes": self.permutation.message_bytes,
-        }
+        if self.permutation is not None:
+            return {
+                "kind": self.kind,
+                "shift": self.permutation.shift,
+                "message_bytes": self.permutation.message_bytes,
+            }
+        if self.incast is not None:
+            return {
+                "kind": self.kind,
+                "receiver_leaves": list(self.incast.receiver_leaves),
+                "receiver_count": self.incast.receiver_count,
+                "fan_in": self.incast.fan_in,
+                "message_bytes": self.incast.message_bytes,
+            }
+        return {"kind": self.kind}
 
 
 @dataclass(frozen=True)
@@ -532,6 +603,8 @@ def _load_workload(document: dict[str, Any]) -> Workload:
     kind = value["kind"]
     if kind not in WORKLOAD_KINDS:
         raise ValueError(f"workload.kind must be one of {sorted(WORKLOAD_KINDS)}")
+    if kind == INCAST_WORKLOAD:
+        return Workload(kind, incast=_load_incast(value))
     if kind != PERMUTATION_WORKLOAD:
         if set(value) != {"kind"}:
             raise ValueError(f"workload.kind '{kind}' takes no other key")
@@ -548,6 +621,50 @@ def _load_workload(document: dict[str, Any]) -> Workload:
             message_bytes=_require_positive_int(
                 value["message_bytes"], "workload.message_bytes"
             ),
+        ),
+    )
+
+
+def _load_incast(value: dict[str, Any]) -> Incast:
+    """The incast's keys; the receiver leaves are bounded by the fabric
+    later."""
+    required = {"kind", "fan_in", "message_bytes"}
+    receiver_keys = {"receiver_leaf", "receiver_leaves"} & set(value)
+    if (
+        not required <= set(value)
+        or len(receiver_keys) != 1
+        or set(value) - required - receiver_keys - {"receiver_count"}
+    ):
+        raise ValueError(
+            "workload.kind 'incast' must contain exactly "
+            "['fan_in', 'kind', 'message_bytes'] and one of "
+            "['receiver_leaf', 'receiver_leaves'], and may contain "
+            "['receiver_count']"
+        )
+    if "receiver_leaf" in value:
+        receiver_leaves: tuple[int, ...] = (
+            _require_nonnegative_int(value["receiver_leaf"], "workload.receiver_leaf"),
+        )
+    else:
+        leaves = value["receiver_leaves"]
+        if not isinstance(leaves, list) or not leaves:
+            raise ValueError("workload.receiver_leaves must be a nonempty array")
+        receiver_leaves = tuple(
+            _require_nonnegative_int(leaf, "workload.receiver_leaves")
+            for leaf in leaves
+        )
+        if len(set(receiver_leaves)) != len(receiver_leaves):
+            raise ValueError("workload.receiver_leaves must be distinct")
+    return Incast(
+        receiver_leaves=receiver_leaves,
+        fan_in=_require_positive_int(value["fan_in"], "workload.fan_in"),
+        message_bytes=_require_positive_int(
+            value["message_bytes"], "workload.message_bytes"
+        ),
+        receiver_count=(
+            _require_positive_int(value["receiver_count"], "workload.receiver_count")
+            if "receiver_count" in value
+            else None
         ),
     )
 
@@ -689,19 +806,20 @@ def parse_profile_document(document: Any) -> Profile:
     if unknown_keys:
         raise ValueError(f"unknown profile keys: {sorted(unknown_keys)}")
     workload = _load_workload(document)
-    # A permutation's message size is its own, so it takes no DP bucket size.
+    # A point-to-point workload's message size is its own, so it takes no DP
+    # bucket size.
     required_keys = (
         REQUIRED_PROFILE_KEYS - {"dp_all_reduce_bytes"}
-        if workload.permutation is not None
+        if workload.point_to_point
         else REQUIRED_PROFILE_KEYS
     )
     missing_keys = required_keys - set(document)
     if missing_keys:
         raise ValueError(f"missing profile keys: {sorted(missing_keys)}")
-    if workload.permutation is not None and "dp_all_reduce_bytes" in document:
+    if workload.point_to_point and "dp_all_reduce_bytes" in document:
         raise ValueError(
-            "workload.kind 'permutation' sends workload.message_bytes and takes "
-            "no dp_all_reduce_bytes"
+            f"workload.kind '{workload.kind}' sends workload.message_bytes and "
+            "takes no dp_all_reduce_bytes"
         )
     if document.get("schema_version") != 1:
         raise ValueError("profile schema_version must be 1")
@@ -720,6 +838,17 @@ def parse_profile_document(document: Any) -> Profile:
     selection_policy = _load_selection_policy(document)
     explicit_clr_schedule = _load_explicit_clr_schedule(document, steps)
     network = load_network(document.get("network"), ranks)
+    incast = workload.incast
+    if (
+        incast is not None
+        and incast.receiver_count is None
+        and network.kind == "clos"
+    ):
+        # Every host of a receiving leaf, recorded as a count.
+        workload = replace(
+            workload,
+            incast=replace(incast, receiver_count=network.hosts_per_leaf),
+        )
     if selection_policy.domain in FORGIVING_DOMAINS:
         domain_value = selection_policy.domain.value
         recovery = network.transport_recovery
@@ -832,7 +961,7 @@ def parse_profile_document(document: Any) -> Profile:
         pp_bytes=_require_nonnegative_int(document.get("pp_bytes"), "pp_bytes"),
         dp_all_reduce_bytes=(
             0
-            if workload.permutation is not None
+            if workload.point_to_point
             else _require_positive_int(
                 document.get("dp_all_reduce_bytes"), "dp_all_reduce_bytes"
             )
@@ -857,28 +986,47 @@ def parse_profile_document(document: Any) -> Profile:
         dp_all_reduce_implementation=dp_all_reduce_implementation,
         model=model,
     )
-    if profile.workload.permutation is not None:
-        if profile.workload.permutation.shift >= profile.ranks:
+    if profile.workload.point_to_point:
+        kind = profile.workload.kind
+        permutation = profile.workload.permutation
+        incast = profile.workload.incast
+        if permutation is not None and permutation.shift >= profile.ranks:
             raise ValueError("workload.shift must be below the rank count")
+        if incast is not None:
+            if profile.network.kind != "clos":
+                raise ValueError("workload.kind 'incast' needs a Clos fabric")
+            leaf_count = profile.ranks // profile.network.hosts_per_leaf
+            if leaf_count < 2:
+                raise ValueError("workload.kind 'incast' needs two leaves or more")
+            if max(incast.receiver_leaves) >= leaf_count:
+                raise ValueError(
+                    "workload.receiver_leaf must be below the leaf count, and so "
+                    "must each of workload.receiver_leaves"
+                )
+            if (
+                incast.receiver_count is None
+                or incast.receiver_count > profile.network.hosts_per_leaf
+            ):
+                raise ValueError(
+                    "workload.receiver_count must be at most network.hosts_per_leaf"
+                )
         if profile.steps != 1:
-            raise ValueError("workload.kind 'permutation' sends once and needs steps 1")
+            raise ValueError(f"workload.kind '{kind}' sends once and needs steps 1")
         if (
             profile.compute_duration_us != 0
             or profile.tp_all_reduce_bytes != 0
             or profile.pp_bytes != 0
         ):
             raise ValueError(
-                "workload.kind 'permutation' requires compute_duration_us, "
+                f"workload.kind '{kind}' requires compute_duration_us, "
                 "tp_all_reduce_bytes and pp_bytes to be zero"
             )
         if profile.model is not None:
-            raise ValueError(
-                "workload.kind 'permutation' cannot include model metadata"
-            )
+            raise ValueError(f"workload.kind '{kind}' cannot include model metadata")
         # The background incast fires on a DP All-Reduce, of which there is none.
         if profile.microburst_enabled:
             raise ValueError(
-                "workload.kind 'permutation' requires microburst_enabled false"
+                f"workload.kind '{kind}' requires microburst_enabled false"
             )
     elif profile.workload.kind == SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD:
         if profile.tp != 1 or profile.pp != 1:
@@ -1463,9 +1611,43 @@ class TraceWriter:
                 None,
             )
 
+    def _build_incast_trace(self, incast: Incast) -> None:
+        """This rank's sends and receives of the incast, none waiting for
+        anything. No parallel dimension owns them, so they carry no domain.
+
+        A rank that neither sends nor receives gets one compute node of zero
+        duration (an incast's compute_duration_us is zero) with no
+        dependencies, since the workload layer refuses a trace with no
+        node."""
+        hosts_per_leaf = self.profile.network.hosts_per_leaf
+        messages = incast.messages(hosts_per_leaf, self.profile.ranks // hosts_per_leaf)
+        if not any(self.rank in message[:2] for message in messages):
+            self.compute("incast_idle", [])
+            return
+        for source, destination, tag in messages:
+            if source == self.rank:
+                name, node_type = f"incast_send_to_{destination}_{tag}", COMM_SEND_NODE
+            elif destination == self.rank:
+                name, node_type = f"incast_recv_from_{source}_{tag}", COMM_RECV_NODE
+            else:
+                continue
+            self.point_to_point_node(
+                name,
+                node_type,
+                [],
+                source,
+                destination,
+                tag,
+                incast.message_bytes,
+                1,
+                None,
+            )
+
     def build(self) -> None:
         if self.profile.workload.permutation is not None:
             self._build_permutation_trace(self.profile.workload.permutation)
+        elif self.profile.workload.incast is not None:
+            self._build_incast_trace(self.profile.workload.incast)
         elif self.profile.workload.kind == SEQUENTIAL_DP_ALL_REDUCE_WORKLOAD:
             self._build_sequential_dp_all_reduce_trace()
         elif self.profile.model is None:
@@ -1816,10 +1998,25 @@ def write_experiment_config(
     path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
 
 
+def sends_per_rank(profile: Profile) -> int:
+    """The most messages one rank sends in an incast, which all start at
+    once; one for every other workload."""
+    incast = profile.workload.incast
+    if incast is None:
+        return 1
+    hosts_per_leaf = profile.network.hosts_per_leaf
+    sources = Counter(
+        source
+        for source, _, _ in incast.messages(hosts_per_leaf, profile.ranks // hosts_per_leaf)
+    )
+    return max(sources.values())
+
+
 def write_system_config(
     path: Path,
     dp_group_ids: Iterable[int] = (),
     dp_all_reduce_implementation: str = "ring",
+    comm_ops_in_flight: int = 1,
 ) -> None:
     configuration: dict[str, Any] = {
         "scheduling-policy": "LIFO",
@@ -1836,6 +2033,11 @@ def write_system_config(
         "roofline-enabled": 0,
         "peak-perf": 900,
     }
+    # The workload layer runs one send or collective at a time per rank
+    # unless told otherwise; a rank whose messages must all start at once
+    # needs that many in flight. One is the layer's default and stays out.
+    if comm_ops_in_flight > 1:
+        configuration["comm-ops-in-flight"] = comm_ops_in_flight
     if dp_all_reduce_implementation != "ring":
         # Override only the DP communicator groups: TP and PP keep the
         # global ring while every DP all-reduce runs the incast-forming
@@ -1991,6 +2193,7 @@ def materialize(
         system_config,
         dp_group_ids=set(dp_groups.values()),
         dp_all_reduce_implementation=profile.dp_all_reduce_implementation,
+        comm_ops_in_flight=sends_per_rank(profile),
     )
     (output_dir / "communicator_groups.json").write_text(
         json.dumps(groups, indent=2) + "\n", encoding="utf-8"

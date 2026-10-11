@@ -5,7 +5,7 @@
 # asked for is ignored, so a leaked key cannot get a shell.
 set -euo pipefail
 
-ROOT="${DCS_CI_ROOT:-$HOME/astra-ci}"
+ROOT="${DCS_CI_ROOT:-$HOME/asteria-ci}"
 umask 077
 cd "$ROOT/jobs"
 
@@ -30,7 +30,7 @@ name=$(printf '%s' "${SSH_ORIGINAL_COMMAND:-runner}" \
 # re-running setup.sh. A push already gates what this script does; offline
 # or diverged, the pull is skipped and the last checkout still works. Only
 # this accept script itself still deploys through setup.sh.
-REPO="${DCS_CI_REPO:-$HOME/astra-sim}"
+REPO="${DCS_CI_REPO:-$HOME/asteria}"
 git -C "$REPO" pull --ff-only --quiet 2>/dev/null || true
 sbatch --parsable --job-name="${name:-runner}" \
     "$REPO/ci/dcs/runner-job.sbatch" "$jit_file"

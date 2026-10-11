@@ -351,6 +351,13 @@ bool Sys::initialize_sys(string name) {
     if (j.contains("active-chunks-per-dimension")) {
         active_chunks_per_dimension = j["active-chunks-per-dimension"];
     }
+    if (j.contains("comm-ops-in-flight")) {
+        int inp_comm_ops_in_flight = j["comm-ops-in-flight"];
+        if (inp_comm_ops_in_flight < 1) {
+            sys_panic("comm-ops-in-flight in sys input file must be at least 1");
+        }
+        comm_ops_in_flight = static_cast<uint32_t>(inp_comm_ops_in_flight);
+    }
     if (j.contains("L")) {
         inp_L = j["L"];
     }

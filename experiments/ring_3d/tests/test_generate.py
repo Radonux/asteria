@@ -1939,6 +1939,8 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 config,
             )
             self.assertNotIn("SPRAY_DELAY", config)
+            self.assertNotIn("SPRAY_EDGE_FREEZE", config)
+            self.assertNotIn("SPRAY_SENDER_POOL_WEIGHT", config)
 
             manifest, config = generated(
                 {
@@ -2001,6 +2003,52 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 config,
             )
 
+    def test_spray_policy_writes_edge_freeze_and_sender_pool_weight_when_set(
+        self,
+    ) -> None:
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            runs = itertools.count()
+
+            def generated(balancing: dict[str, object]) -> tuple[dict, str]:
+                document["network"]["load_balancing"] = balancing
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                output = Path(temporary_directory) / f"run{next(runs)}"
+                manifest = materialize(profile_path, output)
+                config = (output / "network_config.txt").read_text(encoding="utf-8")
+                return manifest["load_balancing"], config
+
+            cases = (
+                ({"edge_freeze": False}, ["SPRAY_EDGE_FREEZE 0"]),
+                ({"edge_freeze": True}, ["SPRAY_EDGE_FREEZE 1"]),
+                ({"sender_pool_weight": 0.5}, ["SPRAY_SENDER_POOL_WEIGHT 0.5"]),
+                ({"sender_pool_weight": 1}, ["SPRAY_SENDER_POOL_WEIGHT 1.0"]),
+                (
+                    {"edge_freeze": False, "sender_pool_weight": 0},
+                    ["SPRAY_EDGE_FREEZE 0", "SPRAY_SENDER_POOL_WEIGHT 0.0"],
+                ),
+            )
+            for knobs, lines in cases:
+                with self.subTest(knobs=knobs):
+                    manifest, config = generated({"mode": "spray_policy", **knobs})
+                    self.assertIn(
+                        "\nSPRAY_EDGE_WINDOW_PENALTY 64\n"
+                        + "".join(f"{line}\n" for line in lines)
+                        + "PORT_COUNTER_OUTPUT_FILE ",
+                        config,
+                    )
+                    for knob, value in knobs.items():
+                        self.assertEqual(manifest[knob], value)
+                    self.assertEqual(
+                        set(manifest) & {"edge_freeze", "sender_pool_weight"},
+                        set(knobs),
+                    )
+
     def test_spray_policy_refuses_what_nothing_would_read(self) -> None:
         document = json.loads(
             (
@@ -2054,6 +2102,26 @@ class Ring3DGeneratorTests(unittest.TestCase):
                 "takes no other key",
             ),
             ({"mode": "ev_hash", "grade_scope": "per_receiver"}, "'ops' does not take"),
+            ({"mode": "spray_uniform", "edge_freeze": False}, "takes no other key"),
+            ({"mode": "ev_hash", "sender_pool_weight": 0.5}, "'ops' does not take"),
+            (
+                {
+                    "mode": "spray_uniform",
+                    "selector": "ack_redirect",
+                    "scope": "per_receiver",
+                    "edge_freeze": False,
+                },
+                "does not take",
+            ),
+            (
+                {
+                    "mode": "spray_uniform",
+                    "selector": "ack_redirect",
+                    "sender_pool_weight": 0.5,
+                },
+                "does not take",
+            ),
+            ({**policy, "edge_freeze": 0}, "edge_freeze must be a boolean"),
             ({**policy, "congestion_thresholds": [0.5, 0.25, 0.75]}, "must increase"),
             ({**policy, "congestion_thresholds": [0.25, 0.5]}, "three thresholds"),
             (
@@ -2082,6 +2150,7 @@ class Ring3DGeneratorTests(unittest.TestCase):
             ("epsilon", (-0.01, 1.01, True)),
             ("candidates", (0, 2.0, True)),
             ("edge_window_penalty", (-1, 128, 1.0)),
+            ("sender_pool_weight", (-0.1, 1.5, True, "half", float("nan"))),
         ):
             refusals += [
                 ({**policy, knob: value}, f"{knob} must be") for value in values

@@ -10,7 +10,7 @@
 #   bash ci/dcs/setup.sh
 set -euo pipefail
 
-ROOT="${DCS_CI_ROOT:-$HOME/astra-ci}"
+ROOT="${DCS_CI_ROOT:-$HOME/asteria-ci}"
 script_dir=$(cd "$(dirname "$0")" && pwd)
 
 mkdir -p "$ROOT/bin" "$ROOT/jobs"
@@ -27,7 +27,7 @@ Setup OK under $ROOT.
 Next: add the CI deploy key to ~/.ssh/authorized_keys as a forced command,
 so the key can submit runner jobs and do nothing else:
 
-  command="$ROOT/bin/accept-runner.sh",restrict ssh-ed25519 AAAA... astra-ci
+  command="$ROOT/bin/accept-runner.sh",restrict ssh-ed25519 AAAA... asteria-ci
 
 Then create the GitHub secrets/vars listed in ci/dcs/README.md.
 EOF
