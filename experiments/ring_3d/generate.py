@@ -336,37 +336,47 @@ class Permutation:
 
 @dataclass(frozen=True)
 class Incast:
-    """Every host on ``receiver_leaf`` receives ``fan_in`` messages at once.
+    """The first ``receiver_count`` hosts on each of ``receiver_leaves``
+    receive ``fan_in`` messages at once.
 
-    A receiver's ``j``-th sender sits on the ``j``-th other leaf taken round
-    robin, so its senders span every other leaf; within that leaf it is the
+    A receiver's ``j``-th sender sits on the ``j``-th leaf other than its own
+    taken round robin, so its senders span every other leaf, receiving leaves
+    included, and a host may both send and receive; within that leaf it is the
     host ``j // (leaf_count - 1)`` places past the receiver's own position,
     which spreads the receivers' senders over the leaf's hosts. A fan-in above
     the hosts outside the receiver's leaf wraps, and the wrapped senders hold
     a second message to that receiver. The tag is ``j + 1``, unique per
-    receiver and so per pair of ranks.
+    receiver and so per pair of ranks. ``receiver_count`` None is every host
+    of the leaf.
     """
 
-    receiver_leaf: int
+    receiver_leaves: tuple[int, ...]
     fan_in: int
     message_bytes: int
+    receiver_count: int | None = None
 
     def messages(
         self, hosts_per_leaf: int, leaf_count: int
     ) -> tuple[tuple[int, int, int], ...]:
         """Every message as (source, destination, tag), receivers in order."""
-        source_leaves = [
-            leaf for leaf in range(leaf_count) if leaf != self.receiver_leaf
-        ]
+        receiver_count = (
+            hosts_per_leaf if self.receiver_count is None else self.receiver_count
+        )
         messages = []
-        for position in range(hosts_per_leaf):
-            destination = self.receiver_leaf * hosts_per_leaf + position
-            for connection in range(self.fan_in):
-                leaf = source_leaves[connection % len(source_leaves)]
-                host = (position + connection // len(source_leaves)) % hosts_per_leaf
-                messages.append(
-                    (leaf * hosts_per_leaf + host, destination, connection + 1)
-                )
+        for receiver_leaf in self.receiver_leaves:
+            source_leaves = [
+                leaf for leaf in range(leaf_count) if leaf != receiver_leaf
+            ]
+            for position in range(receiver_count):
+                destination = receiver_leaf * hosts_per_leaf + position
+                for connection in range(self.fan_in):
+                    leaf = source_leaves[connection % len(source_leaves)]
+                    host = (
+                        position + connection // len(source_leaves)
+                    ) % hosts_per_leaf
+                    messages.append(
+                        (leaf * hosts_per_leaf + host, destination, connection + 1)
+                    )
         return tuple(messages)
 
 
@@ -404,7 +414,8 @@ class Workload:
         if self.incast is not None:
             return {
                 "kind": self.kind,
-                "receiver_leaf": self.incast.receiver_leaf,
+                "receiver_leaves": list(self.incast.receiver_leaves),
+                "receiver_count": self.incast.receiver_count,
                 "fan_in": self.incast.fan_in,
                 "message_bytes": self.incast.message_bytes,
             }
@@ -593,23 +604,7 @@ def _load_workload(document: dict[str, Any]) -> Workload:
     if kind not in WORKLOAD_KINDS:
         raise ValueError(f"workload.kind must be one of {sorted(WORKLOAD_KINDS)}")
     if kind == INCAST_WORKLOAD:
-        if set(value) != {"kind", "receiver_leaf", "fan_in", "message_bytes"}:
-            raise ValueError(
-                "workload.kind 'incast' must contain exactly "
-                "['fan_in', 'kind', 'message_bytes', 'receiver_leaf']"
-            )
-        return Workload(
-            kind,
-            incast=Incast(
-                receiver_leaf=_require_nonnegative_int(
-                    value["receiver_leaf"], "workload.receiver_leaf"
-                ),
-                fan_in=_require_positive_int(value["fan_in"], "workload.fan_in"),
-                message_bytes=_require_positive_int(
-                    value["message_bytes"], "workload.message_bytes"
-                ),
-            ),
-        )
+        return Workload(kind, incast=_load_incast(value))
     if kind != PERMUTATION_WORKLOAD:
         if set(value) != {"kind"}:
             raise ValueError(f"workload.kind '{kind}' takes no other key")
@@ -626,6 +621,50 @@ def _load_workload(document: dict[str, Any]) -> Workload:
             message_bytes=_require_positive_int(
                 value["message_bytes"], "workload.message_bytes"
             ),
+        ),
+    )
+
+
+def _load_incast(value: dict[str, Any]) -> Incast:
+    """The incast's keys; the receiver leaves are bounded by the fabric
+    later."""
+    required = {"kind", "fan_in", "message_bytes"}
+    receiver_keys = {"receiver_leaf", "receiver_leaves"} & set(value)
+    if (
+        not required <= set(value)
+        or len(receiver_keys) != 1
+        or set(value) - required - receiver_keys - {"receiver_count"}
+    ):
+        raise ValueError(
+            "workload.kind 'incast' must contain exactly "
+            "['fan_in', 'kind', 'message_bytes'] and one of "
+            "['receiver_leaf', 'receiver_leaves'], and may contain "
+            "['receiver_count']"
+        )
+    if "receiver_leaf" in value:
+        receiver_leaves: tuple[int, ...] = (
+            _require_nonnegative_int(value["receiver_leaf"], "workload.receiver_leaf"),
+        )
+    else:
+        leaves = value["receiver_leaves"]
+        if not isinstance(leaves, list) or not leaves:
+            raise ValueError("workload.receiver_leaves must be a nonempty array")
+        receiver_leaves = tuple(
+            _require_nonnegative_int(leaf, "workload.receiver_leaves")
+            for leaf in leaves
+        )
+        if len(set(receiver_leaves)) != len(receiver_leaves):
+            raise ValueError("workload.receiver_leaves must be distinct")
+    return Incast(
+        receiver_leaves=receiver_leaves,
+        fan_in=_require_positive_int(value["fan_in"], "workload.fan_in"),
+        message_bytes=_require_positive_int(
+            value["message_bytes"], "workload.message_bytes"
+        ),
+        receiver_count=(
+            _require_positive_int(value["receiver_count"], "workload.receiver_count")
+            if "receiver_count" in value
+            else None
         ),
     )
 
@@ -799,6 +838,17 @@ def parse_profile_document(document: Any) -> Profile:
     selection_policy = _load_selection_policy(document)
     explicit_clr_schedule = _load_explicit_clr_schedule(document, steps)
     network = load_network(document.get("network"), ranks)
+    incast = workload.incast
+    if (
+        incast is not None
+        and incast.receiver_count is None
+        and network.kind == "clos"
+    ):
+        # Every host of a receiving leaf, recorded as a count.
+        workload = replace(
+            workload,
+            incast=replace(incast, receiver_count=network.hosts_per_leaf),
+        )
     if selection_policy.domain in FORGIVING_DOMAINS:
         domain_value = selection_policy.domain.value
         recovery = network.transport_recovery
@@ -948,8 +998,18 @@ def parse_profile_document(document: Any) -> Profile:
             leaf_count = profile.ranks // profile.network.hosts_per_leaf
             if leaf_count < 2:
                 raise ValueError("workload.kind 'incast' needs two leaves or more")
-            if incast.receiver_leaf >= leaf_count:
-                raise ValueError("workload.receiver_leaf must be below the leaf count")
+            if max(incast.receiver_leaves) >= leaf_count:
+                raise ValueError(
+                    "workload.receiver_leaf must be below the leaf count, and so "
+                    "must each of workload.receiver_leaves"
+                )
+            if (
+                incast.receiver_count is None
+                or incast.receiver_count > profile.network.hosts_per_leaf
+            ):
+                raise ValueError(
+                    "workload.receiver_count must be at most network.hosts_per_leaf"
+                )
         if profile.steps != 1:
             raise ValueError(f"workload.kind '{kind}' sends once and needs steps 1")
         if (

@@ -1,4 +1,4 @@
-"""The incast workload: every host on one leaf receives fan_in messages."""
+"""The incast workload: hosts on chosen leaves receive fan_in messages each."""
 
 from __future__ import annotations
 
@@ -78,7 +78,9 @@ def _ends(node: Node) -> tuple[int, int, int, int]:
 
 class IncastMessageTests(unittest.TestCase):
     def test_senders_span_every_other_leaf_round_robin(self) -> None:
-        messages = Incast(receiver_leaf=0, fan_in=14, message_bytes=1).messages(8, 8)
+        messages = Incast(receiver_leaves=(0,), fan_in=14, message_bytes=1).messages(
+            8, 8
+        )
         self.assertEqual(len(messages), 8 * 14)
         for receiver in range(8):
             with self.subTest(receiver=receiver):
@@ -94,7 +96,9 @@ class IncastMessageTests(unittest.TestCase):
                 )
 
     def test_fan_in_above_the_senders_wraps_into_second_messages(self) -> None:
-        messages = Incast(receiver_leaf=0, fan_in=64, message_bytes=1).messages(8, 8)
+        messages = Incast(receiver_leaves=(0,), fan_in=64, message_bytes=1).messages(
+            8, 8
+        )
         for receiver in range(8):
             with self.subTest(receiver=receiver):
                 pairs = Counter(
@@ -110,9 +114,46 @@ class IncastMessageTests(unittest.TestCase):
         self.assertEqual(sum(load.values()), 512)
 
     def test_receiver_leaf_is_never_a_source(self) -> None:
-        messages = Incast(receiver_leaf=3, fan_in=21, message_bytes=1).messages(8, 8)
+        messages = Incast(receiver_leaves=(3,), fan_in=21, message_bytes=1).messages(
+            8, 8
+        )
         self.assertEqual({destination // 8 for _, destination, _ in messages}, {3})
         self.assertNotIn(3, {source // 8 for source, _, _ in messages})
+
+    def test_each_receiving_leaf_takes_its_first_receiver_count_hosts(self) -> None:
+        incast = Incast(
+            receiver_leaves=(5, 2), fan_in=9, message_bytes=1, receiver_count=3
+        )
+        messages = incast.messages(8, 8)
+        self.assertEqual(
+            list(dict.fromkeys(destination for _, destination, _ in messages)),
+            [40, 41, 42, 16, 17, 18],
+        )
+        for receiver in (40, 41, 42, 16, 17, 18):
+            leaf, position = divmod(receiver, 8)
+            others = [other for other in range(8) if other != leaf]
+            with self.subTest(receiver=receiver):
+                self.assertEqual(
+                    [(s, t) for s, d, t in messages if d == receiver],
+                    [
+                        (
+                            others[j % 7] * 8 + (position + j // 7) % 8,
+                            j + 1,
+                        )
+                        for j in range(9)
+                    ],
+                )
+        # The other receiving leaf sends too: host 16 receives and sends.
+        self.assertIn(16, {source for source, _, _ in messages})
+        self.assertIn(40, {source for source, _, _ in messages})
+
+    def test_one_receiver_leaf_is_a_list_of_one(self) -> None:
+        for count in (None, 8):
+            with self.subTest(receiver_count=count):
+                self.assertEqual(
+                    Incast((3,), 21, 1, count).messages(8, 8),
+                    Incast((3,), 21, 1).messages(8, 8),
+                )
 
 
 class IncastTraceTests(unittest.TestCase):
@@ -138,7 +179,8 @@ class IncastTraceTests(unittest.TestCase):
             manifest["workload"],
             {
                 "kind": "incast",
-                "receiver_leaf": 0,
+                "receiver_leaves": [0],
+                "receiver_count": 8,
                 "fan_in": 32,
                 "message_bytes": 2_097_152,
             },
@@ -146,7 +188,7 @@ class IncastTraceTests(unittest.TestCase):
         # 256 messages over 56 sending hosts: every message starts at once only
         # if a rank may hold its most, five, in flight.
         self.assertEqual(system["comm-ops-in-flight"], 5)
-        expected = Incast(0, 32, 2_097_152).messages(8, 8)
+        expected = Incast((0,), 32, 2_097_152).messages(8, 8)
         sends = sorted(
             _ends(node)[:3]
             for nodes in traces.values()
@@ -200,6 +242,94 @@ class IncastTraceTests(unittest.TestCase):
         document = _incast()
         document["network"]["hosts_per_leaf"] = 64
         self._refused(document, "needs two leaves or more")
+        receivers = (
+            ({"receiver_leaves": [1]}, "'incast' must contain exactly"),
+            ({"receiver_count": 9}, "receiver_count must be at most"),
+            ({"receiver_count": 0}, "receiver_count must be a positive integer"),
+            ({"receiver_count": True}, "receiver_count must be a positive integer"),
+            ({"receiver_extra": 1}, "'incast' must contain exactly"),
+        )
+        for change, message in receivers:
+            document = _incast()
+            document["workload"].update(change)
+            with self.subTest(change=change):
+                self._refused(document, message)
+        lists = (
+            ([], "receiver_leaves must be a nonempty array"),
+            (2, "receiver_leaves must be a nonempty array"),
+            ([1, 1], "receiver_leaves must be distinct"),
+            ([0, 8], "each of workload.receiver_leaves"),
+            ([0, -1], "receiver_leaves must be a nonnegative integer"),
+        )
+        for leaves, message in lists:
+            document = _incast()
+            del document["workload"]["receiver_leaf"]
+            document["workload"]["receiver_leaves"] = leaves
+            with self.subTest(receiver_leaves=leaves):
+                self._refused(document, message)
+        document = _incast()
+        del document["workload"]["receiver_leaf"]
+        self._refused(document, "'incast' must contain exactly")
+
+    def test_receiver_leaf_writes_what_receiver_leaves_of_one_writes(self) -> None:
+        single = _incast(fan_in=14, receiver_leaf=3)
+        listed = _incast(fan_in=14, receiver_leaf=3)
+        del listed["workload"]["receiver_leaf"]
+        listed["workload"].update({"receiver_leaves": [3], "receiver_count": 8})
+        outputs = []
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            for name, document in (("single", single), ("listed", listed)):
+                path = Path(temporary_directory) / f"{name}.json"
+                path.write_text(json.dumps(document), encoding="utf-8")
+                output = Path(temporary_directory) / name
+                manifest = materialize(path, output)
+                outputs.append(
+                    (
+                        manifest["workload"],
+                        {
+                            rank: (output / f"workload/ring_3d.{rank}.et").read_bytes()
+                            for rank in range(64)
+                        },
+                        (output / "system.json").read_bytes(),
+                    )
+                )
+        self.assertEqual(outputs[0], outputs[1])
+
+    def test_two_receiving_leaves_trace_exactly_their_messages(self) -> None:
+        document = _incast(fan_in=10)
+        del document["workload"]["receiver_leaf"]
+        document["workload"].update({"receiver_leaves": [6, 1], "receiver_count": 6})
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "profile.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            output = Path(temporary_directory) / "out"
+            manifest = materialize(path, output)
+            traces = {
+                rank: _nodes(output / f"workload/ring_3d.{rank}.et")
+                for rank in range(64)
+            }
+            system = json.loads((output / "system.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["workload"]["receiver_leaves"], [6, 1])
+        self.assertEqual(manifest["workload"]["receiver_count"], 6)
+        expected = Incast((6, 1), 10, 2_097_152, 6).messages(8, 8)
+        self.assertEqual(len(expected), 2 * 6 * 10)
+        for node_type in (COMM_SEND_NODE, COMM_RECV_NODE):
+            with self.subTest(node_type=node_type):
+                self.assertEqual(
+                    sorted(
+                        _ends(node)[:3]
+                        for nodes in traces.values()
+                        for node in nodes
+                        if node.type == node_type
+                    ),
+                    sorted(expected),
+                )
+        self.assertEqual(
+            system["comm-ops-in-flight"],
+            max(Counter(source for source, _, _ in expected).values()),
+        )
+        # Hosts 6 and 7 of a receiving leaf receive nothing.
+        self.assertFalse([node for node in traces[14] if node.type == COMM_RECV_NODE])
 
 
 if __name__ == "__main__":
