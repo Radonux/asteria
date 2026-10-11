@@ -54,7 +54,7 @@ done
 candidates() {
     # Newest scratch generation first: after a rollover both may briefly
     # exist, and the newer one is the one a newer arm wrote into.
-    ls -1dt "${DCS_SCRATCH_BASE:-/scratch/scratch-space}"/expires-*/astra-sim/outbox/"$group/$key" 2>/dev/null || true
+    ls -1dt "${DCS_SCRATCH_BASE:-/scratch/scratch-space}"/expires-*/asteria/outbox/"$group/$key" 2>/dev/null || true
 }
 
 # The freshest generation's outbox root, ranked by the parsed expiry date
@@ -72,7 +72,7 @@ newest_outbox_root() {
             best_epoch=$epoch
         fi
     done
-    [[ -n "$best" ]] && printf '%s\n' "$best/astra-sim/outbox"
+    [[ -n "$best" ]] && printf '%s\n' "$best/asteria/outbox"
 }
 
 case "$verb" in

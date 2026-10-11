@@ -48,7 +48,7 @@ only (checkout, forced-command script, jitconfigs, logs - under 1 GB).
 The multi-gigabyte runtime extraction is shared, not duplicated: before
 the wave provisions, a single seed job (`cluster-seed` in the main
 workflow) publishes both ISA bundles as sealed read-only entries under
-`<scratch base>/astra-sim/store/<artifact name>/` (`ci/dcs/seed-store.sh`),
+`<scratch base>/asteria/store/<artifact name>/` (`ci/dcs/seed-store.sh`),
 and every evaluation job links against the entry its CPU supports
 (`resolve-runtime.sh` + `install-runtime.sh`), cutting a wave's
 environment footprint from ~33 private copies to one per ISA level. The
@@ -68,13 +68,36 @@ deploys through `setup.sh`.
 ## Cluster setup (once)
 
 ```sh
-git clone --no-recurse-submodules <repo-url> ~/astra-sim && cd ~/astra-sim
-bash ci/dcs/setup.sh          # control-plane scripts into ~/astra-ci
+git clone --no-recurse-submodules <repo-url> ~/asteria && cd ~/asteria
+bash ci/dcs/setup.sh          # control-plane scripts into ~/asteria-ci
 ```
 
-Generate a dedicated key pair (`ssh-keygen -t ed25519 -f astra-ci -N ''`)
+Generate a dedicated key pair (`ssh-keygen -t ed25519 -f asteria-ci -N ''`)
 and add the public half to `~/.ssh/authorized_keys` exactly as `setup.sh`
 prints, with the forced command and `restrict`.
+
+## Sharing an account with another repository's runners
+
+These scripts can run on a cluster account that already serves another
+repository with the same layout (astra-sim's `~/astra-ci`, `~/astra-sim`
+and `<scratch base>/astra-sim/`). Every path here is this repository's
+own, so neither side reads, reaps or sweeps the other's:
+
+| What | This repository | Defined in |
+|------|-----------------|------------|
+| Control plane (forced command, jitconfigs, job logs) | `~/asteria-ci` | `accept-runner.sh`, `setup.sh` (`DCS_CI_ROOT` overrides) |
+| Checkout the forced command submits from | `~/asteria` | `accept-runner.sh` (`DCS_CI_REPO` overrides) |
+| Job scratch, one tree per SLURM job | `<scratch base>/asteria/<slurm job id>` | `runner-job.sbatch` |
+| Shared runtime store | `<network scratch>/asteria/store` | `runner-job.sbatch`, `resolve-runtime.sh` |
+| Courier outbox | `<network scratch>/asteria/outbox` | `runner-job.sbatch`, `outbox.sh` |
+| SLURM job name | `asteria-gh-runner`, or the provision's runner name | `runner-job.sbatch`, `accept-runner.sh` |
+
+The orphan reaper only visits numeric job directories under
+`<scratch base>/asteria/`, and the store's age sweep only its own store,
+so the other repository's trees are never candidates. The deploy key is a
+second `authorized_keys` line with its own forced command; the scratch
+base selection (newest `expires-*` generation, then the job-local
+fallbacks) is unchanged.
 
 ## GitHub configuration (once)
 
@@ -109,7 +132,7 @@ tears itself down after the 30-minute idle guard.
 ## Scratch tenancy
 
 A completed experiment leaves nothing on the shared scratch volume. All
-jobs live under one `astra-sim/<slurm job id>` parent per scratch base, so
+jobs live under one `asteria/<slurm job id>` parent per scratch base, so
 a full wave presents as a single directory. Three mechanisms compose: the
 mid-run segment hasher (`.github/scripts/segment_hasher.py`) folds each
 sealed raw-log segment's uncompressed content into the arm's stream
@@ -124,11 +147,11 @@ sibling trees whose SLURM job id no longer exists (the backstop for node
 crashes and kills that outrun the trap). The non-numeric `store` and
 `outbox` siblings are exempt from the reaper by construction; orphaned
 outboxes die with their scratch generation. Only the control-plane files under
-`~/astra-ci` (job logs, jitconfig staging) live outside scratch, and
+`~/asteria-ci` (job logs, jitconfig staging) live outside scratch, and
 teardown below removes those.
 
 ## Teardown
 
 Remove the `authorized_keys` line, delete the two GitHub secrets, and
-`rm -rf ~/astra-ci`. There are no services, cron entries, or standing
+`rm -rf ~/asteria-ci ~/asteria`. There are no services, cron entries, or standing
 registrations to clean up; JIT runners deregister themselves.
