@@ -227,6 +227,19 @@ class LoadBalancing:
     def _names_selector(self) -> bool:
         return self.mode == "ev_hash" or self.selector in SPINE_SELECTORS
 
+    def traces_spine_loss(self) -> bool:
+        """Whether the run traces each host's pooled loss intervals: only the
+        host-wide pool counts over them, so spray_policy with loss_thresholds
+        and sender_pool_weight above 0, and only outside the switch_queue
+        cost source, under which the sender counts no loss."""
+        values = dict(self.parameters)
+        return (
+            self.mode == "spray_policy"
+            and "loss_thresholds" in values
+            and float(values.get("sender_pool_weight", 0.0)) > 0
+            and values.get("grade_cost_source") != "switch_queue"
+        )
+
     def manifest(self) -> dict[str, ParameterValue]:
         if not self._names_selector():
             return {"mode": self.mode, **dict(self.parameters)}

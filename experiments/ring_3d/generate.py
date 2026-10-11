@@ -2053,6 +2053,8 @@ def counter_files(load_balancing: LoadBalancing, output_dir: Path) -> dict[str, 
         files["SPINE_ARRIVAL_OUTPUT_FILE"] = output_dir / "spine_arrivals.csv"
     if load_balancing.mode == "spray_policy":
         files["SPINE_REPORT_OUTPUT_FILE"] = output_dir / "spine_reports.csv"
+    if load_balancing.traces_spine_loss():
+        files["SPINE_LOSS_OUTPUT_FILE"] = output_dir / "spine_losses.csv"
     return files
 
 
