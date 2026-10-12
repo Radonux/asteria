@@ -763,6 +763,13 @@ def _flag(value: Any, field: str) -> bool:
     return value
 
 
+def _grade(value: Any, field: str) -> int:
+    # A report grades a spine in two bits.
+    if _nonnegative_int(value, field) > 3:
+        raise ValueError(f"{field} must be an integer in [0, 3]")
+    return value
+
+
 def _candidate_draw(value: Any, field: str) -> str:
     if value not in ("proportional", "uniform"):
         raise ValueError(f"{field} must be 'proportional' or 'uniform'")
@@ -888,6 +895,12 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
         (0.25, 0.5, 0.75),
         _increasing_thresholds(_fraction),
     ),
+    # Absent, 0, every grade as the thresholds give it. With it, the least
+    # grade the receiver gives a spine for its marked and trimmed fractions
+    # and its one-way delay; the loss grade and a held spine still grade 0.
+    BalancingParameter(
+        "congestion_grade_floor", "SPRAY_CONGESTION_GRADE_FLOOR", 0, _grade
+    ),
     # Absent, the sender counts no loss. With them, the sender counts per
     # spine the sends drawn from its scores and the sends declared lost, and
     # grades each spine at no more than its lost fraction earns.
@@ -1002,6 +1015,7 @@ WRITTEN_WHEN_SET_PARAMETERS = {
     "edge_freeze",
     "sender_pool_weight",
     "trim_thresholds",
+    "congestion_grade_floor",
     "loss_thresholds",
     "loss_interval_ns",
     "loss_hold_clean_sentinels",
