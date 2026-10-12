@@ -13,7 +13,12 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from experiments.ring_3d.generate import load_profile, materialize
 
 PROFILE = REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
-KEYS = ("held_exploration", "held_sentinel_interval_ns", "pool_decay_interval_ns")
+KEYS = (
+    "held_exploration",
+    "held_sentinel_interval_ns",
+    "pool_decay_interval_ns",
+    "pool_hold_propagates",
+)
 
 
 class HeldExplorationTest(unittest.TestCase):
@@ -111,12 +116,45 @@ class HeldExplorationTest(unittest.TestCase):
         self.assertEqual(manifest["held_sentinel_interval_ns"], 0)
         self.assertEqual(manifest["pool_decay_interval_ns"], 0)
 
+    def test_writes_pool_hold_propagates_after_decay_interval(self) -> None:
+        manifest, config = self.generated(
+            {
+                "mode": "spray_policy",
+                "sender_pool_weight": 0.5,
+                "pool_decay_interval_ns": 10000,
+                "pool_hold_propagates": True,
+            }
+        )
+        self.assertIn(
+            "\nSPRAY_SENDER_POOL_WEIGHT 0.5\n"
+            "SPRAY_POOL_DECAY_INTERVAL_NS 10000\n"
+            "SPRAY_POOL_HOLD_PROPAGATES 1\n",
+            config,
+        )
+        self.assertIs(manifest["pool_hold_propagates"], True)
+
+    def test_pool_hold_propagates_false_without_decay_interval(self) -> None:
+        manifest, config = self.generated(
+            {
+                "mode": "spray_policy",
+                "sender_pool_weight": 1,
+                "pool_hold_propagates": False,
+            }
+        )
+        self.assertIn(
+            "\nSPRAY_SENDER_POOL_WEIGHT 1.0\nSPRAY_POOL_HOLD_PROPAGATES 0\n", config
+        )
+        self.assertNotIn("SPRAY_POOL_DECAY_INTERVAL_NS", config)
+        self.assertIs(manifest["pool_hold_propagates"], False)
+        self.assertNotIn("pool_decay_interval_ns", manifest)
+
     def test_unset_writes_nothing(self) -> None:
         manifest, config = self.generated(
             {"mode": "spray_policy", "sender_pool_weight": 0.5}
         )
         self.assertNotIn("SPRAY_HELD_", config)
         self.assertNotIn("SPRAY_POOL_DECAY_", config)
+        self.assertNotIn("SPRAY_POOL_HOLD_", config)
         for key in KEYS:
             self.assertNotIn(key, manifest)
 
@@ -193,11 +231,32 @@ class HeldExplorationTest(unittest.TestCase):
                 {**pooled, "pool_decay_interval_ns": True},
                 "pool_decay_interval_ns must be a nonnegative integer",
             ),
+            (
+                {**policy, "pool_hold_propagates": True},
+                "pool_hold_propagates requires sender_pool_weight above 0",
+            ),
+            (
+                {**policy, "sender_pool_weight": 0, "pool_hold_propagates": False},
+                "pool_hold_propagates requires sender_pool_weight above 0",
+            ),
+            (
+                {**policy, "sender_pool_weight": -1, "pool_hold_propagates": True},
+                "sender_pool_weight must be a number in",
+            ),
+            (
+                {**pooled, "pool_hold_propagates": 1},
+                "pool_hold_propagates must be a boolean",
+            ),
+            (
+                {**pooled, "pool_hold_propagates": "true"},
+                "pool_hold_propagates must be a boolean",
+            ),
         ]
         knobs = (
             ("held_exploration", "sentinel"),
             ("held_sentinel_interval_ns", 0),
             ("pool_decay_interval_ns", 0),
+            ("pool_hold_propagates", True),
         )
         for knob, value in knobs:
             refusals += [

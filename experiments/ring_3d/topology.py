@@ -988,6 +988,13 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "pool_decay_interval_ns", "SPRAY_POOL_DECAY_INTERVAL_NS", 0, _nonnegative_int
     ),
+    # With it, a spine the host-wide pool holds, by its grade or its loss
+    # hold, gets no share in any of the host's draws, and its sentinels are
+    # sent once per host per sentinel interval. Read only with
+    # sender_pool_weight above 0.
+    BalancingParameter(
+        "pool_hold_propagates", "SPRAY_POOL_HOLD_PROPAGATES", False, _flag
+    ),
 )
 # The parameters written, and recorded in the manifest, only when the profile
 # sets them; the simulator's defaults are the defaults above.
@@ -1001,6 +1008,7 @@ WRITTEN_WHEN_SET_PARAMETERS = {
     "held_exploration",
     "held_sentinel_interval_ns",
     "pool_decay_interval_ns",
+    "pool_hold_propagates",
 }
 # The parameters only one-way delay reads.
 ONE_WAY_DELAY_PARAMETERS = {
@@ -1170,17 +1178,17 @@ def _load_spray_policy(
             "network.load_balancing.held_sentinel_interval_ns requires "
             "held_exploration 'sentinel'"
         )
-    if "pool_decay_interval_ns" in balancing and not (
-        _probability(
-            balancing.get("sender_pool_weight", 0.0),
-            "network.load_balancing.sender_pool_weight",
-        )
-        > 0
-    ):
-        raise ValueError(
-            "network.load_balancing.pool_decay_interval_ns requires "
-            "sender_pool_weight above 0"
-        )
+    for key in ("pool_decay_interval_ns", "pool_hold_propagates"):
+        if key in balancing and not (
+            _probability(
+                balancing.get("sender_pool_weight", 0.0),
+                "network.load_balancing.sender_pool_weight",
+            )
+            > 0
+        ):
+            raise ValueError(
+                f"network.load_balancing.{key} requires sender_pool_weight above 0"
+            )
     if balancing.get("grade_cost_source") == "switch_queue" and balancing.get(
         "grade_scope", "per_receiver"
     ) != "per_receiver":
