@@ -902,6 +902,15 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "loss_interval_ns", "SPRAY_LOSS_INTERVAL_NS", 0, _nonnegative_int
     ),
+    # The clean sentinels a spine whose lost fraction graded 0 must deliver,
+    # consecutively, before it leaves grade 0; 0 releases it at the first
+    # interval with no loss. Read only with loss_thresholds.
+    BalancingParameter(
+        "loss_hold_clean_sentinels",
+        "SPRAY_LOSS_HOLD_CLEAN_SENTINELS",
+        0,
+        _nonnegative_int,
+    ),
     BalancingParameter(
         "absence_fraction_of_median",
         "SPRAY_ABSENCE_FRACTION_OF_MEDIAN",
@@ -988,6 +997,7 @@ WRITTEN_WHEN_SET_PARAMETERS = {
     "trim_thresholds",
     "loss_thresholds",
     "loss_interval_ns",
+    "loss_hold_clean_sentinels",
     "held_exploration",
     "held_sentinel_interval_ns",
     "pool_decay_interval_ns",
@@ -1140,6 +1150,10 @@ def _load_spray_policy(
     if "loss_interval_ns" in balancing and "loss_thresholds" not in balancing:
         raise ValueError(
             "network.load_balancing.loss_interval_ns requires loss_thresholds"
+        )
+    if "loss_hold_clean_sentinels" in balancing and "loss_thresholds" not in balancing:
+        raise ValueError(
+            "network.load_balancing.loss_hold_clean_sentinels requires loss_thresholds"
         )
     if balancing.get("held_exploration") == "none" and (
         balancing.get("grade_cost_source") != "switch_queue"
