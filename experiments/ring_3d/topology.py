@@ -798,6 +798,12 @@ def _grade_cost_source(value: Any, field: str) -> str:
     return value
 
 
+def _held_exploration(value: Any, field: str) -> str:
+    if value not in ("epsilon", "sentinel", "none"):
+        raise ValueError(f"{field} must be 'epsilon', 'sentinel' or 'none'")
+    return value
+
+
 def _trim_scoring(value: Any, field: str) -> str:
     if value not in ("mark", "ignore"):
         raise ValueError(f"{field} must be 'mark' or 'ignore'")
@@ -896,6 +902,15 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "loss_interval_ns", "SPRAY_LOSS_INTERVAL_NS", 0, _nonnegative_int
     ),
+    # The clean sentinels a spine whose lost fraction graded 0 must deliver,
+    # consecutively, before it leaves grade 0; 0 releases it at the first
+    # interval with no loss. Read only with loss_thresholds.
+    BalancingParameter(
+        "loss_hold_clean_sentinels",
+        "SPRAY_LOSS_HOLD_CLEAN_SENTINELS",
+        0,
+        _nonnegative_int,
+    ),
     BalancingParameter(
         "absence_fraction_of_median",
         "SPRAY_ABSENCE_FRACTION_OF_MEDIAN",
@@ -943,6 +958,19 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     ),
     BalancingParameter("gamma", "SPRAY_GAMMA", 0.25, _fraction),
     BalancingParameter("epsilon", "SPRAY_EPSILON", 0.02, _probability),
+    # How a held spine, one whose last grade was 0, is explored: epsilon
+    # gives it its share of the epsilon draw, sentinel one data packet per
+    # sentinel interval and no share of the draw, none nothing.
+    BalancingParameter(
+        "held_exploration", "SPRAY_HELD_EXPLORATION", "epsilon", _held_exploration
+    ),
+    # Read only with held_exploration sentinel.
+    BalancingParameter(
+        "held_sentinel_interval_ns",
+        "SPRAY_HELD_SENTINEL_INTERVAL_NS",
+        0,
+        _nonnegative_int,
+    ),
     BalancingParameter("candidates", "SPRAY_CANDIDATES", 1, _positive_int),
     BalancingParameter(
         "candidate_draw", "SPRAY_CANDIDATE_DRAW", "proportional", _candidate_draw
@@ -954,6 +982,19 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "sender_pool_weight", "SPRAY_SENDER_POOL_WEIGHT", 0.0, _probability
     ),
+    # Absent, the host-wide pool decays once per report it takes; with it,
+    # once per interval, depositing the mean of the grades taken in it. Read
+    # only with sender_pool_weight above 0.
+    BalancingParameter(
+        "pool_decay_interval_ns", "SPRAY_POOL_DECAY_INTERVAL_NS", 0, _nonnegative_int
+    ),
+    # With it, a spine the host-wide pool holds, by its grade or its loss
+    # hold, gets no share in any of the host's draws, and its sentinels are
+    # sent once per host per sentinel interval. Read only with
+    # sender_pool_weight above 0.
+    BalancingParameter(
+        "pool_hold_propagates", "SPRAY_POOL_HOLD_PROPAGATES", False, _flag
+    ),
 )
 # The parameters written, and recorded in the manifest, only when the profile
 # sets them; the simulator's defaults are the defaults above.
@@ -963,6 +1004,11 @@ WRITTEN_WHEN_SET_PARAMETERS = {
     "trim_thresholds",
     "loss_thresholds",
     "loss_interval_ns",
+    "loss_hold_clean_sentinels",
+    "held_exploration",
+    "held_sentinel_interval_ns",
+    "pool_decay_interval_ns",
+    "pool_hold_propagates",
 }
 # The parameters only one-way delay reads.
 ONE_WAY_DELAY_PARAMETERS = {
@@ -1113,6 +1159,36 @@ def _load_spray_policy(
         raise ValueError(
             "network.load_balancing.loss_interval_ns requires loss_thresholds"
         )
+    if "loss_hold_clean_sentinels" in balancing and "loss_thresholds" not in balancing:
+        raise ValueError(
+            "network.load_balancing.loss_hold_clean_sentinels requires loss_thresholds"
+        )
+    if balancing.get("held_exploration") == "none" and (
+        balancing.get("grade_cost_source") != "switch_queue"
+    ):
+        raise ValueError(
+            "network.load_balancing.held_exploration 'none' requires "
+            "grade_cost_source 'switch_queue'"
+        )
+    if (
+        "held_sentinel_interval_ns" in balancing
+        and balancing.get("held_exploration") != "sentinel"
+    ):
+        raise ValueError(
+            "network.load_balancing.held_sentinel_interval_ns requires "
+            "held_exploration 'sentinel'"
+        )
+    for key in ("pool_decay_interval_ns", "pool_hold_propagates"):
+        if key in balancing and not (
+            _probability(
+                balancing.get("sender_pool_weight", 0.0),
+                "network.load_balancing.sender_pool_weight",
+            )
+            > 0
+        ):
+            raise ValueError(
+                f"network.load_balancing.{key} requires sender_pool_weight above 0"
+            )
     if balancing.get("grade_cost_source") == "switch_queue" and balancing.get(
         "grade_scope", "per_receiver"
     ) != "per_receiver":

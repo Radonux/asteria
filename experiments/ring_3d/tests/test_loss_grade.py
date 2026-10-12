@@ -99,6 +99,47 @@ class LossGradeTest(unittest.TestCase):
         self.assertNotIn("loss_thresholds", manifest)
         self.assertNotIn("loss_interval_ns", manifest)
 
+    def test_writes_clean_sentinels_after_interval_when_set(self) -> None:
+        manifest, config = self.generated(
+            {
+                "mode": "spray_policy",
+                "loss_thresholds": [0.01, 0.05, 1],
+                "loss_interval_ns": 20000,
+                "loss_hold_clean_sentinels": 4,
+            }
+        )
+        self.assertIn(
+            "\nSPRAY_LOSS_INTERVAL_NS 20000\n"
+            "SPRAY_LOSS_HOLD_CLEAN_SENTINELS 4\n"
+            "SPRAY_ABSENCE_FRACTION_OF_MEDIAN ",
+            config,
+        )
+        self.assertEqual(manifest["loss_hold_clean_sentinels"], 4)
+
+    def test_writes_clean_sentinels_without_interval(self) -> None:
+        manifest, config = self.generated(
+            {
+                "mode": "spray_policy",
+                "loss_thresholds": [0.1, 0.2, 0.3],
+                "loss_hold_clean_sentinels": 0,
+            }
+        )
+        self.assertIn(
+            "SPRAY_LOSS_THRESHOLDS 0.1 0.2 0.3\n"
+            "SPRAY_LOSS_HOLD_CLEAN_SENTINELS 0\n"
+            "SPRAY_ABSENCE_FRACTION_OF_MEDIAN ",
+            config,
+        )
+        self.assertNotIn("SPRAY_LOSS_INTERVAL_NS", config)
+        self.assertEqual(manifest["loss_hold_clean_sentinels"], 0)
+
+    def test_clean_sentinels_unset_writes_nothing(self) -> None:
+        manifest, config = self.generated(
+            {"mode": "spray_policy", "loss_thresholds": [0.1, 0.2, 0.3]}
+        )
+        self.assertNotIn("SPRAY_LOSS_HOLD_CLEAN_SENTINELS", config)
+        self.assertNotIn("loss_hold_clean_sentinels", manifest)
+
     def test_refusals(self) -> None:
         policy = {"mode": "spray_policy"}
         thresholds = [0.1, 0.2, 0.3]
@@ -150,6 +191,43 @@ class LossGradeTest(unittest.TestCase):
             ({"mode": "spray_uniform", "loss_interval_ns": 0}, "takes no other key"),
             ({"mode": "ev_hash", "loss_thresholds": thresholds}, "'ops' does not take"),
             ({"mode": "ecmp", "loss_thresholds": thresholds}, "takes no other key"),
+            (
+                {**policy, "loss_hold_clean_sentinels": 2},
+                "loss_hold_clean_sentinels requires loss_thresholds",
+            ),
+            (
+                {
+                    **policy,
+                    "loss_thresholds": thresholds,
+                    "loss_hold_clean_sentinels": -1,
+                },
+                "loss_hold_clean_sentinels must be a nonnegative integer",
+            ),
+            (
+                {
+                    **policy,
+                    "loss_thresholds": thresholds,
+                    "loss_hold_clean_sentinels": 1.5,
+                },
+                "loss_hold_clean_sentinels must be a nonnegative integer",
+            ),
+            (
+                {
+                    **policy,
+                    "loss_thresholds": thresholds,
+                    "loss_hold_clean_sentinels": True,
+                },
+                "loss_hold_clean_sentinels must be a nonnegative integer",
+            ),
+            (
+                {"mode": "spray_uniform", "loss_hold_clean_sentinels": 0},
+                "takes no other key",
+            ),
+            (
+                {"mode": "ev_hash", "loss_hold_clean_sentinels": 0},
+                "'ops' does not take",
+            ),
+            ({"mode": "ecmp", "loss_hold_clean_sentinels": 0}, "takes no other key"),
         ]
         refusals += [
             (
@@ -165,6 +243,7 @@ class LossGradeTest(unittest.TestCase):
             for knob, value in (
                 ("loss_thresholds", thresholds),
                 ("loss_interval_ns", 0),
+                ("loss_hold_clean_sentinels", 0),
             )
         ]
         for balancing, message in refusals:
