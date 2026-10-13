@@ -117,6 +117,7 @@ class RepsSpineTest(unittest.TestCase):
             ("hold_rule", "llr"),
             ("hold_release", "trickle"),
             ("sentinel_mode", "duplicate"),
+            ("held_loss_rtts", 2),
             ("receiver_hold", True),
             ("receiver_hold_clean", 8),
             ("grade_cost_source", "switch_queue"),

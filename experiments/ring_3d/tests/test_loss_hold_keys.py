@@ -139,6 +139,27 @@ class LossHoldKeysTest(unittest.TestCase):
         self.assertIn("\nSPRAY_SENTINEL_MODE duplicate\n", config)
         self.assertEqual(manifest["load_balancing"]["sentinel_mode"], "duplicate")
 
+    def test_held_loss_rtts_is_written_only_when_set(self) -> None:
+        for selector in ("reps_hold", "reps_flow_hold", "mrc_hold"):
+            for rtts in (0, 3):
+                with self.subTest(selector=selector, rtts=rtts):
+                    manifest, config, _ = self.generated(
+                        {**HOLD, "selector": selector, "held_loss_rtts": rtts}
+                    )
+                    self.assertIn(f"\nSPRAY_HELD_LOSS_RTTS {rtts}\n", config)
+                    self.assertEqual(
+                        manifest["load_balancing"]["held_loss_rtts"], rtts
+                    )
+        manifest, config, _ = self.generated(
+            {**MRC_HOLD, "sentinel_mode": "duplicate", "held_loss_rtts": 1}
+        )
+        self.assertIn(
+            "\nSPRAY_SENTINEL_MODE duplicate\nSPRAY_HELD_LOSS_RTTS 1\n", config
+        )
+        manifest, config, _ = self.generated(HOLD)
+        self.assertNotIn("SPRAY_HELD_LOSS_RTTS", config)
+        self.assertNotIn("held_loss_rtts", manifest["load_balancing"])
+
     def test_receiver_hold_writes_its_trace(self) -> None:
         for selector in ("reps_hold", "reps_flow_hold", "mrc_hold"):
             with self.subTest(selector=selector):
@@ -210,6 +231,9 @@ class LossHoldKeysTest(unittest.TestCase):
             ({**HOLD, "hold_rule": "sprt"}, "hold_rule must be 'count' or 'llr'"),
             ({**HOLD, "hold_release": "drip"}, "hold_release must be 'sentinels'"),
             ({**HOLD, "sentinel_mode": "copy"}, "sentinel_mode must be 'data'"),
+            ({**HOLD, "held_loss_rtts": -1}, "held_loss_rtts must be a nonnegative integer"),
+            ({**HOLD, "held_loss_rtts": 1.5}, "held_loss_rtts must be a nonnegative integer"),
+            ({**HOLD, "held_loss_rtts": True}, "held_loss_rtts must be a nonnegative integer"),
             ({**HOLD, "hold_beta": 0.01}, "hold_beta requires hold_rule 'llr'"),
             (
                 {**HOLD, "hold_rule": "llr", "hold_trickle": 0.1},
@@ -267,6 +291,7 @@ class LossHoldKeysTest(unittest.TestCase):
             ("hold_rule", "llr"),
             ("hold_release", "trickle"),
             ("sentinel_mode", "duplicate"),
+            ("held_loss_rtts", 2),
             ("receiver_hold", True),
             ("receiver_hold_clean", 8),
             ("loss_p0", 0.0),

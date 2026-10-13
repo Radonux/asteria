@@ -1211,10 +1211,11 @@ SPRAY_UNIFORM_KEYS: tuple[BalancingParameter, ...] = (
 # hold_auto_leaves, read only under auto or with receiver_hold, is the
 # destination leaves (the sender leaves at the receiver) with a loss on a
 # spine from which the hold covers every one. hold_rule, the hold test's
-# probabilities, hold_release with hold_trickle, sentinel_mode, path_seq and
-# receiver_hold with receiver_hold_clean take the backend's defaults when
-# absent; the backend reads loss_p0, loss_p1 and hold_alpha only under
-# hold_rule llr or hold_release trickle, hold_beta only under llr.
+# probabilities, hold_release with hold_trickle, sentinel_mode,
+# held_loss_rtts, path_seq and receiver_hold with receiver_hold_clean take the
+# backend's defaults when absent; the backend reads loss_p0, loss_p1 and
+# hold_alpha only under hold_rule llr or hold_release trickle, hold_beta only
+# under llr.
 LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
     _policy_parameter("loss_thresholds"),
     BalancingParameter("loss_interval_ns", "SPRAY_LOSS_INTERVAL_NS", 0, _positive_int),
@@ -1246,6 +1247,9 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
         "hold_trickle", "SPRAY_HOLD_TRICKLE", 0.01, _number_in(0, 0.5, True, False)
     ),
     BalancingParameter("sentinel_mode", "SPRAY_SENTINEL_MODE", "data", _sentinel_mode),
+    BalancingParameter(
+        "held_loss_rtts", "SPRAY_HELD_LOSS_RTTS", 2, _nonnegative_int
+    ),
     PATH_SEQ_KEY,
     BalancingParameter("receiver_hold", "SPRAY_RECEIVER_HOLD", False, _flag, _on_off),
     BalancingParameter(
@@ -1296,6 +1300,7 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "hold_release",
     "hold_trickle",
     "sentinel_mode",
+    "held_loss_rtts",
     "path_seq",
     "receiver_hold",
     "receiver_hold_clean",
