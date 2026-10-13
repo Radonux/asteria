@@ -66,6 +66,7 @@ class RepsSpineSelectorTest(unittest.TestCase):
         self.assertIn(HOLD_SETTINGS.format(selector="reps_hold"), config)
         self.assertNotIn("SPRAY_HELD_SENTINEL_INTERVAL_NS", config)
         self.assertNotIn("SPRAY_HOLD_SCOPE", config)
+        self.assertNotIn("SPRAY_HOLD_AUTO_LEAVES", config)
         self.assertEqual(
             manifest["load_balancing"],
             {
@@ -118,6 +119,26 @@ class RepsSpineSelectorTest(unittest.TestCase):
         self.assertEqual(manifest["load_balancing"]["hold_scope"], "leaf")
         self.assertIn("SPINE_LOSS_OUTPUT_FILE", manifest["counter_files"])
 
+    def test_reps_hold_auto_scope_is_written_when_set(self) -> None:
+        manifest, config, _ = self.generated(
+            {**HOLD, "hold_scope": "auto", "hold_auto_leaves": 3}
+        )
+        self.assertIn("\nSPRAY_HOLD_SCOPE auto\nSPRAY_HOLD_AUTO_LEAVES 3\n", config)
+        balancing = manifest["load_balancing"]
+        self.assertEqual(balancing["hold_scope"], "auto")
+        self.assertEqual(balancing["hold_auto_leaves"], 3)
+        self.assertIn("SPINE_LOSS_OUTPUT_FILE", manifest["counter_files"])
+
+    def test_reps_hold_auto_leaves_under_the_default_scope(self) -> None:
+        manifest, config, _ = self.generated({**HOLD, "hold_auto_leaves": 2})
+        self.assertNotIn("SPRAY_HOLD_SCOPE", config)
+        self.assertIn(
+            "\nSPRAY_HELD_EXPLORATION sentinel\nSPRAY_HOLD_AUTO_LEAVES 2\n", config
+        )
+        balancing = manifest["load_balancing"]
+        self.assertNotIn("hold_scope", balancing)
+        self.assertEqual(balancing["hold_auto_leaves"], 2)
+
     def test_reps_flow_hold_writes_no_trace(self) -> None:
         manifest, config, _ = self.generated(
             {**FLOW_HOLD, "held_sentinel_interval_ns": 0, "buffer_size": 2}
@@ -132,6 +153,7 @@ class RepsSpineSelectorTest(unittest.TestCase):
         self.assertNotIn("SPINE_LOSS_OUTPUT_FILE", manifest["counter_files"])
         self.assertEqual(manifest["load_balancing"]["selector"], "reps_flow_hold")
         self.assertNotIn("hold_scope", manifest["load_balancing"])
+        self.assertNotIn("SPRAY_HOLD_AUTO_LEAVES", config)
 
     def test_reps_oracle_writes_the_cost_source(self) -> None:
         manifest, config, _ = self.generated(
@@ -218,9 +240,31 @@ class RepsSpineSelectorTest(unittest.TestCase):
             ):
                 refusals.append(({**hold, key: value}, f"'{selector}' does not take"))
         refusals += [
-            ({**HOLD, "hold_scope": "rack"}, "hold_scope must be 'host' or 'leaf'"),
+            (
+                {**HOLD, "hold_scope": "rack"},
+                "hold_scope must be 'host', 'leaf' or 'auto'",
+            ),
             ({**FLOW_HOLD, "hold_scope": "host"}, "'reps_flow_hold' does not take"),
             ({**FLOW_HOLD, "hold_scope": "leaf"}, "'reps_flow_hold' does not take"),
+            ({**FLOW_HOLD, "hold_scope": "auto"}, "'reps_flow_hold' does not take"),
+            (
+                {**FLOW_HOLD, "hold_auto_leaves": 2},
+                "'reps_flow_hold' does not take",
+            ),
+            *(
+                (
+                    {**HOLD, "hold_scope": scope, "hold_auto_leaves": 2},
+                    "hold_auto_leaves requires hold_scope 'auto'",
+                )
+                for scope in ("host", "leaf")
+            ),
+            *(
+                (
+                    {**HOLD, "hold_auto_leaves": leaves},
+                    "hold_auto_leaves must be an integer of at least 2",
+                )
+                for leaves in (1, 0, -2, True, 2.0, "2")
+            ),
             (
                 {k: v for k, v in ORACLE.items() if k != "grade_cost_source"},
                 "'reps_oracle' requires grade_cost_source 'switch_queue'",
@@ -242,6 +286,7 @@ class RepsSpineSelectorTest(unittest.TestCase):
             ("held_exploration", "sentinel"),
             ("held_sentinel_interval_ns", 0),
             ("hold_scope", "leaf"),
+            ("hold_auto_leaves", 2),
             ("congestion_grade_floor", 1),
         ):
             refusals.append(({**ORACLE, key: value}, "'reps_oracle' does not take"))
@@ -253,7 +298,7 @@ class RepsSpineSelectorTest(unittest.TestCase):
                 ({**balancing, "mode": "ecmp"}, "takes no other key"),
             ]
         # And no other selector reads the keys they add.
-        for key, value in (("hold_scope", "leaf"),):
+        for key, value in (("hold_scope", "leaf"), ("hold_auto_leaves", 2)):
             refusals += [
                 ({"mode": "spray_policy", key: value}, "does not take"),
                 ({"mode": "spray_uniform", key: value}, "takes no other key"),

@@ -67,8 +67,9 @@ PATH_SELECTORS = ("ops", "reps", "ue_oblivious", "ue_aware", "mrc")
 # What chooses each data packet's spine under spray_uniform instead of the
 # uniform draw.
 SPINE_SELECTORS = ("ack_redirect", "reps_hold", "reps_flow_hold", "reps_oracle")
-# The spine selectors that keep a loss hold: per host, or per destination leaf
-# under hold_scope leaf, for reps_hold; per queue pair for reps_flow_hold.
+# The spine selectors that keep a loss hold: per host, per destination leaf,
+# or per spine either of the two under hold_scope, for reps_hold; per queue
+# pair for reps_flow_hold.
 LOSS_HOLD_SELECTORS = ("reps_hold", "reps_flow_hold")
 # The value an acknowledgement's redirect field names no spine with, so
 # ack_redirect names at most this many spines.
@@ -238,8 +239,9 @@ class LoadBalancing:
         host-wide pool counts over them, so spray_policy with loss_thresholds
         and sender_pool_weight above 0, and only outside the switch_queue
         cost source, under which the sender counts no loss; and reps_hold's
-        loss hold, kept per host or per destination leaf. reps_flow_hold's
-        holds are per queue pair, and the backend refuses the trace there."""
+        loss hold, kept per host, per destination leaf or per spine either.
+        reps_flow_hold's holds are per queue pair, and the backend refuses
+        the trace there."""
         values = dict(self.parameters)
         if self.mode == "spray_uniform":
             return self.selector == "reps_hold"
@@ -822,8 +824,14 @@ def _held_exploration(value: Any, field: str) -> str:
 
 
 def _hold_scope(value: Any, field: str) -> str:
-    if value not in ("host", "leaf"):
-        raise ValueError(f"{field} must be 'host' or 'leaf'")
+    if value not in ("host", "leaf", "auto"):
+        raise ValueError(f"{field} must be 'host', 'leaf' or 'auto'")
+    return value
+
+
+def _hold_auto_leaves(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 2:
+        raise ValueError(f"{field} must be an integer of at least 2")
     return value
 
 
@@ -1080,8 +1088,10 @@ def _policy_parameter(name: str) -> BalancingParameter:
 # reps_hold and reps_flow_hold: REPS's parameters, defaults filled in, then
 # the loss hold's, which the backend requires, the loss interval and the
 # clean sentinels above 0; then those written only when set. hold_scope,
-# reps_hold's alone, keys the hold by host or by destination leaf, the
-# backend's default.
+# reps_hold's alone, keys the hold by host, by destination leaf, or per spine
+# by either, auto, the backend's default; hold_auto_leaves, read only under
+# auto, is the destination leaves with a loss on a spine from which auto
+# holds it for every destination.
 LOSS_HOLD_PARAMETERS: tuple[BalancingParameter, ...] = (
     *SELECTOR_PARAMETERS["reps"],
     _policy_parameter("loss_thresholds"),
@@ -1094,15 +1104,24 @@ LOSS_HOLD_PARAMETERS: tuple[BalancingParameter, ...] = (
     ),
     _policy_parameter("held_exploration"),
     _policy_parameter("held_sentinel_interval_ns"),
-    BalancingParameter("hold_scope", "SPRAY_HOLD_SCOPE", "leaf", _hold_scope),
+    BalancingParameter("hold_scope", "SPRAY_HOLD_SCOPE", "auto", _hold_scope),
+    BalancingParameter(
+        "hold_auto_leaves", "SPRAY_HOLD_AUTO_LEAVES", 2, _hold_auto_leaves
+    ),
 )
+# The parameters reps_hold alone takes.
+REPS_HOLD_PARAMETERS = {"hold_scope", "hold_auto_leaves"}
 LOSS_HOLD_REQUIRED_PARAMETERS = (
     "loss_thresholds",
     "loss_interval_ns",
     "loss_hold_clean_sentinels",
     "held_exploration",
 )
-LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {"held_sentinel_interval_ns", "hold_scope"}
+LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
+    "held_sentinel_interval_ns",
+    "hold_scope",
+    "hold_auto_leaves",
+}
 # reps_oracle: REPS's parameters, defaults filled in, and the cost source the
 # backend requires, switch_queue, which builds the switches' state it reads.
 REPS_ORACLE_PARAMETERS: tuple[BalancingParameter, ...] = (
@@ -1224,7 +1243,7 @@ def _load_loss_hold_selector(
     parameters = tuple(
         parameter
         for parameter in LOSS_HOLD_PARAMETERS
-        if selector == "reps_hold" or parameter.name != "hold_scope"
+        if selector == "reps_hold" or parameter.name not in REPS_HOLD_PARAMETERS
     )
     unknown = set(balancing) - {"mode", "selector"} - {p.name for p in parameters}
     if unknown:
@@ -1253,6 +1272,12 @@ def _load_loss_hold_selector(
         raise ValueError(
             f"network.load_balancing.selector '{selector}' requires "
             "held_exploration 'sentinel'"
+        )
+    # As the backend reads it, only under auto, given or by default.
+    scope = dict(parsed).get("hold_scope", "auto")
+    if "hold_auto_leaves" in balancing and scope != "auto":
+        raise ValueError(
+            "network.load_balancing.hold_auto_leaves requires hold_scope 'auto'"
         )
     _require_reorder_tolerance("spray_uniform", recovery, trimming)
     return LoadBalancing(mode="spray_uniform", selector=selector, parameters=parsed)
