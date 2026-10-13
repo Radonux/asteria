@@ -19,6 +19,7 @@ KEYS = (
     "PORT_COUNTER_OUTPUT_FILE",
     "SPINE_ARRIVAL_OUTPUT_FILE",
     "SPINE_REPORT_OUTPUT_FILE",
+    "RTO_EVENT_OUTPUT_FILE",
 )
 
 
@@ -27,16 +28,18 @@ class FabricCounterTests(unittest.TestCase):
         document = json.loads(
             (PROFILES / "no_incast_8_zero.json").read_text(encoding="utf-8")
         )
+        # The retransmission timeout trace is written under every mode.
         written = {
-            "ecmp": (),
-            "ev_hash": ("PORT_COUNTER_OUTPUT_FILE",),
-            "spray_uniform": KEYS[:2],
+            "ecmp": ("RTO_EVENT_OUTPUT_FILE",),
+            "ev_hash": ("PORT_COUNTER_OUTPUT_FILE", "RTO_EVENT_OUTPUT_FILE"),
+            "spray_uniform": (*KEYS[:2], "RTO_EVENT_OUTPUT_FILE"),
             "spray_policy": KEYS,
         }
         files = {
             "PORT_COUNTER_OUTPUT_FILE": "port_counters.csv",
             "SPINE_ARRIVAL_OUTPUT_FILE": "spine_arrivals.csv",
             "SPINE_REPORT_OUTPUT_FILE": "spine_reports.csv",
+            "RTO_EVENT_OUTPUT_FILE": "rto_events.csv",
         }
         for mode, keys in written.items():
             document["network"]["load_balancing"] = {"mode": mode}

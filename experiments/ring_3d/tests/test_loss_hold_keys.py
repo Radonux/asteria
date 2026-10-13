@@ -173,6 +173,14 @@ class LossHoldKeysTest(unittest.TestCase):
         self.assertIn("\nSPRAY_PATH_SEQ off\nSPRAY_RECEIVER_HOLD off\n", config)
         self.assertNotIn("RECEIVER_HOLD_OUTPUT_FILE", config)
 
+    def test_every_run_writes_the_rto_trace(self) -> None:
+        for balancing in ({"mode": "ecmp"}, {"mode": "spray_uniform"}, HOLD, MRC_HOLD):
+            with self.subTest(balancing=balancing):
+                manifest, config, ns3 = self.generated(balancing)
+                trace = str(ns3 / "rto_events.csv")
+                self.assertIn(f"\nRTO_EVENT_OUTPUT_FILE {trace}\n", config)
+                self.assertEqual(manifest["counter_files"]["RTO_EVENT_OUTPUT_FILE"], trace)
+
     def test_receiver_hold_names_at_most_8_spines(self) -> None:
         for spines, refused in ((8, False), (9, True)):
             self.write(RECEIVER, spines=spines)

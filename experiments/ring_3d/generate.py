@@ -2001,9 +2001,10 @@ def write_network_config(
             f"PACKET_TRIM_LASTHOP {int(packet_trimming.last_hop_codepoint)}\n"
         )
     # Absent means ECMP to the simulator, so an ECMP profile keeps the exact
-    # configuration it had before the knob existed. Under per-packet paths the
-    # run also writes what every switch port sent and, where the identification
-    # names a spine, what every host received over each.
+    # configuration it had before the knob existed, but for the
+    # retransmission timeout trace every run writes. Under per-packet paths
+    # the run also writes what every switch port sent and, where the
+    # identification names a spine, what every host received over each.
     load_balancing_settings = (
         ""
         if load_balancing.mode == "ecmp"
@@ -2057,6 +2058,8 @@ def counter_files(load_balancing: LoadBalancing, output_dir: Path) -> dict[str, 
         files["SPINE_LOSS_OUTPUT_FILE"] = output_dir / "spine_losses.csv"
     if load_balancing.traces_receiver_hold():
         files["RECEIVER_HOLD_OUTPUT_FILE"] = output_dir / "receiver_holds.csv"
+    # The backend writes a row per retransmission timeout under every mode.
+    files["RTO_EVENT_OUTPUT_FILE"] = output_dir / "rto_events.csv"
     return files
 
 
