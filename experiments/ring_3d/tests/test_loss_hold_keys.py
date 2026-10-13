@@ -267,7 +267,6 @@ class LossHoldKeysTest(unittest.TestCase):
             ("hold_rule", "llr"),
             ("hold_release", "trickle"),
             ("sentinel_mode", "duplicate"),
-            ("path_seq", True),
             ("receiver_hold", True),
             ("receiver_hold_clean", 8),
             ("loss_p0", 0.0),
@@ -282,6 +281,11 @@ class LossHoldKeysTest(unittest.TestCase):
                     "does not take",
                 ),
             ]
+        # path_seq is read under spray_uniform only.
+        refusals += [
+            ({"mode": "spray_policy", "path_seq": True}, "does not take"),
+            ({"mode": "ev_hash", "selector": "mrc", "path_seq": True}, "does not take"),
+        ]
         for balancing, message in refusals:
             self.write(balancing)
             with self.subTest(balancing=balancing):
