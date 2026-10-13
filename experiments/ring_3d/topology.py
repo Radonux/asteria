@@ -66,11 +66,22 @@ MAX_REPORTED_SPINES = 32
 PATH_SELECTORS = ("ops", "reps", "ue_oblivious", "ue_aware", "mrc")
 # What chooses each data packet's spine under spray_uniform instead of the
 # uniform draw.
-SPINE_SELECTORS = ("ack_redirect", "reps_hold", "reps_flow_hold", "reps_oracle")
+SPINE_SELECTORS = (
+    "ack_redirect",
+    "reps_hold",
+    "reps_flow_hold",
+    "reps_oracle",
+    "mrc_hold",
+)
 # The spine selectors that keep a loss hold: per host, per destination leaf,
-# or per spine either of the two under hold_scope, for reps_hold; per queue
-# pair for reps_flow_hold.
-LOSS_HOLD_SELECTORS = ("reps_hold", "reps_flow_hold")
+# or per spine either of the two under hold_scope, for reps_hold and
+# mrc_hold; per queue pair for reps_flow_hold.
+LOSS_HOLD_SELECTORS = ("reps_hold", "reps_flow_hold", "mrc_hold")
+# The loss hold selectors that read hold_scope and write the host's loss
+# trace.
+HOLD_SCOPE_SELECTORS = ("reps_hold", "mrc_hold")
+# The most spines a receiver's hold names in an acknowledgement's bitmap.
+MAX_RECEIVER_HOLD_SPINES = 8
 # The value an acknowledgement's redirect field names no spine with, so
 # ack_redirect names at most this many spines.
 MAX_REDIRECT_SPINES = 255
@@ -217,7 +228,8 @@ class LoadBalancing:
     ``selector`` ``ack_redirect`` the sender names instead the spine the latest
     acknowledgement redirects it to, else the spine that carried the packet it
     answers; with ``reps_hold`` or ``reps_flow_hold`` it chooses by REPS over
-    the spines, leaving out those its loss hold holds, and with
+    the spines, leaving out those its loss hold holds, with ``mrc_hold`` by
+    MRC over the spines with the same loss hold, and with
     ``reps_oracle`` by REPS over the spines, leaving out those the switches'
     state shows a fault on. ``spray_policy`` names a spine per packet the same
     way, drawn from scores the sender builds out of the grades the receiver
@@ -238,18 +250,27 @@ class LoadBalancing:
         """Whether the run traces each host's pooled loss intervals: only the
         host-wide pool counts over them, so spray_policy with loss_thresholds
         and sender_pool_weight above 0, and only outside the switch_queue
-        cost source, under which the sender counts no loss; and reps_hold's
-        loss hold, kept per host, per destination leaf or per spine either.
-        reps_flow_hold's holds are per queue pair, and the backend refuses
-        the trace there."""
+        cost source, under which the sender counts no loss; and the loss
+        hold of reps_hold and mrc_hold, kept per host, per destination leaf
+        or per spine either. reps_flow_hold's holds are per queue pair, and
+        the backend refuses the trace there."""
         values = dict(self.parameters)
         if self.mode == "spray_uniform":
-            return self.selector == "reps_hold"
+            return self.selector in HOLD_SCOPE_SELECTORS
         return (
             self.mode == "spray_policy"
             and "loss_thresholds" in values
             and float(values.get("sender_pool_weight", 0.0)) > 0
             and values.get("grade_cost_source") != "switch_queue"
+        )
+
+    def traces_receiver_hold(self) -> bool:
+        """Whether the run traces the receiving hosts' holds: under a loss
+        hold selector with receiver_hold, the only configuration in which
+        the backend reads the trace."""
+        return (
+            self.selector in LOSS_HOLD_SELECTORS
+            and dict(self.parameters).get("receiver_hold") is True
         )
 
     def manifest(self) -> dict[str, ParameterValue]:
@@ -267,7 +288,8 @@ class LoadBalancing:
         )
         values = dict(self.parameters)
         return selector + "".join(
-            f"{parameter.key} {_setting(values[parameter.name])}\n"
+            f"{parameter.key} "
+            f"{(parameter.write or _setting)(values[parameter.name])}\n"
             for parameter in _parameters_of(self.mode, self.selector)
             if parameter.name in values
         )
@@ -657,12 +679,14 @@ ParameterValue = int | float | bool | str | tuple[float, ...]
 class BalancingParameter:
     """One parameter of a load-balancing mode or a path selector: its profile
     key, its simulator key, the default its source gives, and the parser that
-    validates a value."""
+    validates a value; and, where the simulator reads it otherwise than
+    _setting writes it, how it is written."""
 
     name: str
     key: str
     default: ParameterValue
     parse: Callable[[Any, str], ParameterValue]
+    write: Callable[[ParameterValue], str] | None = None
 
 
 def _setting(value: ParameterValue) -> str:
@@ -827,6 +851,52 @@ def _hold_scope(value: Any, field: str) -> str:
     if value not in ("host", "leaf", "auto"):
         raise ValueError(f"{field} must be 'host', 'leaf' or 'auto'")
     return value
+
+
+def _hold_rule(value: Any, field: str) -> str:
+    if value not in ("count", "llr"):
+        raise ValueError(f"{field} must be 'count' or 'llr'")
+    return value
+
+
+def _hold_release(value: Any, field: str) -> str:
+    if value not in ("sentinels", "trickle"):
+        raise ValueError(f"{field} must be 'sentinels' or 'trickle'")
+    return value
+
+
+def _sentinel_mode(value: Any, field: str) -> str:
+    if value not in ("data", "duplicate"):
+        raise ValueError(f"{field} must be 'data' or 'duplicate'")
+    return value
+
+
+def _number_in(
+    low: float, high: float, low_open: bool, high_open: bool
+) -> Callable[[Any, str], float]:
+    """A number within low and high, each end open or closed."""
+    interval = f"{'(' if low_open else '['}{low:g}, {high:g}{')' if high_open else ']'}"
+
+    def parse(value: Any, field: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{field} must be a number in {interval}")
+        number = float(value)
+        if (
+            not isfinite(number)
+            or number < low
+            or number > high
+            or (low_open and number == low)
+            or (high_open and number == high)
+        ):
+            raise ValueError(f"{field} must be a number in {interval}")
+        return number
+
+    return parse
+
+
+def _on_off(value: ParameterValue) -> str:
+    """A switch as the backend's on and off keys read it."""
+    return "on" if value else "off"
 
 
 def _hold_auto_leaves(value: Any, field: str) -> int:
@@ -1085,15 +1155,20 @@ def _policy_parameter(name: str) -> BalancingParameter:
     return next(p for p in POLICY_PARAMETERS if p.name == name)
 
 
-# reps_hold and reps_flow_hold: REPS's parameters, defaults filled in, then
-# the loss hold's, which the backend requires, the loss interval and the
-# clean sentinels above 0; then those written only when set. hold_scope,
-# reps_hold's alone, keys the hold by host, by destination leaf, or per spine
-# by either, auto, the backend's default; hold_auto_leaves, read only under
-# auto, is the destination leaves with a loss on a spine from which auto
-# holds it for every destination.
-LOSS_HOLD_PARAMETERS: tuple[BalancingParameter, ...] = (
-    *SELECTOR_PARAMETERS["reps"],
+# The loss hold of reps_hold, reps_flow_hold and mrc_hold, after the
+# selector's own parameters: the loss thresholds, the loss interval and the
+# held exploration the backend requires, and the clean sentinels it requires
+# under hold_release sentinels; then the keys written only when set.
+# hold_scope, read by reps_hold and mrc_hold, keys the hold by host, by
+# destination leaf, or per spine by either, auto, the backend's default;
+# hold_auto_leaves, read only under auto or with receiver_hold, is the
+# destination leaves (the sender leaves at the receiver) with a loss on a
+# spine from which the hold covers every one. hold_rule, the hold test's
+# probabilities, hold_release with hold_trickle, sentinel_mode, path_seq and
+# receiver_hold with receiver_hold_clean take the backend's defaults when
+# absent; the backend reads loss_p0, loss_p1 and hold_alpha only under
+# hold_rule llr or hold_release trickle, hold_beta only under llr.
+LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
     _policy_parameter("loss_thresholds"),
     BalancingParameter("loss_interval_ns", "SPRAY_LOSS_INTERVAL_NS", 0, _positive_int),
     BalancingParameter(
@@ -1108,19 +1183,69 @@ LOSS_HOLD_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "hold_auto_leaves", "SPRAY_HOLD_AUTO_LEAVES", 2, _hold_auto_leaves
     ),
+    BalancingParameter("hold_rule", "SPRAY_HOLD_RULE", "count", _hold_rule),
+    BalancingParameter("loss_p0", "SPRAY_LOSS_P0", 0.0, _number_in(0, 1, False, True)),
+    BalancingParameter("loss_p1", "SPRAY_LOSS_P1", 0.001, _number_in(0, 1, True, True)),
+    BalancingParameter(
+        "hold_alpha", "SPRAY_HOLD_ALPHA", 0.001, _number_in(0, 0.5, True, True)
+    ),
+    BalancingParameter(
+        "hold_beta", "SPRAY_HOLD_BETA", 0.001, _number_in(0, 0.5, True, True)
+    ),
+    BalancingParameter(
+        "hold_release", "SPRAY_HOLD_RELEASE", "sentinels", _hold_release
+    ),
+    BalancingParameter(
+        "hold_trickle", "SPRAY_HOLD_TRICKLE", 0.01, _number_in(0, 0.5, True, False)
+    ),
+    BalancingParameter("sentinel_mode", "SPRAY_SENTINEL_MODE", "data", _sentinel_mode),
+    BalancingParameter("path_seq", "SPRAY_PATH_SEQ", False, _flag, _on_off),
+    BalancingParameter("receiver_hold", "SPRAY_RECEIVER_HOLD", False, _flag, _on_off),
+    BalancingParameter(
+        "receiver_hold_clean", "SPRAY_RECEIVER_HOLD_CLEAN", 1024, _positive_int
+    ),
 )
-# The parameters reps_hold alone takes.
-REPS_HOLD_PARAMETERS = {"hold_scope", "hold_auto_leaves"}
+# Each loss hold selector's parameters: REPS's, or MRC's but its set, which
+# is the spines, defaults filled in; then the loss hold's.
+LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
+    "reps_hold": (*SELECTOR_PARAMETERS["reps"], *LOSS_HOLD_KEYS),
+    "reps_flow_hold": (*SELECTOR_PARAMETERS["reps"], *LOSS_HOLD_KEYS),
+    "mrc_hold": (
+        *(
+            parameter
+            for parameter in SELECTOR_PARAMETERS["mrc"]
+            if parameter.name != "ev_set_size"
+        ),
+        *LOSS_HOLD_KEYS,
+    ),
+}
 LOSS_HOLD_REQUIRED_PARAMETERS = (
     "loss_thresholds",
     "loss_interval_ns",
-    "loss_hold_clean_sentinels",
     "held_exploration",
 )
+# Under hold_release trickle the trickle sends release a hold, and the
+# backend refuses the sentinels' keys.
+SENTINEL_RELEASE_PARAMETERS = (
+    "loss_hold_clean_sentinels",
+    "held_sentinel_interval_ns",
+)
 LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
+    "loss_hold_clean_sentinels",
     "held_sentinel_interval_ns",
     "hold_scope",
     "hold_auto_leaves",
+    "hold_rule",
+    "loss_p0",
+    "loss_p1",
+    "hold_alpha",
+    "hold_beta",
+    "hold_release",
+    "hold_trickle",
+    "sentinel_mode",
+    "path_seq",
+    "receiver_hold",
+    "receiver_hold_clean",
 }
 # reps_oracle: REPS's parameters, defaults filled in, and the cost source the
 # backend requires, switch_queue, which builds the switches' state it reads.
@@ -1138,7 +1263,7 @@ def _parameters_of(mode: str, selector: str) -> tuple[BalancingParameter, ...]:
     if selector == "ack_redirect":
         return ACK_REDIRECT_PARAMETERS + GRADER_PARAMETERS
     if selector in LOSS_HOLD_SELECTORS:
-        return LOSS_HOLD_PARAMETERS
+        return LOSS_HOLD_PARAMETERS[selector]
     if selector == "reps_oracle":
         return REPS_ORACLE_PARAMETERS
     return ()
@@ -1237,13 +1362,25 @@ def _load_loss_hold_selector(
     recovery: TransportRecovery | None,
     trimming: PacketTrimming | None,
 ) -> LoadBalancing:
-    """spray_uniform with reps_hold or reps_flow_hold, which require the loss
-    hold's keys and held_exploration sentinel, as the backend does."""
+    """spray_uniform with reps_hold, reps_flow_hold or mrc_hold, which
+    require the loss hold's keys and held_exploration sentinel, and read the
+    keys of its rule, its release, its exploration sends and the receiver's
+    hold where the backend reads them."""
     selector = balancing["selector"]
+    scoped = selector in HOLD_SCOPE_SELECTORS
+    # Without hold_scope, hold_auto_leaves is read only by the receiver's
+    # hold.
     parameters = tuple(
         parameter
-        for parameter in LOSS_HOLD_PARAMETERS
-        if selector == "reps_hold" or parameter.name not in REPS_HOLD_PARAMETERS
+        for parameter in LOSS_HOLD_PARAMETERS[selector]
+        if scoped
+        or (
+            parameter.name != "hold_scope"
+            and (
+                parameter.name != "hold_auto_leaves"
+                or balancing.get("receiver_hold") is True
+            )
+        )
     )
     unknown = set(balancing) - {"mode", "selector"} - {p.name for p in parameters}
     if unknown:
@@ -1251,12 +1388,33 @@ def _load_loss_hold_selector(
             f"network.load_balancing.selector '{selector}' does not take "
             f"{sorted(unknown)}"
         )
-    if any(name not in balancing for name in LOSS_HOLD_REQUIRED_PARAMETERS):
+    trickle = (
+        _hold_release(
+            balancing.get("hold_release", "sentinels"),
+            "network.load_balancing.hold_release",
+        )
+        == "trickle"
+    )
+    required = LOSS_HOLD_REQUIRED_PARAMETERS + (
+        () if trickle else ("loss_hold_clean_sentinels",)
+    )
+    if any(name not in balancing for name in required):
         raise ValueError(
             f"network.load_balancing.selector '{selector}' requires "
-            "loss_thresholds, loss_interval_ns, loss_hold_clean_sentinels and "
-            "held_exploration 'sentinel'"
+            + (
+                "loss_thresholds, loss_interval_ns and held_exploration "
+                "'sentinel' under hold_release 'trickle'"
+                if trickle
+                else "loss_thresholds, loss_interval_ns, "
+                "loss_hold_clean_sentinels and held_exploration 'sentinel'"
+            )
         )
+    for name in SENTINEL_RELEASE_PARAMETERS:
+        if trickle and name in balancing:
+            raise ValueError(
+                f"network.load_balancing.{name} is read only under "
+                "hold_release 'sentinels'"
+            )
     parsed = _parsed(
         balancing,
         tuple(
@@ -1266,21 +1424,63 @@ def _load_loss_hold_selector(
             or parameter.name in balancing
         ),
     )
-    # A held spine is left out of every choice, so only its sentinels' clean
+    values = dict(parsed)
+    # A held spine is left out of every choice, so only its exploration
     # sends can end the hold.
-    if dict(parsed)["held_exploration"] != "sentinel":
+    if values["held_exploration"] != "sentinel":
         raise ValueError(
             f"network.load_balancing.selector '{selector}' requires "
             "held_exploration 'sentinel'"
         )
-    # As the backend reads it, only under auto, given or by default.
-    scope = dict(parsed).get("hold_scope", "auto")
-    if "hold_auto_leaves" in balancing and scope != "auto":
+    _require_hold_test(balancing, values, trickle)
+    receiver_hold = values.get("receiver_hold") is True
+    if receiver_hold and values.get("path_seq") is not True:
+        raise ValueError("network.load_balancing.receiver_hold requires path_seq true")
+    if "receiver_hold_clean" in balancing and not receiver_hold:
         raise ValueError(
-            "network.load_balancing.hold_auto_leaves requires hold_scope 'auto'"
+            "network.load_balancing.receiver_hold_clean requires receiver_hold true"
+        )
+    # As the backend reads it: under auto, given or by default, or by the
+    # receiver's hold.
+    if (
+        "hold_auto_leaves" in balancing
+        and values.get("hold_scope", "auto") != "auto"
+        and not receiver_hold
+    ):
+        raise ValueError(
+            "network.load_balancing.hold_auto_leaves requires hold_scope 'auto' "
+            "or receiver_hold true"
         )
     _require_reorder_tolerance("spray_uniform", recovery, trimming)
     return LoadBalancing(mode="spray_uniform", selector=selector, parameters=parsed)
+
+
+def _require_hold_test(
+    balancing: dict[str, Any], values: dict[str, ParameterValue], trickle: bool
+) -> None:
+    """The hold test's keys only where the backend reads them: hold_beta under
+    hold_rule llr; loss_p0, loss_p1 and hold_alpha under llr or hold_release
+    trickle, with loss_p0 below loss_p1; hold_trickle under trickle."""
+    llr = values.get("hold_rule", "count") == "llr"
+    if "hold_beta" in balancing and not llr:
+        raise ValueError("network.load_balancing.hold_beta requires hold_rule 'llr'")
+    for name in ("loss_p0", "loss_p1", "hold_alpha"):
+        if name in balancing and not (llr or trickle):
+            raise ValueError(
+                f"network.load_balancing.{name} requires hold_rule 'llr' or "
+                "hold_release 'trickle'"
+            )
+    if "hold_trickle" in balancing and not trickle:
+        raise ValueError(
+            "network.load_balancing.hold_trickle requires hold_release 'trickle'"
+        )
+    if (llr or trickle) and not float(values.get("loss_p0", 0.0)) < float(
+        values.get("loss_p1", 0.001)
+    ):
+        raise ValueError(
+            "network.load_balancing.loss_p0 must be below "
+            "network.load_balancing.loss_p1"
+        )
 
 
 def _load_reps_oracle(
@@ -1963,6 +2163,14 @@ def _require_reported_spines(network: ClosNetwork) -> None:
         raise ValueError(
             f"network.load_balancing.selector '{network.load_balancing.selector}' "
             f"holds at most {MAX_REPORTED_SPINES} spines"
+        )
+    if (
+        network.load_balancing.traces_receiver_hold()
+        and network.live_spine_count > MAX_RECEIVER_HOLD_SPINES
+    ):
+        raise ValueError(
+            "network.load_balancing.receiver_hold holds at most "
+            f"{MAX_RECEIVER_HOLD_SPINES} spines"
         )
     if (
         network.load_balancing.selector == "ack_redirect"
