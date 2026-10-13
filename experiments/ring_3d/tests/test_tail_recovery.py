@@ -30,6 +30,7 @@ ORACLE = {
     "grade_cost_source": "switch_queue",
 }
 REDIRECT = {"mode": "spray_uniform", "selector": "ack_redirect"}
+REPS_SPINE = {"mode": "spray_uniform", "selector": "reps_spine"}
 TAIL = {"path_seq": True, "tail_recovery": True}
 
 
@@ -56,7 +57,7 @@ class TailRecoveryTest(unittest.TestCase):
         return manifest, config
 
     def test_path_seq_under_every_spray_uniform_selector(self) -> None:
-        for balancing in (UNIFORM, HOLD, ORACLE, REDIRECT):
+        for balancing in (UNIFORM, HOLD, ORACLE, REDIRECT, REPS_SPINE):
             with self.subTest(balancing=balancing):
                 manifest, config = self.generated({**balancing, "path_seq": True})
                 self.assertIn("\nSPRAY_PATH_SEQ on\n", config)

@@ -72,6 +72,7 @@ SPINE_SELECTORS = (
     "reps_flow_hold",
     "reps_oracle",
     "mrc_hold",
+    "reps_spine",
 )
 # The spine selectors that keep a loss hold: per host, per destination leaf,
 # or per spine either of the two under hold_scope, for reps_hold and
@@ -237,7 +238,8 @@ class LoadBalancing:
     the spines, leaving out those its loss hold holds, with ``mrc_hold`` by
     MRC over the spines with the same loss hold, and with
     ``reps_oracle`` by REPS over the spines, leaving out those the switches'
-    state shows a fault on. ``spray_policy`` names a spine per packet the same
+    state shows a fault on, and with ``reps_spine`` by REPS over the spines,
+    leaving out none. ``spray_policy`` names a spine per packet the same
     way, drawn from scores the sender builds out of the grades the receiver
     reports in every acknowledgement. Every mode but ``ecmp`` reorders a
     flow's packets on the way.
@@ -1308,6 +1310,11 @@ REPS_ORACLE_PARAMETERS: tuple[BalancingParameter, ...] = (
 )
 
 
+# reps_spine: REPS's parameters, defaults filled in; no loss hold, no
+# sentinel, and none of the loss hold's keys.
+REPS_SPINE_PARAMETERS: tuple[BalancingParameter, ...] = SELECTOR_PARAMETERS["reps"]
+
+
 def _parameters_of(mode: str, selector: str) -> tuple[BalancingParameter, ...]:
     if mode == "ev_hash":
         return SELECTOR_PARAMETERS[selector]
@@ -1319,6 +1326,8 @@ def _parameters_of(mode: str, selector: str) -> tuple[BalancingParameter, ...]:
         return LOSS_HOLD_PARAMETERS[selector]
     if selector == "reps_oracle":
         return REPS_ORACLE_PARAMETERS + SPRAY_UNIFORM_KEYS
+    if selector == "reps_spine":
+        return REPS_SPINE_PARAMETERS + SPRAY_UNIFORM_KEYS
     if mode == "spray_uniform":
         return SPRAY_UNIFORM_KEYS
     return ()
@@ -1347,6 +1356,8 @@ def _load_load_balancing(
         return _load_loss_hold_selector(balancing, recovery, trimming)
     if mode == "spray_uniform" and balancing.get("selector") == "reps_oracle":
         return _load_reps_oracle(balancing, recovery, trimming)
+    if mode == "spray_uniform" and balancing.get("selector") == "reps_spine":
+        return _load_reps_spine(balancing, recovery, trimming)
     if mode == "spray_uniform" and balancing.get("selector") in SPINE_SELECTORS:
         return _load_spine_selector(balancing, recovery, trimming)
     if mode == "spray_uniform" and "selector" not in balancing:
@@ -1622,6 +1633,30 @@ def _load_reps_oracle(
         mode="spray_uniform",
         selector="reps_oracle",
         parameters=parsed + _spray_uniform_keys(balancing),
+    )
+
+
+def _load_reps_spine(
+    balancing: dict[str, Any],
+    recovery: TransportRecovery | None,
+    trimming: PacketTrimming | None,
+) -> LoadBalancing:
+    """spray_uniform with reps_spine, which reads REPS's parameters and the
+    keys spray_uniform reads under every selector, and refuses the loss
+    hold's keys and every spray_policy key, as the backend does."""
+    names = {parameter.name for parameter in REPS_SPINE_PARAMETERS + SPRAY_UNIFORM_KEYS}
+    unknown = set(balancing) - {"mode", "selector"} - names
+    if unknown:
+        raise ValueError(
+            "network.load_balancing.selector 'reps_spine' does not take "
+            f"{sorted(unknown)}"
+        )
+    _require_reorder_tolerance("spray_uniform", recovery, trimming)
+    return LoadBalancing(
+        mode="spray_uniform",
+        selector="reps_spine",
+        parameters=_parsed(balancing, REPS_SPINE_PARAMETERS)
+        + _spray_uniform_keys(balancing),
     )
 
 
