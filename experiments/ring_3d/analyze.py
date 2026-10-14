@@ -797,6 +797,7 @@ _HOST_TRANSPORT_EVENTS: Final = frozenset(
         "cc_exempt_granted",
         "cc_transition",
         "path_probe",
+        "ack_loss_declared",
     }
 )
 
@@ -876,6 +877,11 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
         # A path selector's probe of a path it no longer sends data on. It
         # carries no payload, so it is a count on the control plane.
         "path_probe",
+        # A send whose own acknowledgement never came, declared lost on its
+        # spine under ack_loss_rtts once a later cumulative acknowledgement
+        # covered it. Nothing is repaired, so it is a count on the control
+        # plane.
+        "ack_loss_declared",
     }
     # Switch conversions only: trim_forgiven is the receiver's answer to one,
     # not a second conversion, and adding it would double-count the payload.
@@ -977,6 +983,7 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
             "trimmed_queue_drop_count": events["switch_trimmed_queue_drop"],
         },
         "rto_fired_count": events["rto_fired"],
+        "ack_loss_declared_count": events["ack_loss_declared"],
         "cnp_taken_count": events["cnp_taken"],
         "clipped_trim_count": events["clipped_trim"],
         "trim_forgiven_count": events["trim_forgiven"],

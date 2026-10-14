@@ -430,7 +430,7 @@ class Ring3DAnalysisTests(unittest.TestCase):
             self.write_telemetry(telemetry, self.valid_shed_flow())
             ns3 = root / "ns3"
             ns3.mkdir()
-            for event in ("cnp_taken", "path_probe"):
+            for event in ("cnp_taken", "path_probe", "ack_loss_declared"):
                 (ns3 / "transport_summary.csv").write_text(
                     f"event,plane,event_count,total_bytes\n{event},data,1,0\n",
                     encoding="utf-8",

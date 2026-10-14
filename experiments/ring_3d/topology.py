@@ -1196,9 +1196,17 @@ TAIL_RECOVERY_KEYS: tuple[BalancingParameter, ...] = (
         _tail_recovery_delay_ns,
     ),
 )
+# ack_loss_rtts, after tail recovery's: the base RTTs after a later
+# cumulative acknowledgement covers a send whose own acknowledgement never
+# arrived at which that send is declared an acknowledgement loss on its spine,
+# to the path selector and the loss hold, with no repair; absent, none is.
+ACK_LOSS_KEY = BalancingParameter(
+    "ack_loss_rtts", "SPRAY_ACK_LOSS_RTTS", 0.0, _positive_number
+)
 SPRAY_UNIFORM_KEYS: tuple[BalancingParameter, ...] = (
     PATH_SEQ_KEY,
     *TAIL_RECOVERY_KEYS,
+    ACK_LOSS_KEY,
 )
 
 
@@ -1258,13 +1266,19 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
 )
 # Each loss hold selector's parameters: REPS's, or MRC's but its set, which
 # is the spines, defaults filled in; then the loss hold's, path_seq among
-# them, and tail recovery's.
+# them, tail recovery's and ack_loss_rtts.
 LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
-    "reps_hold": (*SELECTOR_PARAMETERS["reps"], *LOSS_HOLD_KEYS, *TAIL_RECOVERY_KEYS),
+    "reps_hold": (
+        *SELECTOR_PARAMETERS["reps"],
+        *LOSS_HOLD_KEYS,
+        *TAIL_RECOVERY_KEYS,
+        ACK_LOSS_KEY,
+    ),
     "reps_flow_hold": (
         *SELECTOR_PARAMETERS["reps"],
         *LOSS_HOLD_KEYS,
         *TAIL_RECOVERY_KEYS,
+        ACK_LOSS_KEY,
     ),
     "mrc_hold": (
         *(
@@ -1274,6 +1288,7 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         ),
         *LOSS_HOLD_KEYS,
         *TAIL_RECOVERY_KEYS,
+        ACK_LOSS_KEY,
     ),
 }
 LOSS_HOLD_REQUIRED_PARAMETERS = (
@@ -1306,6 +1321,7 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "receiver_hold_clean",
     "tail_recovery",
     "tail_recovery_delay_ns",
+    "ack_loss_rtts",
 }
 # reps_oracle: REPS's parameters, defaults filled in, and the cost source the
 # backend requires, switch_queue, which builds the switches' state it reads.
@@ -1445,8 +1461,8 @@ def _load_uniform_draw(
     if unknown:
         raise ValueError(
             "network.load_balancing.mode 'spray_uniform' without a selector "
-            "takes no other key than path_seq, tail_recovery and "
-            "tail_recovery_delay_ns; a selector "
+            "takes no other key than path_seq, tail_recovery, "
+            "tail_recovery_delay_ns and ack_loss_rtts; a selector "
             "and its parameters require mode 'ev_hash', or mode 'spray_uniform' "
             f"for a selector in {list(SPINE_SELECTORS)}"
         )
@@ -1459,8 +1475,8 @@ def _load_uniform_draw(
 def _spray_uniform_keys(
     balancing: dict[str, Any],
 ) -> tuple[tuple[str, ParameterValue], ...]:
-    """path_seq, tail_recovery and tail_recovery_delay_ns as given, each only
-    when set, refused where the backend refuses them."""
+    """path_seq, tail_recovery, tail_recovery_delay_ns and ack_loss_rtts as
+    given, each only when set, refused where the backend refuses them."""
     parsed = _parsed(
         balancing,
         tuple(parameter for parameter in SPRAY_UNIFORM_KEYS if parameter.name in balancing),
