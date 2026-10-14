@@ -1,4 +1,5 @@
-"""path_seq under every spray_uniform selector, tail_recovery and its delay."""
+"""path_seq under every spray_uniform selector, tail_recovery, its delay and
+its loss report guard."""
 
 from __future__ import annotations
 
@@ -181,6 +182,7 @@ class TailRecoveryTest(unittest.TestCase):
             ("path_seq", True),
             ("tail_recovery", True),
             ("tail_recovery_delay_ns", 0),
+            ("tail_loss_rtts", 1),
         ):
             refusals += [
                 ({"mode": "ecmp", key: value}, "takes no other key"),
@@ -188,6 +190,80 @@ class TailRecoveryTest(unittest.TestCase):
                 ({"mode": "ev_hash", key: value}, "does not take"),
                 ({"mode": "ev_hash", "selector": "reps", key: value}, "does not take"),
             ]
+        for balancing, message in refusals:
+            self.write(balancing)
+            with self.subTest(balancing=balancing):
+                with self.assertRaisesRegex(ValueError, message):
+                    load_profile(self.profile_path)
+
+    def test_tail_loss_rtts_is_written_after_the_delay(self) -> None:
+        manifest, config = self.generated({**UNIFORM, **TAIL, "tail_loss_rtts": 2})
+        self.assertIn(
+            "\nSPRAY_TAIL_RECOVERY on\nSPRAY_TAIL_LOSS_RTTS 2.0\n", config
+        )
+        self.assertNotIn("PATH_SELECTOR", config)
+        self.assertEqual(manifest["load_balancing"]["tail_loss_rtts"], 2.0)
+        manifest, config = self.generated(
+            {**UNIFORM, **TAIL, "tail_loss_rtts": 0, "ack_loss_rtts": 1}
+        )
+        self.assertIn(
+            "\nSPRAY_TAIL_RECOVERY on\n"
+            "SPRAY_TAIL_LOSS_RTTS 0.0\n"
+            "SPRAY_ACK_LOSS_RTTS 1.0\n",
+            config,
+        )
+        self.assertEqual(manifest["load_balancing"]["tail_loss_rtts"], 0.0)
+        for balancing in (HOLD, REPS_SPINE):
+            with self.subTest(balancing=balancing):
+                manifest, config = self.generated(
+                    {
+                        **balancing,
+                        **TAIL,
+                        "tail_recovery_delay_ns": 0,
+                        "tail_loss_rtts": 0.5,
+                    }
+                )
+                self.assertIn(f"PATH_SELECTOR {balancing['selector']}\n", config)
+                self.assertIn(
+                    "\nSPRAY_TAIL_RECOVERY on\n"
+                    "SPRAY_TAIL_RECOVERY_DELAY_NS 0\n"
+                    "SPRAY_TAIL_LOSS_RTTS 0.5\n",
+                    config,
+                )
+                self.assertEqual(manifest["load_balancing"]["tail_loss_rtts"], 0.5)
+
+    def test_tail_loss_rtts_unset_is_not_written(self) -> None:
+        for balancing in (UNIFORM, HOLD, REPS_SPINE):
+            with self.subTest(balancing=balancing):
+                manifest, config = self.generated({**balancing, **TAIL})
+                self.assertNotIn("SPRAY_TAIL_LOSS_RTTS", config)
+                self.assertNotIn("tail_loss_rtts", manifest["load_balancing"])
+
+    def test_tail_loss_rtts_refusals(self) -> None:
+        refusals: list[tuple[dict[str, object], str]] = []
+        for balancing in (UNIFORM, HOLD, REPS_SPINE):
+            refusals += [
+                (
+                    {**balancing, "tail_loss_rtts": 1},
+                    "tail_loss_rtts requires tail_recovery true",
+                ),
+                (
+                    {**balancing, "path_seq": True, "tail_loss_rtts": 0},
+                    "tail_loss_rtts requires tail_recovery true",
+                ),
+                (
+                    {**balancing, "path_seq": True, "tail_recovery": False,
+                     "tail_loss_rtts": 1},
+                    "tail_loss_rtts requires tail_recovery true",
+                ),
+            ]
+            for value in (-1, -0.5, True, "1", None, float("inf"), float("nan")):
+                refusals.append(
+                    (
+                        {**balancing, **TAIL, "tail_loss_rtts": value},
+                        "tail_loss_rtts must be a nonnegative number",
+                    )
+                )
         for balancing, message in refusals:
             self.write(balancing)
             with self.subTest(balancing=balancing):

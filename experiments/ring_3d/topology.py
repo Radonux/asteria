@@ -1183,7 +1183,10 @@ def _tail_recovery_delay_ns(value: Any, field: str) -> int:
 # its requested spine; tail_recovery, which requires path_seq true, a
 # message's closing packets' per-spine sent counts and the receiver's repair
 # requests from them; tail_recovery_delay_ns, read only with tail_recovery,
-# the delay before such a request, absent the fabric's largest base RTT.
+# the delay before such a request, absent the fabric's largest base RTT;
+# tail_loss_rtts, read only with tail_recovery, the base RTTs a send a repair
+# request declares lost waits before its loss is reported to the path
+# selector, a trim of it in that time cancelling the report, absent 1.
 PATH_SEQ_KEY = BalancingParameter("path_seq", "SPRAY_PATH_SEQ", False, _flag, _on_off)
 TAIL_RECOVERY_KEYS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
@@ -1194,6 +1197,9 @@ TAIL_RECOVERY_KEYS: tuple[BalancingParameter, ...] = (
         "SPRAY_TAIL_RECOVERY_DELAY_NS",
         0,
         _tail_recovery_delay_ns,
+    ),
+    BalancingParameter(
+        "tail_loss_rtts", "SPRAY_TAIL_LOSS_RTTS", 1.0, _nonnegative_number
     ),
 )
 # ack_loss_rtts, after tail recovery's: the base RTTs after a later
@@ -1321,6 +1327,7 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "receiver_hold_clean",
     "tail_recovery",
     "tail_recovery_delay_ns",
+    "tail_loss_rtts",
     "ack_loss_rtts",
 }
 # reps_oracle: REPS's parameters, defaults filled in, and the cost source the
@@ -1462,7 +1469,7 @@ def _load_uniform_draw(
         raise ValueError(
             "network.load_balancing.mode 'spray_uniform' without a selector "
             "takes no other key than path_seq, tail_recovery, "
-            "tail_recovery_delay_ns and ack_loss_rtts; a selector "
+            "tail_recovery_delay_ns, tail_loss_rtts and ack_loss_rtts; a selector "
             "and its parameters require mode 'ev_hash', or mode 'spray_uniform' "
             f"for a selector in {list(SPINE_SELECTORS)}"
         )
@@ -1475,8 +1482,9 @@ def _load_uniform_draw(
 def _spray_uniform_keys(
     balancing: dict[str, Any],
 ) -> tuple[tuple[str, ParameterValue], ...]:
-    """path_seq, tail_recovery, tail_recovery_delay_ns and ack_loss_rtts as
-    given, each only when set, refused where the backend refuses them."""
+    """path_seq, tail_recovery, tail_recovery_delay_ns, tail_loss_rtts and
+    ack_loss_rtts as given, each only when set, refused where the backend
+    refuses them."""
     parsed = _parsed(
         balancing,
         tuple(parameter for parameter in SPRAY_UNIFORM_KEYS if parameter.name in balancing),
@@ -1488,16 +1496,17 @@ def _spray_uniform_keys(
 def _require_tail_recovery(
     balancing: dict[str, Any], values: dict[str, ParameterValue]
 ) -> None:
-    """tail_recovery requires path_seq true, and tail_recovery_delay_ns is read
-    only with tail_recovery true, as the backend reads them."""
+    """tail_recovery requires path_seq true, and tail_recovery_delay_ns and
+    tail_loss_rtts are read only with tail_recovery true, as the backend reads
+    them."""
     tail_recovery = values.get("tail_recovery") is True
     if tail_recovery and values.get("path_seq") is not True:
         raise ValueError("network.load_balancing.tail_recovery requires path_seq true")
-    if "tail_recovery_delay_ns" in balancing and not tail_recovery:
-        raise ValueError(
-            "network.load_balancing.tail_recovery_delay_ns requires "
-            "tail_recovery true"
-        )
+    for name in ("tail_recovery_delay_ns", "tail_loss_rtts"):
+        if name in balancing and not tail_recovery:
+            raise ValueError(
+                f"network.load_balancing.{name} requires tail_recovery true"
+            )
 
 
 def _load_loss_hold_selector(
