@@ -1,5 +1,6 @@
 """path_seq under every spray_uniform selector, tail_recovery, its delay, its
-loss report guard and the tail_loss_cancelled count."""
+loss report guard and the tail_loss_cancelled, tail_loss_delivered and
+tail_loss_ambiguous counts."""
 
 from __future__ import annotations
 
@@ -300,6 +301,29 @@ class TailRecoveryTest(unittest.TestCase):
         self.assertEqual(transport["ack_loss_declared_count"], 6)
         self.assertEqual(transport["rto_fired_count"], 3)
 
+    def test_tail_loss_delivered_and_ambiguous_are_counted_apart(self) -> None:
+        ns3 = self.directory / "ns3"
+        ns3.mkdir()
+        summary = ns3 / "transport_summary.csv"
+        summary.write_text(
+            "event,plane,event_count,total_bytes\n"
+            "tail_loss_cancelled,control,4,0\n",
+            encoding="utf-8",
+        )
+        transport = _summarize_transport_events(ns3)
+        self.assertEqual(transport["tail_loss_delivered_count"], 0)
+        self.assertEqual(transport["tail_loss_ambiguous_count"], 0)
+        summary.write_text(
+            "event,plane,event_count,total_bytes\n"
+            "tail_loss_cancelled,control,4,0\n"
+            "tail_loss_delivered,control,7,0\n"
+            "tail_loss_ambiguous,control,2,0\n",
+            encoding="utf-8",
+        )
+        transport = _summarize_transport_events(ns3)
+        self.assertEqual(transport["tail_loss_cancelled_count"], 4)
+        self.assertEqual(transport["tail_loss_delivered_count"], 7)
+        self.assertEqual(transport["tail_loss_ambiguous_count"], 2)
 
 if __name__ == "__main__":
     unittest.main()
