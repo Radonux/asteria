@@ -798,6 +798,7 @@ _HOST_TRANSPORT_EVENTS: Final = frozenset(
         "cc_transition",
         "path_probe",
         "ack_loss_declared",
+        "tail_loss_cancelled",
     }
 )
 
@@ -882,6 +883,10 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
         # covered it. Nothing is repaired, so it is a count on the control
         # plane.
         "ack_loss_declared",
+        # A tail repair request's deferred loss report under tail_loss_rtts
+        # that a later trim notification for the same send cancelled. The
+        # repair already went out, so it is a count on the control plane.
+        "tail_loss_cancelled",
     }
     # Switch conversions only: trim_forgiven is the receiver's answer to one,
     # not a second conversion, and adding it would double-count the payload.
@@ -984,6 +989,7 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
         },
         "rto_fired_count": events["rto_fired"],
         "ack_loss_declared_count": events["ack_loss_declared"],
+        "tail_loss_cancelled_count": events["tail_loss_cancelled"],
         "cnp_taken_count": events["cnp_taken"],
         "clipped_trim_count": events["clipped_trim"],
         "trim_forgiven_count": events["trim_forgiven"],

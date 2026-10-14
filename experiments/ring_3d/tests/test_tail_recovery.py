@@ -1,5 +1,5 @@
-"""path_seq under every spray_uniform selector, tail_recovery, its delay and
-its loss report guard."""
+"""path_seq under every spray_uniform selector, tail_recovery, its delay, its
+loss report guard and the tail_loss_cancelled count."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
+from experiments.ring_3d.analyze import _summarize_transport_events
 from experiments.ring_3d.generate import load_profile, materialize
 
 PROFILE = REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
@@ -275,6 +276,29 @@ class TailRecoveryTest(unittest.TestCase):
         self.write({**UNIFORM, **TAIL})
         with self.assertRaisesRegex(ValueError, "requires network.transport_recovery"):
             load_profile(self.profile_path)
+
+    def test_tail_loss_cancelled_is_counted_on_the_control_plane(self) -> None:
+        ns3 = self.directory / "ns3"
+        ns3.mkdir()
+        summary = ns3 / "transport_summary.csv"
+        summary.write_text(
+            "event,plane,event_count,total_bytes\nrto_fired,control,3,0\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            _summarize_transport_events(ns3)["tail_loss_cancelled_count"], 0
+        )
+        summary.write_text(
+            "event,plane,event_count,total_bytes\n"
+            "rto_fired,control,3,0\n"
+            "ack_loss_declared,control,6,0\n"
+            "tail_loss_cancelled,control,4,0\n",
+            encoding="utf-8",
+        )
+        transport = _summarize_transport_events(ns3)
+        self.assertEqual(transport["tail_loss_cancelled_count"], 4)
+        self.assertEqual(transport["ack_loss_declared_count"], 6)
+        self.assertEqual(transport["rto_fired_count"], 3)
 
 
 if __name__ == "__main__":
