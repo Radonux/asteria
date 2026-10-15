@@ -152,6 +152,7 @@ class AllToAllPinnedOutputTests(unittest.TestCase):
                 self.assertEqual(digest.hexdigest(), expected)
                 self.assertNotIn("combine_bytes", manifest["workload"])
                 self.assertNotIn("expert_compute_ns", manifest["workload"])
+                self.assertNotIn("dataset_splits", manifest["workload"])
 
 
 class AllToAllTraceTests(unittest.TestCase):
@@ -315,6 +316,22 @@ class AllToAllTraceTests(unittest.TestCase):
                     )
                     self.assertEqual(list(nodes[0].ctrl_deps), [])
 
+    def test_dataset_splits_sets_the_system_layers_chunks(self) -> None:
+        _, _, default, _ = _materialize(_all_to_all())
+        self.assertEqual(default["preferred-dataset-splits"], 4)
+        manifest, traces, system, _ = _materialize(
+            _all_to_all(message_bytes=65_538, dataset_splits=1)
+        )
+        # One chunk: the system layer sends each pair its message_bytes as
+        # one message per collective, and nothing else in system.json moves.
+        self.assertEqual(system, {**default, "preferred-dataset-splits": 1})
+        self.assertEqual(manifest["workload"]["dataset_splits"], 1)
+        self.assertEqual(
+            _attributes(traces[0][0])["comm_size"].uint64_val, 65_538 * 64
+        )
+        _, _, two, _ = _materialize(_all_to_all(dataset_splits=2))
+        self.assertEqual(two["preferred-dataset-splits"], 2)
+
     def test_other_workloads_write_no_all_to_all_group(self) -> None:
         document = json.loads(
             (PROFILES / "no_incast_8_zero.json").read_text(encoding="utf-8")
@@ -370,6 +387,16 @@ class AllToAllTraceTests(unittest.TestCase):
             (
                 _all_to_all(expert_compute_ns=1000),
                 "may contain \\['combine_bytes', 'expert_compute_ns'\\] together",
+            ),
+            (_all_to_all(dataset_splits=0), "dataset_splits must be a positive"),
+            (_all_to_all(dataset_splits=True), "dataset_splits must be a positive"),
+            (
+                _all_to_all(message_bytes=65_540, dataset_splits=8),
+                "must be a multiple of 8",
+            ),
+            (
+                _all_to_all(group={"leaves": [1]}, message_bytes=56, dataset_splits=8),
+                "at least 8 times the rank count",
             ),
         )
         for document, message in cases:

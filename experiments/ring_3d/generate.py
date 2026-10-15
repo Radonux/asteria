@@ -164,7 +164,8 @@ WORKLOAD_KINDS = frozenset(
     }
 )
 # The system layer splits every collective into this many chunks
-# (system.json preferred-dataset-splits).
+# (system.json preferred-dataset-splits) unless an all-to-all workload sets
+# workload.dataset_splits.
 PREFERRED_DATASET_SPLITS = 4
 # The native algorithm an all-to-all workload's group runs: every member sends
 # to every other member at once (CollectiveImplLookup "direct", no window).
@@ -412,7 +413,9 @@ class AllToAll:
     the combine's all-to-all, in a chain.
 
     ``leaves`` None is every host; otherwise the group is every host on the
-    listed leaves, in rank order.
+    listed leaves, in rank order. ``dataset_splits`` is the chunks the system
+    layer cuts each collective into, sent one after another; None is
+    PREFERRED_DATASET_SPLITS.
     """
 
     message_bytes: int
@@ -420,6 +423,7 @@ class AllToAll:
     compute_ns: int
     leaves: tuple[int, ...] | None = None
     combine: Combine | None = None
+    dataset_splits: int | None = None
 
     def members(self, ranks: int, hosts_per_leaf: int | None) -> tuple[int, ...]:
         if self.leaves is None:
@@ -502,6 +506,8 @@ class Workload:
             if combine is not None:
                 manifest["combine_bytes"] = combine.combine_bytes
                 manifest["expert_compute_ns"] = combine.expert_compute_ns
+            if self.all_to_all.dataset_splits is not None:
+                manifest["dataset_splits"] = self.all_to_all.dataset_splits
             return manifest
         return {"kind": self.kind}
 
@@ -770,11 +776,12 @@ def _load_all_to_all(value: dict[str, Any]) -> AllToAll:
     combine_keys = {"combine_bytes", "expert_compute_ns"}
     # The combine's two keys come together: the compute is what separates
     # the iteration's two all-to-alls.
-    if set(value) not in (required, required | combine_keys):
+    if set(value) - {"dataset_splits"} not in (required, required | combine_keys):
         raise ValueError(
             "workload.kind 'all_to_all' must contain exactly "
             "['compute_ns', 'group', 'iterations', 'kind', 'message_bytes'], "
-            "and may contain ['combine_bytes', 'expert_compute_ns'] together"
+            "and may contain ['combine_bytes', 'expert_compute_ns'] together "
+            "and 'dataset_splits'"
         )
     group = value["group"]
     if group == "all":
@@ -810,6 +817,11 @@ def _load_all_to_all(value: dict[str, Any]) -> AllToAll:
                 ),
             )
             if "combine_bytes" in value
+            else None
+        ),
+        dataset_splits=(
+            _require_positive_int(value["dataset_splits"], "workload.dataset_splits")
+            if "dataset_splits" in value
             else None
         ),
     )
@@ -1255,10 +1267,11 @@ def _check_all_to_all(all_to_all: AllToAll, profile: Profile) -> None:
             "workload.kind 'all_to_all' runs one iteration per step and needs "
             "steps equal to workload.iterations"
         )
-    # The system layer cuts each collective into PREFERRED_DATASET_SPLITS
+    # The system layer cuts each collective into dataset_splits(profile)
     # chunks and each chunk into group_size messages, one per member, with
     # integer division; a chunk below the rank count is resized. Either would
     # send a pair other than its bytes per pair.
+    splits = dataset_splits(profile)
     collectives = [
         (
             "message_bytes",
@@ -1276,15 +1289,14 @@ def _check_all_to_all(all_to_all: AllToAll, profile: Profile) -> None:
             )
         )
     for field, pair_bytes, comm_size in collectives:
-        if pair_bytes % PREFERRED_DATASET_SPLITS:
+        if pair_bytes % splits:
             raise ValueError(
-                f"workload.{field} must be a multiple of "
-                f"{PREFERRED_DATASET_SPLITS} for 'all_to_all'"
+                f"workload.{field} must be a multiple of {splits} for 'all_to_all'"
             )
-        if comm_size // PREFERRED_DATASET_SPLITS < profile.ranks:
+        if comm_size // splits < profile.ranks:
             raise ValueError(
                 f"workload.{field} times the group size must be at least "
-                f"{PREFERRED_DATASET_SPLITS} times the rank count for 'all_to_all'"
+                f"{splits} times the rank count for 'all_to_all'"
             )
 
 
@@ -1306,6 +1318,16 @@ def all_to_all_group_id(profile: Profile) -> int | None:
         return None
     tp, pp, dp = profile.tp, profile.pp, profile.dp
     return dp * pp + dp * tp + pp * tp + 1
+
+
+def dataset_splits(profile: Profile) -> int:
+    """The chunks the system layer cuts each collective into: the
+    all-to-all's workload.dataset_splits when set, PREFERRED_DATASET_SPLITS
+    for every other profile."""
+    all_to_all = profile.workload.all_to_all
+    if all_to_all is None or all_to_all.dataset_splits is None:
+        return PREFERRED_DATASET_SPLITS
+    return all_to_all.dataset_splits
 
 
 def rank_for(tp_rank: int, pp_rank: int, dp_rank: int, profile: Profile) -> int:
@@ -2335,12 +2357,13 @@ def write_system_config(
     dp_all_reduce_implementation: str = "ring",
     comm_ops_in_flight: int = 1,
     all_to_all_group_id: int | None = None,
+    preferred_dataset_splits: int = PREFERRED_DATASET_SPLITS,
 ) -> None:
     configuration: dict[str, Any] = {
         "scheduling-policy": "LIFO",
         "endpoint-delay": 10,
         "active-chunks-per-dimension": 1,
-        "preferred-dataset-splits": PREFERRED_DATASET_SPLITS,
+        "preferred-dataset-splits": preferred_dataset_splits,
         "all-reduce-implementation": ["ring"],
         "all-gather-implementation": ["ring"],
         "reduce-scatter-implementation": ["ring"],
@@ -2541,6 +2564,7 @@ def materialize(
         dp_all_reduce_implementation=profile.dp_all_reduce_implementation,
         comm_ops_in_flight=sends_per_rank(profile),
         all_to_all_group_id=all_to_all_group_id(profile),
+        preferred_dataset_splits=dataset_splits(profile),
     )
     (output_dir / "communicator_groups.json").write_text(
         json.dumps(groups, indent=2) + "\n", encoding="utf-8"
