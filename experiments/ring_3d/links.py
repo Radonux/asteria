@@ -16,10 +16,14 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from math import isfinite
+from math import expm1, isfinite, log1p
 from typing import Any
 
 FAILURE_MODELS = ("graceful", "silent", "gray")
+# What a gray loss failure's error_rate is the rate of: each packet, frame,
+# whatever its size, or each byte, byte, so that a packet is lost by its
+# size, the rate derived so that a full data frame keeps error_rate.
+LOSS_UNITS = ("frame", "byte")
 # A failure's direction on its leaf-spine link: "up" is what the leaf sends
 # the spine, "down" what the spine sends the leaf, "both" the two.
 FAILURE_DIRECTIONS = ("up", "down", "both")
@@ -68,7 +72,12 @@ class LinkFailure:
     leaf what arrives from the spine under "down", both under "both". ``gray``
     gives the links an error rate or a lower rate in the same direction or
     directions: a loss is dropped by the receiving end, and a lower rate is
-    the sending end's.
+    the sending end's. A loss's ``loss_unit`` ``frame``, the default, drops
+    every packet with ``error_rate``; ``byte`` drops a packet of s bytes with
+    1 - (1 - r)^s, r being the rate per byte at which a full data frame is
+    lost with ``error_rate`` (per_byte_rate), so that an acknowledgement or
+    a trimmed header is lost about as much less often as it is smaller, as
+    corruption failing a frame's check would lose it.
 
     With ``duration_ns`` the links are restored that long after each failure,
     and the failure happens ``repeat`` times, ``period_ns`` apart; without it
@@ -87,6 +96,8 @@ class LinkFailure:
     period_ns: int | None = None
     # As the profile gives it; None when it leaves it out.
     direction: str | None = None
+    # As the profile gives it; None when it leaves it out.
+    loss_unit: str | None = None
 
     def effective_direction(self) -> str:
         """The direction the failure applies in: "up" for an unspecified
@@ -127,12 +138,22 @@ class LinkFailure:
             range(leaf_count) if self.leaf is None else range(self.leaf, self.leaf + 1)
         )
 
-    def _action(self) -> tuple[str, str]:
-        """The LINK_FAILURE kind, and the value written after the two nodes."""
+    def per_byte_rate(self, frame_bytes: int) -> float:
+        """The rate r per byte that loses a full data frame of frame_bytes
+        with error_rate: 1 - (1 - error_rate)^(1 / frame_bytes)."""
+        assert self.error_rate is not None
+        return -expm1(log1p(-self.error_rate) / frame_bytes)
+
+    def _action(self, frame_bytes: int) -> tuple[str, str]:
+        """The LINK_FAILURE kind, and the value written after the two nodes:
+        under loss_unit byte the rate per byte at a full data frame of
+        frame_bytes."""
         if self.model == "graceful":
             return "down", ""
         if self.model == "silent":
             return "blackhole", ""
+        if self.loss_unit == "byte":
+            return "loss", " " + format(self.per_byte_rate(frame_bytes), ".17g")
         if self.error_rate is not None:
             return "loss", " " + format(self.error_rate, ".17g")
         return "rate", f" {self.rate}"
@@ -162,13 +183,16 @@ class LinkFailure:
             return " forward"
         return ""
 
-    def config_lines(self, index: ClosIndex) -> list[str]:
+    def config_lines(self, index: ClosIndex, frame_bytes: int) -> list[str]:
         """Per affected link, per node pair _ends gives and per occurrence,
         one LINK_FAILURE line and, with a duration, one LINK_RESTORE line
         naming the two nodes in the same order, which the backend restores
-        that failure by."""
-        kind, value = self._action()
+        that failure by. frame_bytes is a full data frame's, as the backend
+        checks under loss_unit byte, written after the direction."""
+        kind, value = self._action(frame_bytes)
         token = self._backend_direction_token()
+        if self.loss_unit == "byte":
+            token += f" byte {frame_bytes}"
         lines = []
         for leaf in self.leaves(index.leaf_count):
             for a, b in self._ends(index.leaf(leaf), index.spine(self.spine)):
@@ -179,9 +203,11 @@ class LinkFailure:
                         lines.append(f"LINK_RESTORE {end} {link}\n")
         return lines
 
-    def manifest(self) -> dict[str, Any]:
-        """The failure as given; direction only when the profile sets it, so
-        a manifest without it is unchanged."""
+    def manifest(self, frame_bytes: int) -> dict[str, Any]:
+        """The failure as given; direction and loss_unit only when the
+        profile sets them, so a manifest without them is unchanged, and under
+        loss_unit byte the full data frame of frame_bytes the rate per byte
+        is derived at and that rate."""
         recorded: dict[str, Any] = {
             "model": self.model,
             "start_ns": self.start_ns,
@@ -195,6 +221,11 @@ class LinkFailure:
         }
         if self.direction is not None:
             recorded["direction"] = self.direction
+        if self.loss_unit is not None:
+            recorded["loss_unit"] = self.loss_unit
+        if self.loss_unit == "byte":
+            recorded["reference_frame_bytes"] = frame_bytes
+            recorded["per_byte_error_rate"] = self.per_byte_rate(frame_bytes)
         return recorded
 
 
@@ -354,6 +385,15 @@ def load_link_failures(
             allowed |= {"error_rate", "rate"}
             if len({"error_rate", "rate"} & set(entry)) != 1:
                 raise ValueError(f"{field} is gray and sets one of error_rate and rate")
+        if "loss_unit" in entry:
+            if model != "gray" or "error_rate" not in entry:
+                raise ValueError(
+                    f"{field}.loss_unit is read only by a gray failure that sets "
+                    "error_rate"
+                )
+            if entry["loss_unit"] not in LOSS_UNITS:
+                raise ValueError(f"{field}.loss_unit must be one of {list(LOSS_UNITS)}")
+            allowed.add("loss_unit")
         if model != "graceful":
             allowed.add("duration_ns")
             if "duration_ns" in entry:
@@ -407,6 +447,7 @@ def load_link_failures(
             repeat=repeat,
             period_ns=period_ns,
             direction=_direction(entry, field, model),
+            loss_unit=entry.get("loss_unit"),
         )
         for leaf in failure.leaves(clos.leaf_count):
             earlier = failed.setdefault((leaf, failure.spine), [])

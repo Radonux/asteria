@@ -2609,7 +2609,8 @@ def materialize(
             override.manifest() for override in profile.network.link_overrides
         ],
         "link_failures": [
-            failure.manifest() for failure in profile.network.link_failures
+            failure.manifest(profile.network.data_frame_bytes())
+            for failure in profile.network.link_failures
         ],
         "switch": profile.network.switch.manifest(),
         "fabric": (

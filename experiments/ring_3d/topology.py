@@ -81,6 +81,15 @@ LOSS_HOLD_SELECTORS = ("reps_hold", "reps_flow_hold", "mrc_hold")
 # The loss hold selectors that read hold_scope and write the host's loss
 # trace.
 HOLD_SCOPE_SELECTORS = ("reps_hold", "mrc_hold")
+# The bytes the backend puts before a data packet's payload as a device
+# receives it, in the plain configuration: the PPP header (2), the IPv4
+# header (20), the UDP header (8) and the data header's priority group (2)
+# and sequence (4). The INT header's send time, the path sequence and the
+# tail counts add theirs where set (ClosNetwork.data_frame_bytes).
+DATA_FRAME_HEADER_BYTES = 36
+INT_SEND_TIME_BYTES = 8
+PATH_SEQ_BYTES = 2
+TAIL_COUNT_BYTES = 2
 # The most spines a receiver's hold names in an acknowledgement's bitmap.
 MAX_RECEIVER_HOLD_SPINES = 8
 # The most spines a closing packet's per-spine counts name under
@@ -440,13 +449,33 @@ class ClosNetwork:
             spine_count=self.live_spine_count,
         )
 
+    def data_frame_bytes(self) -> int:
+        """A full data frame's bytes as the backend's devices receive it
+        (RdmaHw::DataFrameBytes), which a loss_unit byte failure's rate per
+        byte is derived at and the backend checks: the payload and
+        DATA_FRAME_HEADER_BYTES, with the INT header's send time where
+        ack_redirect or one_way_delay asks for it, the path sequence under
+        path_seq and the flags and a count per spine under tail_recovery."""
+        balancing = dict(self.load_balancing.parameters)
+        header = DATA_FRAME_HEADER_BYTES
+        if (
+            self.load_balancing.selector == "ack_redirect"
+            or balancing.get("one_way_delay") is True
+        ):
+            header += INT_SEND_TIME_BYTES
+        if balancing.get("path_seq") is True:
+            header += PATH_SEQ_BYTES
+        if balancing.get("tail_recovery") is True:
+            header += 1 + TAIL_COUNT_BYTES * self.live_spine_count
+        return self.packet_payload_bytes + header
+
     def link_failure_config(self, host_count: int) -> str:
         """The LINK_FAILURE lines of every failure, in profile order."""
         index = self.clos_index(host_count)
         return "".join(
             line
             for failure in self.link_failures
-            for line in failure.config_lines(index)
+            for line in failure.config_lines(index, self.data_frame_bytes())
         )
     data_loss: DataPlaneLoss | None = None
     transport_recovery: TransportRecovery | None = None
