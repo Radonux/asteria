@@ -1216,6 +1216,14 @@ SPRAY_UNIFORM_KEYS: tuple[BalancingParameter, ...] = (
     *TAIL_RECOVERY_KEYS,
     ACK_LOSS_KEY,
 )
+# receiver_tail_missing, after ack_loss_rtts, read only by the loss hold
+# selectors with receiver_hold and tail_recovery true: whether the receiver's
+# hold also counts missing the sends a tail repair request names that are
+# still missing tail_loss_rtts base RTTs after the request, which holds a
+# spine on which nothing arrives; absent, false.
+RECEIVER_TAIL_MISSING_KEY = BalancingParameter(
+    "receiver_tail_missing", "SPRAY_RECEIVER_TAIL_MISSING", False, _flag, _on_off
+)
 
 
 # The loss hold of reps_hold, reps_flow_hold and mrc_hold, after the
@@ -1274,19 +1282,21 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
 )
 # Each loss hold selector's parameters: REPS's, or MRC's but its set, which
 # is the spines, defaults filled in; then the loss hold's, path_seq among
-# them, tail recovery's and ack_loss_rtts.
+# them, tail recovery's, ack_loss_rtts and receiver_tail_missing.
 LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
     "reps_hold": (
         *SELECTOR_PARAMETERS["reps"],
         *LOSS_HOLD_KEYS,
         *TAIL_RECOVERY_KEYS,
         ACK_LOSS_KEY,
+        RECEIVER_TAIL_MISSING_KEY,
     ),
     "reps_flow_hold": (
         *SELECTOR_PARAMETERS["reps"],
         *LOSS_HOLD_KEYS,
         *TAIL_RECOVERY_KEYS,
         ACK_LOSS_KEY,
+        RECEIVER_TAIL_MISSING_KEY,
     ),
     "mrc_hold": (
         *(
@@ -1297,6 +1307,7 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         *LOSS_HOLD_KEYS,
         *TAIL_RECOVERY_KEYS,
         ACK_LOSS_KEY,
+        RECEIVER_TAIL_MISSING_KEY,
     ),
 }
 LOSS_HOLD_REQUIRED_PARAMETERS = (
@@ -1331,6 +1342,7 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "tail_recovery_delay_ns",
     "tail_loss_rtts",
     "ack_loss_rtts",
+    "receiver_tail_missing",
 }
 # reps_oracle: REPS's parameters, defaults filled in, and the cost source the
 # backend requires, switch_queue, which builds the switches' state it reads.
@@ -1594,6 +1606,13 @@ def _load_loss_hold_selector(
     if "receiver_hold_clean" in balancing and not receiver_hold:
         raise ValueError(
             "network.load_balancing.receiver_hold_clean requires receiver_hold true"
+        )
+    if "receiver_tail_missing" in balancing and not (
+        receiver_hold and values.get("tail_recovery") is True
+    ):
+        raise ValueError(
+            "network.load_balancing.receiver_tail_missing requires receiver_hold "
+            "true and tail_recovery true"
         )
     # As the backend reads it: under auto, given or by default, or by the
     # receiver's hold.
