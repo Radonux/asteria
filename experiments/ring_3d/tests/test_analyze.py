@@ -439,6 +439,9 @@ class Ring3DAnalysisTests(unittest.TestCase):
                 "tail_loss_ambiguous",
                 "tail_repair_rerouted",
                 "receiver_tail_missing",
+                "receiver_tail_missing_late",
+                "receiver_tail_missing_spine3",
+                "receiver_tail_missing_late_spine0",
             ):
                 (ns3 / "transport_summary.csv").write_text(
                     f"event,plane,event_count,total_bytes\n{event},data,1,0\n",

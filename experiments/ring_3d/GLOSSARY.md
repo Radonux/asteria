@@ -92,7 +92,7 @@ Profiles are strict JSON input validated by `generate.py`; unknown fields fail.
 | `network.load_balancing.ack_loss_rtts` | `spray_uniform`, with any selector or none: the base RTTs after a later cumulative acknowledgement covers a send whose own acknowledgement never arrived at which that send is declared an acknowledgement loss on its spine, to the path selector and the loss hold; nothing is repaired, and each declaration is counted as `ack_loss_declared` | Absent (0, none declared) | Positive number; writes `SPRAY_ACK_LOSS_RTTS`, only when set, after the selector's keys, `path_seq` and `tail_recovery`, as does the manifest; refused under every other mode |
 | `network.load_balancing.receiver_hold` | Loss hold selectors with `path_seq: true`: whether each receiving host holds a spine for one sender leaf, or for every one once `hold_auto_leaves` sender leaves have a missing packet on it, reports its holds in a bitmap in every acknowledgement, and the senders hold those spines toward its leaf, with the loss hold's exclusion and sentinels | Absent (false) | Boolean; writes `SPRAY_RECEIVER_HOLD on` or `off`, only when set, and with it on `RECEIVER_HOLD_OUTPUT_FILE`. Requires `path_seq: true` and at most 8 spines, as the backend does |
 | `network.load_balancing.receiver_hold_clean` | Loss hold selectors with `receiver_hold: true`: the consecutive arrivals without a missing packet on a held spine that release the receiver's hold | Absent (1024) | Positive integer; writes `SPRAY_RECEIVER_HOLD_CLEAN`, only when set; refused without `receiver_hold` |
-| `network.load_balancing.receiver_tail_missing` | Loss hold selectors with `receiver_hold: true` and `tail_recovery: true`: whether the receiver's hold also counts missing, for the sender's leaf on their requested spine, the sends a tail repair request names that have neither arrived nor been trimmed `tail_loss_rtts` base RTTs after the request and that no gap in the path sequences counted, so that a spine on which nothing arrives, such as a black-holed one, is held; a send counted that arrives later is a late arrival, and each send counted is counted as `receiver_tail_missing` | Absent (false) | Boolean; writes `SPRAY_RECEIVER_TAIL_MISSING on` or `off`, only when set, after `SPRAY_ACK_LOSS_RTTS`'s place, as does the manifest; refused without `receiver_hold: true` and `tail_recovery: true`, as the backend does |
+| `network.load_balancing.receiver_tail_missing` | Loss hold selectors with `receiver_hold: true` and `tail_recovery: true`: whether the receiver's hold also counts missing, for the sender's leaf on their requested spine, the sends a tail repair request names that have neither arrived nor been trimmed `tail_loss_rtts` base RTTs after the request and that no gap in the path sequences counted, so that a spine on which nothing arrives, such as a black-holed one, is held; a send counted that arrives later is a late arrival, each send counted is counted as `receiver_tail_missing`, and each of them whose data packet or trimmed header arrives after all as `receiver_tail_missing_late` | Absent (false) | Boolean; writes `SPRAY_RECEIVER_TAIL_MISSING on` or `off`, only when set, after `SPRAY_ACK_LOSS_RTTS`'s place, as does the manifest; refused without `receiver_hold: true` and `tail_recovery: true`, as the backend does |
 | `RECEIVER_HOLD_OUTPUT_FILE` (`receiver_holds.csv`) | The receiver hold trace: every interval of `loss_interval_ns` a receiving host's hold closes, one row per host, sender leaf and spine, with header `time_ns,rank,sender_leaf,spine,arrivals,lost,hold`; `lost` is the packets the path sequences show missing, with those `receiver_tail_missing` counts, and `hold` the scope the spine is held at as the interval closes, `none`, `leaf` or `host` | Not written | Written in the run's `ns3` directory and recorded in the manifest's `counter_files` exactly when a loss hold selector sets `receiver_hold: true`, the only configuration in which the backend reads the key |
 | `RTO_EVENT_OUTPUT_FILE` (`rto_events.csv`) | The retransmission timeout trace: one row per timeout a queue pair takes, with header `time_ns,rank,dst_rank,spine,sentinel,bytes_outstanding`; `spine` is the requested spine of the oldest outstanding send, empty where the mode keeps no send record or names no spine, and `sentinel` whether that send was an exploration send onto a held spine | Written | Written by every run, in the run's `ns3` directory, and recorded in the manifest's `counter_files`; the backend reads the key under every mode |
 | `network.load_balancing.selector: "reps_oracle"` | `spray_uniform`, simulation only: each data packet's spine chosen by REPS over the spine indices, leaving out for the rest of the run every spine the switches' state shows a fault on toward the destination's leaf: over the four hops between the two leaves, forward and reverse, a receiving port with a link error rate or black-holed, or a sending port slower than the slowest hop of another spine's path. Read at most once per base RTT per destination leaf; while every spine is faulted none is left out. No sentinel is sent | Absent | Writes `PATH_SELECTOR reps_oracle`, `buffer_size` and `freezing_timeout_ns` with defaults filled in, and `SPRAY_GRADE_COST_SOURCE switch_queue`; the manifest records them. Requires `grade_cost_source: "switch_queue"`, as the backend does, and refuses the loss hold's keys, `hold_scope`, `hold_auto_leaves` and every other `spray_policy` key |
@@ -222,9 +222,9 @@ a naturally emitted framework burst or as packet loss.
   `first_trim_to_first_repair_ns`, separates a repair-driven tail from a
   congestion-control-driven one.
 - `rto_fired`, `cnp_taken`, `ack_loss_declared`, `tail_loss_cancelled`,
-  `tail_loss_delivered`, `tail_loss_ambiguous`, `tail_repair_rerouted` and
-  `receiver_tail_missing` in `transport_summary.csv` are host-transport
-  reactions, not packets. They ride the control plane and carry zero bytes.
+  `tail_loss_delivered`, `tail_loss_ambiguous`, `tail_repair_rerouted`,
+  `receiver_tail_missing` and `receiver_tail_missing_late` in
+  `transport_summary.csv` are host-transport reactions, not packets. They ride the control plane and carry zero bytes.
   `ack_loss_declared` counts the sends `ack_loss_rtts` declared lost on their
   spines; `summary.json` reports it as `ack_loss_declared_count`, zero when
   the key is absent.
@@ -245,6 +245,16 @@ a naturally emitted framework burst or as packet loss.
   `receiver_tail_missing`, those a tail repair request named that were still
   missing `tail_loss_rtts` base RTTs after it; `summary.json` reports it as
   `receiver_tail_missing_count`, zero when none was.
+  `receiver_tail_missing_late` counts those of them whose data packet or
+  trimmed header arrived after all, each a false count; `summary.json`
+  reports it as `receiver_tail_missing_late_count`, zero when none was. The
+  backend also writes both broken down by the requested spine of each send,
+  as `receiver_tail_missing_spine<k>` and
+  `receiver_tail_missing_late_spine<k>` rows on the control plane for the
+  spines that have one; these are no events of their own and stay out of
+  every event total, and `summary.json` reports them as
+  `receiver_tail_missing_by_spine` and `receiver_tail_missing_late_by_spine`,
+  spine to count, empty when no row is written.
   `trim_forgiven` is the receiver's answer to a switch's trim, not a second
   conversion: it rides the data plane with the payload bytes it released, and
   it is excluded from the packet-trimming conversion counts.

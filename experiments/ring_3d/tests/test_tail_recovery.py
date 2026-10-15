@@ -1,7 +1,8 @@
 """path_seq under every spray_uniform selector, tail_recovery, its delay, its
 loss report guard, the receiver's count of what a tail request still misses,
 and the tail_loss_cancelled, tail_loss_delivered, tail_loss_ambiguous,
-tail_repair_rerouted and receiver_tail_missing counts."""
+tail_repair_rerouted, receiver_tail_missing and receiver_tail_missing_late
+counts with their breakdown by spine."""
 
 from __future__ import annotations
 
@@ -435,6 +436,40 @@ class TailRecoveryTest(unittest.TestCase):
         transport = _summarize_transport_events(ns3)
         self.assertEqual(transport["receiver_tail_missing_count"], 12)
         self.assertEqual(transport["tail_loss_delivered_count"], 7)
+        self.assertEqual(transport["receiver_tail_missing_late_count"], 0)
+        self.assertEqual(transport["receiver_tail_missing_by_spine"], {})
+
+    def test_receiver_tail_counts_break_down_by_spine(self) -> None:
+        ns3 = self.directory / "ns3"
+        ns3.mkdir()
+        summary = ns3 / "transport_summary.csv"
+        summary.write_text(
+            "event,plane,event_count,total_bytes\n"
+            "receiver_tail_missing,control,12,0\n"
+            "receiver_tail_missing_late,control,3,0\n"
+            "receiver_tail_missing_late_spine2,control,1,0\n"
+            "receiver_tail_missing_late_spine3,control,2,0\n"
+            "receiver_tail_missing_spine3,control,12,0\n",
+            encoding="utf-8",
+        )
+        transport = _summarize_transport_events(ns3)
+        self.assertEqual(transport["receiver_tail_missing_count"], 12)
+        self.assertEqual(transport["receiver_tail_missing_late_count"], 3)
+        self.assertEqual(transport["receiver_tail_missing_by_spine"], {3: 12})
+        self.assertEqual(
+            transport["receiver_tail_missing_late_by_spine"], {2: 1, 3: 2}
+        )
+        # The breakdown rows are no events of their own.
+        self.assertEqual(transport["event_count"], 15)
+        self.assertNotIn("receiver_tail_missing_spine3", transport["event_counts"])
+        for event in ("receiver_tail_missing_spinex", "tail_loss_delivered_spine3"):
+            summary.write_text(
+                f"event,plane,event_count,total_bytes\n{event},control,1,0\n",
+                encoding="utf-8",
+            )
+            with self.subTest(event=event):
+                with self.assertRaisesRegex(ValueError, "invalid transport event"):
+                    _summarize_transport_events(ns3)
 
 if __name__ == "__main__":
     unittest.main()

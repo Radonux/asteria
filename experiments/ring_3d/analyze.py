@@ -803,8 +803,23 @@ _HOST_TRANSPORT_EVENTS: Final = frozenset(
         "tail_loss_ambiguous",
         "tail_repair_rerouted",
         "receiver_tail_missing",
+        "receiver_tail_missing_late",
     }
 )
+
+# The receiver's tail counts, which the backend also breaks down by the
+# requested spine of each send, in a row per spine named after the event
+# with _spine<k> appended.
+_RECEIVER_TAIL_EVENTS: Final = ("receiver_tail_missing", "receiver_tail_missing_late")
+
+
+def _receiver_tail_spine_row(event: str) -> tuple[str, int] | None:
+    """The event and spine of a breakdown row of a receiver tail count, or
+    None for any other row."""
+    base, separator, spine = event.rpartition("_spine")
+    if separator and base in _RECEIVER_TAIL_EVENTS and spine.isdigit():
+        return base, int(spine)
+    return None
 
 _FORGIVEN_PAYLOAD_EVENTS: Final = frozenset(
     {"trim_forgiven", "remainder_forgiven"}
@@ -825,6 +840,7 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
     event_plane_counts: dict[str, dict[str, int]] = defaultdict(
         lambda: defaultdict(int)
     )
+    by_spine: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     valid_events = {
         "data_arrival",
         "data_deliver",
@@ -905,6 +921,8 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
         # after the request. No packet goes with it, so it is a count on the
         # control plane.
         "receiver_tail_missing",
+        # Such a send whose data packet or trimmed header arrived after all.
+        "receiver_tail_missing_late",
     }
     # Switch conversions only: trim_forgiven is the receiver's answer to one,
     # not a second conversion, and adding it would double-count the payload.
@@ -919,6 +937,17 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
     for row in iter_csv(path):
         event = row.get("event")
         plane = row.get("plane")
+        # A breakdown of events counted in their own rows, so no event of its
+        # own.
+        spine_row = _receiver_tail_spine_row(event or "")
+        if spine_row is not None:
+            if plane != "control":
+                raise ValueError("host transport reaction must ride the control plane")
+            spine_events = _as_int(row, "event_count")
+            if spine_events < 0:
+                raise ValueError("transport event totals must be nonnegative")
+            by_spine[spine_row[0]][spine_row[1]] += spine_events
+            continue
         if event not in valid_events or plane not in {"data", "control"}:
             raise ValueError("invalid transport event plane or event")
         if event.startswith("data_") and plane != "data":
@@ -1012,6 +1041,13 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
         "tail_loss_ambiguous_count": events["tail_loss_ambiguous"],
         "tail_repair_rerouted_count": events["tail_repair_rerouted"],
         "receiver_tail_missing_count": events["receiver_tail_missing"],
+        "receiver_tail_missing_late_count": events["receiver_tail_missing_late"],
+        "receiver_tail_missing_by_spine": dict(
+            sorted(by_spine["receiver_tail_missing"].items())
+        ),
+        "receiver_tail_missing_late_by_spine": dict(
+            sorted(by_spine["receiver_tail_missing_late"].items())
+        ),
         "cnp_taken_count": events["cnp_taken"],
         "clipped_trim_count": events["clipped_trim"],
         "trim_forgiven_count": events["trim_forgiven"],
