@@ -437,6 +437,7 @@ class Ring3DAnalysisTests(unittest.TestCase):
                 "tail_loss_cancelled",
                 "tail_loss_delivered",
                 "tail_loss_ambiguous",
+                "tail_repair_rerouted",
             ):
                 (ns3 / "transport_summary.csv").write_text(
                     f"event,plane,event_count,total_bytes\n{event},data,1,0\n",

@@ -88,7 +88,7 @@ Profiles are strict JSON input validated by `generate.py`; unknown fields fail.
 | `network.load_balancing.path_seq` | `spray_uniform`, with any selector or none: whether every data packet carries its queue pair's count of the packets sent before it up its requested spine, from which the receiver counts the packets missing per carrying spine | Absent (false) | Boolean; writes `SPRAY_PATH_SEQ on` or `off`, only when set, as does the manifest; refused under every other mode |
 | `network.load_balancing.tail_recovery` | `spray_uniform`, with any selector or none, and `path_seq: true`: whether a message's last new data packet and every repair after it close their spine and carry the queue pair's count of the data packets sent up each spine, from which the receiver requests each run of missing path sequences and the sender repairs them | Absent (false) | Boolean; writes `SPRAY_TAIL_RECOVERY on` or `off`, only when set, as does the manifest. Requires `path_seq: true`, at most 8 spines and, as every `spray_uniform` run does, `transport_recovery.selective_repair`, as the backend does; refused under every other mode |
 | `network.load_balancing.tail_recovery_delay_ns` | `tail_recovery: true`: the nanoseconds the receiver waits after a closing packet shows a run missing before it requests what of the run is still missing; 0 requests at once | Absent (the fabric's largest base RTT between two hosts) | Nonnegative integer below 2^64 - 1; writes `SPRAY_TAIL_RECOVERY_DELAY_NS`, only when set, as does the manifest; refused without `tail_recovery: true` |
-| `network.load_balancing.tail_loss_rtts` | `tail_recovery: true`: the base RTTs after which a send a tail repair request declares lost, repaired at once, is reported lost to the path selector; a trim notification for that send in that time cancels the report, counted as `tail_loss_cancelled`, as does an acknowledgement of that send along its path, counted as `tail_loss_delivered`, or as `tail_loss_ambiguous` when a repair of it had gone out along the same path, and 0 reports at once | Absent (1) | Nonnegative number; writes `SPRAY_TAIL_LOSS_RTTS`, only when set, after `SPRAY_TAIL_RECOVERY_DELAY_NS`'s place, as does the manifest; refused without `tail_recovery: true` |
+| `network.load_balancing.tail_loss_rtts` | `tail_recovery: true`: the base RTTs after which a send a tail repair request declares lost, repaired at once, is reported lost to the path selector; a trim notification for that send in that time cancels the report, counted as `tail_loss_cancelled`, as does an acknowledgement of that send along its path, counted as `tail_loss_delivered`, or as `tail_loss_ambiguous` when a repair of it had gone out along the same path; a repair whose path choice is that send's path is chosen again, up to once per spine, counted as `tail_repair_rerouted` when it then goes out along another path, and 0 reports at once | Absent (1) | Nonnegative number; writes `SPRAY_TAIL_LOSS_RTTS`, only when set, after `SPRAY_TAIL_RECOVERY_DELAY_NS`'s place, as does the manifest; refused without `tail_recovery: true` |
 | `network.load_balancing.ack_loss_rtts` | `spray_uniform`, with any selector or none: the base RTTs after a later cumulative acknowledgement covers a send whose own acknowledgement never arrived at which that send is declared an acknowledgement loss on its spine, to the path selector and the loss hold; nothing is repaired, and each declaration is counted as `ack_loss_declared` | Absent (0, none declared) | Positive number; writes `SPRAY_ACK_LOSS_RTTS`, only when set, after the selector's keys, `path_seq` and `tail_recovery`, as does the manifest; refused under every other mode |
 | `network.load_balancing.receiver_hold` | Loss hold selectors with `path_seq: true`: whether each receiving host holds a spine for one sender leaf, or for every one once `hold_auto_leaves` sender leaves have a missing packet on it, reports its holds in a bitmap in every acknowledgement, and the senders hold those spines toward its leaf, with the loss hold's exclusion and sentinels | Absent (false) | Boolean; writes `SPRAY_RECEIVER_HOLD on` or `off`, only when set, and with it on `RECEIVER_HOLD_OUTPUT_FILE`. Requires `path_seq: true` and at most 8 spines, as the backend does |
 | `network.load_balancing.receiver_hold_clean` | Loss hold selectors with `receiver_hold: true`: the consecutive arrivals without a missing packet on a held spine that release the receiver's hold | Absent (1024) | Positive integer; writes `SPRAY_RECEIVER_HOLD_CLEAN`, only when set; refused without `receiver_hold` |
@@ -221,7 +221,7 @@ a naturally emitted framework burst or as packet loss.
   `first_trim_to_first_repair_ns`, separates a repair-driven tail from a
   congestion-control-driven one.
 - `rto_fired`, `cnp_taken`, `ack_loss_declared`, `tail_loss_cancelled`,
-  `tail_loss_delivered` and `tail_loss_ambiguous` in
+  `tail_loss_delivered`, `tail_loss_ambiguous` and `tail_repair_rerouted` in
   `transport_summary.csv` are host-transport reactions, not packets. They ride
   the control plane and carry zero bytes. `ack_loss_declared` counts the sends
   `ack_loss_rtts` declared lost on their spines; `summary.json` reports it as
@@ -234,7 +234,11 @@ a naturally emitted framework burst or as packet loss.
   arrived after the request, and `tail_loss_ambiguous` those whose
   acknowledgement may be that of a repair sent along the same path;
   `summary.json` reports them as `tail_loss_delivered_count` and
-  `tail_loss_ambiguous_count`, zero when none was.
+  `tail_loss_ambiguous_count`, zero when none was. `tail_repair_rerouted`
+  counts the repairs of such sends that the path selector chose again, up to
+  once per spine, because its choice was the declared send's path, and that
+  then went out along another path; `summary.json` reports it as
+  `tail_repair_rerouted_count`, zero when none was.
   `trim_forgiven` is the receiver's answer to a switch's trim, not a second
   conversion: it rides the data plane with the payload bytes it released, and
   it is excluded from the packet-trimming conversion counts.

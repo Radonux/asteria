@@ -1187,7 +1187,8 @@ def _tail_recovery_delay_ns(value: Any, field: str) -> int:
 # tail_loss_rtts, read only with tail_recovery, the base RTTs a send a repair
 # request declares lost waits before its loss is reported to the path
 # selector, a trim of it or an acknowledgement of it along its path in that
-# time cancelling the report, absent 1.
+# time cancelling the report, its repair chosen again off its path where the
+# selector offers another, absent 1.
 PATH_SEQ_KEY = BalancingParameter("path_seq", "SPRAY_PATH_SEQ", False, _flag, _on_off)
 TAIL_RECOVERY_KEYS: tuple[BalancingParameter, ...] = (
     BalancingParameter(

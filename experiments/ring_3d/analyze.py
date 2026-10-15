@@ -801,6 +801,7 @@ _HOST_TRANSPORT_EVENTS: Final = frozenset(
         "tail_loss_cancelled",
         "tail_loss_delivered",
         "tail_loss_ambiguous",
+        "tail_repair_rerouted",
     }
 )
 
@@ -895,6 +896,9 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
         # The same, where a repair of the send had already gone out along the
         # declared path, so the acknowledgement may be the repair's.
         "tail_loss_ambiguous",
+        # A repair of such a send the path selector chose again because its
+        # first choice was the declared send's path, sent along another path.
+        "tail_repair_rerouted",
     }
     # Switch conversions only: trim_forgiven is the receiver's answer to one,
     # not a second conversion, and adding it would double-count the payload.
@@ -1000,6 +1004,7 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
         "tail_loss_cancelled_count": events["tail_loss_cancelled"],
         "tail_loss_delivered_count": events["tail_loss_delivered"],
         "tail_loss_ambiguous_count": events["tail_loss_ambiguous"],
+        "tail_repair_rerouted_count": events["tail_repair_rerouted"],
         "cnp_taken_count": events["cnp_taken"],
         "clipped_trim_count": events["clipped_trim"],
         "trim_forgiven_count": events["trim_forgiven"],
