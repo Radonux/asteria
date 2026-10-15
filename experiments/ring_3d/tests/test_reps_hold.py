@@ -22,6 +22,7 @@ HOLD = {
     "held_exploration": "sentinel",
 }
 FLOW_HOLD = {**HOLD, "selector": "reps_flow_hold"}
+MRC_HOLD = {**HOLD, "selector": "mrc_hold"}
 ORACLE = {
     "mode": "spray_uniform",
     "selector": "reps_oracle",
@@ -118,6 +119,25 @@ class RepsSpineSelectorTest(unittest.TestCase):
         self.assertIn("\nSPRAY_HOLD_SCOPE leaf\n", config)
         self.assertEqual(manifest["load_balancing"]["hold_scope"], "leaf")
         self.assertIn("SPINE_LOSS_OUTPUT_FILE", manifest["counter_files"])
+
+    def test_pair_scope_is_written_when_set(self) -> None:
+        for hold in (HOLD, MRC_HOLD):
+            with self.subTest(selector=hold["selector"]):
+                manifest, config, _ = self.generated({**hold, "hold_scope": "pair"})
+                self.assertIn("\nSPRAY_HOLD_SCOPE pair\n", config)
+                self.assertNotIn("SPRAY_HOLD_AUTO_LEAVES", config)
+                self.assertEqual(manifest["load_balancing"]["hold_scope"], "pair")
+                self.assertIn("SPINE_LOSS_OUTPUT_FILE", manifest["counter_files"])
+        manifest, config, _ = self.generated(
+            {
+                **HOLD,
+                "hold_scope": "pair",
+                "path_seq": True,
+                "receiver_hold": True,
+                "hold_auto_leaves": 3,
+            }
+        )
+        self.assertIn("\nSPRAY_HOLD_SCOPE pair\nSPRAY_HOLD_AUTO_LEAVES 3\n", config)
 
     def test_reps_hold_auto_scope_is_written_when_set(self) -> None:
         manifest, config, _ = self.generated(
@@ -242,11 +262,12 @@ class RepsSpineSelectorTest(unittest.TestCase):
         refusals += [
             (
                 {**HOLD, "hold_scope": "rack"},
-                "hold_scope must be 'host', 'leaf' or 'auto'",
+                "hold_scope must be 'host', 'leaf', 'auto' or 'pair'",
             ),
             ({**FLOW_HOLD, "hold_scope": "host"}, "'reps_flow_hold' does not take"),
             ({**FLOW_HOLD, "hold_scope": "leaf"}, "'reps_flow_hold' does not take"),
             ({**FLOW_HOLD, "hold_scope": "auto"}, "'reps_flow_hold' does not take"),
+            ({**FLOW_HOLD, "hold_scope": "pair"}, "'reps_flow_hold' does not take"),
             (
                 {**FLOW_HOLD, "hold_auto_leaves": 2},
                 "'reps_flow_hold' does not take",
@@ -256,7 +277,7 @@ class RepsSpineSelectorTest(unittest.TestCase):
                     {**HOLD, "hold_scope": scope, "hold_auto_leaves": 2},
                     "hold_auto_leaves requires hold_scope 'auto'",
                 )
-                for scope in ("host", "leaf")
+                for scope in ("host", "leaf", "pair")
             ),
             *(
                 (

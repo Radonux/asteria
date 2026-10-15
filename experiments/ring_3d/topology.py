@@ -75,8 +75,8 @@ SPINE_SELECTORS = (
     "reps_spine",
 )
 # The spine selectors that keep a loss hold: per host, per destination leaf,
-# or per spine either of the two under hold_scope, for reps_hold and
-# mrc_hold; per queue pair for reps_flow_hold.
+# per spine either of the two, or per destination host under hold_scope, for
+# reps_hold and mrc_hold; per queue pair for reps_flow_hold.
 LOSS_HOLD_SELECTORS = ("reps_hold", "reps_flow_hold", "mrc_hold")
 # The loss hold selectors that read hold_scope and write the host's loss
 # trace.
@@ -861,8 +861,8 @@ def _held_exploration(value: Any, field: str) -> str:
 
 
 def _hold_scope(value: Any, field: str) -> str:
-    if value not in ("host", "leaf", "auto"):
-        raise ValueError(f"{field} must be 'host', 'leaf' or 'auto'")
+    if value not in ("host", "leaf", "auto", "pair"):
+        raise ValueError(f"{field} must be 'host', 'leaf', 'auto' or 'pair'")
     return value
 
 
@@ -1231,7 +1231,8 @@ RECEIVER_TAIL_MISSING_KEY = BalancingParameter(
 # held exploration the backend requires, and the clean sentinels it requires
 # under hold_release sentinels; then the keys written only when set.
 # hold_scope, read by reps_hold and mrc_hold, keys the hold by host, by
-# destination leaf, or per spine by either, auto, the backend's default;
+# destination leaf, per spine by either, auto, the backend's default, or by
+# destination host, pair;
 # hold_auto_leaves, read only under auto or with receiver_hold, is the
 # destination leaves (the sender leaves at the receiver) with a loss on a
 # spine from which the hold covers every one. hold_rule, the hold test's
