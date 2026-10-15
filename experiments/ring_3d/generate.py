@@ -390,10 +390,26 @@ class Incast:
 
 
 @dataclass(frozen=True)
+class Combine:
+    """A second all-to-all in every iteration: after a compute of
+    ``expert_compute_ns``, every member sends ``combine_bytes`` to every
+    other member."""
+
+    combine_bytes: int
+    expert_compute_ns: int
+
+    def collective_bytes(self, group_size: int) -> int:
+        """The combine's comm_size, as AllToAll.collective_bytes."""
+        return self.combine_bytes * group_size
+
+
+@dataclass(frozen=True)
 class AllToAll:
     """Every member of the group runs ``iterations`` native all-to-all
     collectives, each sending ``message_bytes`` to every other member, with a
-    compute of ``compute_ns`` between consecutive iterations.
+    compute of ``compute_ns`` between consecutive iterations. With a
+    ``combine``, each iteration is that all-to-all, the combine's compute and
+    the combine's all-to-all, in a chain.
 
     ``leaves`` None is every host; otherwise the group is every host on the
     listed leaves, in rank order.
@@ -403,6 +419,7 @@ class AllToAll:
     iterations: int
     compute_ns: int
     leaves: tuple[int, ...] | None = None
+    combine: Combine | None = None
 
     def members(self, ranks: int, hosts_per_leaf: int | None) -> tuple[int, ...]:
         if self.leaves is None:
@@ -474,13 +491,18 @@ class Workload:
                 "message_bytes": self.incast.message_bytes,
             }
         if self.all_to_all is not None:
-            return {
+            manifest: dict[str, Any] = {
                 "kind": self.kind,
                 "group": self.all_to_all.manifest_group(),
                 "message_bytes": self.all_to_all.message_bytes,
                 "iterations": self.all_to_all.iterations,
                 "compute_ns": self.all_to_all.compute_ns,
             }
+            combine = self.all_to_all.combine
+            if combine is not None:
+                manifest["combine_bytes"] = combine.combine_bytes
+                manifest["expert_compute_ns"] = combine.expert_compute_ns
+            return manifest
         return {"kind": self.kind}
 
 
@@ -733,13 +755,26 @@ def _load_incast(value: dict[str, Any]) -> Incast:
     )
 
 
+def _compute_duration_ns(value: Any, field: str) -> int:
+    duration = _require_nonnegative_int(value, field)
+    # A Chakra compute node's duration is whole microseconds.
+    if duration % 1_000:
+        raise ValueError(f"{field} must be a multiple of 1000")
+    return duration
+
+
 def _load_all_to_all(value: dict[str, Any]) -> AllToAll:
     """The all-to-all's keys; the group and the sizes are bounded by the
     fabric later."""
-    if set(value) != {"kind", "group", "message_bytes", "iterations", "compute_ns"}:
+    required = {"kind", "group", "message_bytes", "iterations", "compute_ns"}
+    combine_keys = {"combine_bytes", "expert_compute_ns"}
+    # The combine's two keys come together: the compute is what separates
+    # the iteration's two all-to-alls.
+    if set(value) not in (required, required | combine_keys):
         raise ValueError(
             "workload.kind 'all_to_all' must contain exactly "
-            "['compute_ns', 'group', 'iterations', 'kind', 'message_bytes']"
+            "['compute_ns', 'group', 'iterations', 'kind', 'message_bytes'], "
+            "and may contain ['combine_bytes', 'expert_compute_ns'] together"
         )
     group = value["group"]
     if group == "all":
@@ -758,17 +793,25 @@ def _load_all_to_all(value: dict[str, Any]) -> AllToAll:
         )
         if len(set(leaves)) != len(leaves):
             raise ValueError("workload.group.leaves must be distinct")
-    compute_ns = _require_nonnegative_int(value["compute_ns"], "workload.compute_ns")
-    # A Chakra compute node's duration is whole microseconds.
-    if compute_ns % 1_000:
-        raise ValueError("workload.compute_ns must be a multiple of 1000")
     return AllToAll(
         message_bytes=_require_positive_int(
             value["message_bytes"], "workload.message_bytes"
         ),
         iterations=_require_positive_int(value["iterations"], "workload.iterations"),
-        compute_ns=compute_ns,
+        compute_ns=_compute_duration_ns(value["compute_ns"], "workload.compute_ns"),
         leaves=leaves,
+        combine=(
+            Combine(
+                combine_bytes=_require_positive_int(
+                    value["combine_bytes"], "workload.combine_bytes"
+                ),
+                expert_compute_ns=_compute_duration_ns(
+                    value["expert_compute_ns"], "workload.expert_compute_ns"
+                ),
+            )
+            if "combine_bytes" in value
+            else None
+        ),
     )
 
 
@@ -1212,21 +1255,37 @@ def _check_all_to_all(all_to_all: AllToAll, profile: Profile) -> None:
             "workload.kind 'all_to_all' runs one iteration per step and needs "
             "steps equal to workload.iterations"
         )
-    # The system layer cuts the collective into PREFERRED_DATASET_SPLITS
+    # The system layer cuts each collective into PREFERRED_DATASET_SPLITS
     # chunks and each chunk into group_size messages, one per member, with
     # integer division; a chunk below the rank count is resized. Either would
-    # send a pair other than message_bytes.
-    if all_to_all.message_bytes % PREFERRED_DATASET_SPLITS:
-        raise ValueError(
-            "workload.message_bytes must be a multiple of "
-            f"{PREFERRED_DATASET_SPLITS} for 'all_to_all'"
+    # send a pair other than its bytes per pair.
+    collectives = [
+        (
+            "message_bytes",
+            all_to_all.message_bytes,
+            all_to_all.collective_bytes(group_size),
         )
-    chunk_bytes = all_to_all.collective_bytes(group_size) // PREFERRED_DATASET_SPLITS
-    if chunk_bytes < profile.ranks:
-        raise ValueError(
-            "workload.message_bytes times the group size must be at least "
-            f"{PREFERRED_DATASET_SPLITS} times the rank count for 'all_to_all'"
+    ]
+    combine = all_to_all.combine
+    if combine is not None:
+        collectives.append(
+            (
+                "combine_bytes",
+                combine.combine_bytes,
+                combine.collective_bytes(group_size),
+            )
         )
+    for field, pair_bytes, comm_size in collectives:
+        if pair_bytes % PREFERRED_DATASET_SPLITS:
+            raise ValueError(
+                f"workload.{field} must be a multiple of "
+                f"{PREFERRED_DATASET_SPLITS} for 'all_to_all'"
+            )
+        if comm_size // PREFERRED_DATASET_SPLITS < profile.ranks:
+            raise ValueError(
+                f"workload.{field} times the group size must be at least "
+                f"{PREFERRED_DATASET_SPLITS} times the rank count for 'all_to_all'"
+            )
 
 
 def all_to_all_members(profile: Profile) -> tuple[int, ...]:
@@ -1841,14 +1900,18 @@ class TraceWriter:
         """A member's chain of all-to-all collectives over the group, the i-th
         carrying training step i and no domain, each after the previous one
         and, when compute_ns is positive, a compute of that length between
-        them. A rank outside the group gets one compute node of zero
-        duration with no dependencies, as an idle incast rank does."""
+        them. A combine adds, after each, its compute when positive and its
+        all-to-all, which carries the same training step, so the step's
+        collective rows span the whole iteration. A rank outside the group
+        gets one compute node of zero duration with no dependencies, as an
+        idle incast rank does."""
         members = all_to_all_members(self.profile)
         if self.rank not in members:
             self.compute("all_to_all_idle", [])
             return
         group_id = all_to_all_group_id(self.profile)
         assert group_id is not None
+        combine = all_to_all.combine
         predecessor: int | None = None
         for iteration in range(1, all_to_all.iterations + 1):
             if predecessor is not None and all_to_all.compute_ns:
@@ -1863,6 +1926,23 @@ class TraceWriter:
                 ALL_TO_ALL,
                 group_id,
                 all_to_all.collective_bytes(len(members)),
+                iteration,
+                None,
+            )
+            if combine is None:
+                continue
+            if combine.expert_compute_ns:
+                predecessor = self.compute(
+                    f"iteration_{iteration}_expert_compute",
+                    [predecessor],
+                    combine.expert_compute_ns // 1_000,
+                )
+            predecessor = self.collective(
+                f"iteration_{iteration}_combine_all_to_all",
+                [predecessor],
+                ALL_TO_ALL,
+                group_id,
+                combine.collective_bytes(len(members)),
                 iteration,
                 None,
             )
