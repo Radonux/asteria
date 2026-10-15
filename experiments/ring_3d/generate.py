@@ -2070,6 +2070,10 @@ def write_network_config(
         f"RATE_HAI {rate_hai_bps}bps\n"
         f"MIN_RATE {min_rate_bps}bps\n"
     )
+    if congestion_control.window_state is not None:
+        congestion_settings += (
+            f"NSCC_WINDOW_STATE {congestion_control.window_state}\n"
+        )
     if packet_trimming is None:
         trim_settings = "PACKET_TRIM_MODE disabled\n"
     else:

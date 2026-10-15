@@ -357,6 +357,48 @@ class Ring3DGeneratorTests(unittest.TestCase):
                     self.assertIn(f"\nLOAD_BALANCING {mode}\n", config)
                     self.assertIn("\nHAS_WIN 1\n", config)
 
+    def test_congestion_control_nscc_window_state(self) -> None:
+        document = json.loads(
+            (
+                REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
+            ).read_text(encoding="utf-8")
+        )
+        document["network"]["load_balancing"] = {"mode": "spray_uniform"}
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile_path = Path(temporary_directory) / "profile.json"
+            for state in ("connection", "message", None):
+                control = {"mode": "nscc"}
+                if state is not None:
+                    control["window_state"] = state
+                document["network"]["congestion_control"] = control
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                output = Path(temporary_directory) / str(state)
+                manifest = materialize(profile_path, output)
+                config = (output / "network_config.txt").read_text(encoding="utf-8")
+                with self.subTest(state=state):
+                    if state is None:
+                        self.assertNotIn("NSCC_WINDOW_STATE", config)
+                        self.assertNotIn("window_state", manifest["congestion_control"])
+                    else:
+                        self.assertIn(
+                            f"\nMIN_RATE 200000000bps\nNSCC_WINDOW_STATE {state}\n",
+                            config,
+                        )
+                        self.assertEqual(
+                            manifest["congestion_control"]["window_state"], state
+                        )
+            for control, message in (
+                ({"mode": "nscc", "window_state": "flow"}, "must be 'message' or"),
+                ({"mode": "nscc", "window_state": True}, "must be 'message' or"),
+                ({"mode": "dcqcn", "window_state": "connection"}, "requires mode 'nscc'"),
+                ({"mode": "none", "window_state": "message"}, "requires mode 'nscc'"),
+            ):
+                document["network"]["congestion_control"] = control
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                with self.subTest(control=control):
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_profile(profile_path)
+
     def test_congestion_control_nscc_refuses_ecmp(self) -> None:
         """NSCC needs an acknowledgement per packet, which ECMP does not send."""
         ring_path = (

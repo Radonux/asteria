@@ -170,7 +170,10 @@ class CongestionControl:
     The three rates are DCQCN's and are fractions of the link rate rather than
     absolute literals, so a profile keeps its intended aggressiveness at any
     link speed. ``ecn_threshold_scale`` multiplies every switch KMIN and KMAX
-    threshold and leaves the marking probability alone.
+    threshold and leaves the marking probability alone. ``window_state``,
+    under ``nscc`` alone, keeps NSCC's window per queue pair, ``message``, or
+    per destination and priority group across the queue pairs to it,
+    ``connection``; None when the profile leaves it out.
     """
 
     mode: str
@@ -178,6 +181,7 @@ class CongestionControl:
     rate_hai_fraction: float = DEFAULT_RATE_HAI_FRACTION
     min_rate_fraction: float = DEFAULT_MIN_RATE_FRACTION
     ecn_threshold_scale: float = 1.0
+    window_state: str | None = None
 
     @property
     def cc_mode(self) -> int:
@@ -207,7 +211,7 @@ class CongestionControl:
 
     def manifest(self, link_rate: str) -> dict[str, str | int | float]:
         rate_ai, rate_hai, min_rate = self.rates_bps(link_rate)
-        return {
+        recorded: dict[str, str | int | float] = {
             "mode": self.mode,
             "cc_mode": self.cc_mode,
             "rate_ai_fraction": self.rate_ai_fraction,
@@ -218,6 +222,9 @@ class CongestionControl:
             "rate_hai_bps": rate_hai,
             "min_rate_bps": min_rate,
         }
+        if self.window_state is not None:
+            recorded["window_state"] = self.window_state
+        return recorded
 
 
 @dataclass(frozen=True)
@@ -628,6 +635,7 @@ def _load_congestion_control(document: dict[str, Any]) -> CongestionControl:
         "rate_hai_fraction",
         "min_rate_fraction",
         "ecn_threshold_scale",
+        "window_state",
     }
     if not isinstance(control, dict) or not {"mode"} <= set(control) <= (
         {"mode"} | optional
@@ -672,6 +680,18 @@ def _load_congestion_control(document: dict[str, Any]) -> CongestionControl:
             "network.congestion_control.ecn_threshold_scale must be a positive "
             "number that keeps every threshold at least 1 KB"
         )
+    window_state = control.get("window_state")
+    if "window_state" in control:
+        if window_state not in ("message", "connection"):
+            raise ValueError(
+                "network.congestion_control.window_state must be 'message' or "
+                "'connection'"
+            )
+        # The backend keeps the other modes' state per queue pair.
+        if mode != "nscc":
+            raise ValueError(
+                "network.congestion_control.window_state requires mode 'nscc'"
+            )
     return CongestionControl(
         mode=mode,
         rate_ai_fraction=rate_ai,
@@ -681,6 +701,7 @@ def _load_congestion_control(document: dict[str, Any]) -> CongestionControl:
             "network.congestion_control.min_rate_fraction",
         ),
         ecn_threshold_scale=float(scale),
+        window_state=window_state,
     )
 
 
