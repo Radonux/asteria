@@ -1067,15 +1067,18 @@ def _duplicate_report_value(value: ParameterValue) -> str:
     return "retract" if value == "retract" else _on_off(value)
 
 
+OVERDUE_REPAIRS = ("evidence", "probe", "reprobe")
+
+
 def _overdue_repair(value: Any, field: str) -> bool | str:
-    if value is not False and value not in ("evidence", "probe"):
-        raise ValueError(f"{field} must be 'evidence', 'probe' or false")
+    if value is not False and value not in OVERDUE_REPAIRS:
+        raise ValueError(f"{field} must be 'evidence', 'probe', 'reprobe' or false")
     return value
 
 
 def _overdue_repair_value(value: ParameterValue) -> str:
-    """SPRAY_OVERDUE_REPAIR's evidence, probe or off."""
-    return value if value in ("evidence", "probe") else "off"
+    """SPRAY_OVERDUE_REPAIR's evidence, probe, reprobe or off."""
+    return value if value in OVERDUE_REPAIRS else "off"
 
 
 def _hold_auto_leaves(value: Any, field: str) -> int:
@@ -1498,8 +1501,9 @@ RECEIVER_TAIL_MISSING_KEY = BalancingParameter(
 # destination leaves (the sender leaves at the receiver) with a loss on a
 # spine from which the hold covers every one. hold_rule, the hold test's
 # probabilities, hold_release with hold_trickle, sentinel_mode,
-# held_loss_rtts with overdue_repair, path_seq and receiver_hold with
-# receiver_hold_clean take the backend's defaults when absent; the backend reads loss_p0, loss_p1 and
+# held_loss_rtts with overdue_repair and overdue_repair_limit, path_seq and
+# receiver_hold with receiver_hold_clean take the backend's defaults when
+# absent; the backend reads loss_p0, loss_p1 and
 # hold_alpha only under hold_rule llr or hold_release trickle, hold_beta only
 # under llr.
 LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
@@ -1538,6 +1542,9 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
     ),
     BalancingParameter(
         "overdue_repair", "SPRAY_OVERDUE_REPAIR", False, _overdue_repair, _overdue_repair_value
+    ),
+    BalancingParameter(
+        "overdue_repair_limit", "SPRAY_OVERDUE_REPAIR_LIMIT", 2, _positive_int
     ),
     PATH_SEQ_KEY,
     BalancingParameter("receiver_hold", "SPRAY_RECEIVER_HOLD", False, _flag, _on_off),
@@ -1624,6 +1631,7 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "sentinel_mode",
     "held_loss_rtts",
     "overdue_repair",
+    "overdue_repair_limit",
     "path_seq",
     "receiver_hold",
     "receiver_hold_clean",
@@ -1994,11 +2002,15 @@ def _load_loss_hold_selector(
             "held_exploration 'sentinel'"
         )
     _require_hold_test(balancing, values, trickle)
-    if values.get("overdue_repair") in ("evidence", "probe") and not (
+    if values.get("overdue_repair") in OVERDUE_REPAIRS and not (
         values.get("held_loss_rtts", 2) > 0
     ):
         raise ValueError(
             "network.load_balancing.overdue_repair requires held_loss_rtts above 0"
+        )
+    if "overdue_repair_limit" in balancing and values.get("overdue_repair") != "reprobe":
+        raise ValueError(
+            "network.load_balancing.overdue_repair_limit requires overdue_repair 'reprobe'"
         )
     receiver_hold = values.get("receiver_hold") is True
     if receiver_hold and values.get("path_seq") is not True:
