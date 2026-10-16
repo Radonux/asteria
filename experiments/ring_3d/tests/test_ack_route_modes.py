@@ -1,5 +1,5 @@
-"""ack_route reverse_set and repath, with ack_route_set_size, under
-spray_uniform."""
+"""ack_route reverse_set and repath, with ack_route_set_size and
+ack_route_set_probe_rtts and ack_route_set_reply, under spray_uniform."""
 
 from __future__ import annotations
 
@@ -56,6 +56,18 @@ class AckRouteModesTest(unittest.TestCase):
                                                    "ack_route_set_size": 3})
                 self.assertIn("\nACK_ROUTE reverse_set\nACK_ROUTE_SET_SIZE 3\n", config)
                 self.assertEqual(manifest["load_balancing"]["ack_route_set_size"], 3)
+                self.assertNotIn("ACK_ROUTE_SET_PROBE_RTTS", config)
+                manifest, config = self.generated({**balancing, "ack_route": "reverse_set",
+                                                   "ack_route_set_size": 4, "ack_route_set_probe_rtts": 16})
+                self.assertIn("\nACK_ROUTE reverse_set\nACK_ROUTE_SET_SIZE 4\nACK_ROUTE_SET_PROBE_RTTS 16.0\n",
+                              config)
+                self.assertEqual(manifest["load_balancing"]["ack_route_set_probe_rtts"], 16.0)
+                self.assertNotIn("ACK_ROUTE_SET_REPLY", config)
+                manifest, config = self.generated({**balancing, "ack_route": "reverse_set",
+                                                   "ack_route_set_probe_rtts": 4, "ack_route_set_reply": "answer"})
+                self.assertIn("\nACK_ROUTE reverse_set\nACK_ROUTE_SET_PROBE_RTTS 4.0\nACK_ROUTE_SET_REPLY answer\n",
+                              config)
+                self.assertEqual(manifest["load_balancing"]["ack_route_set_reply"], "answer")
                 manifest, config = self.generated({**balancing, "ack_route": "repath",
                                                    "coverage_first": True})
                 self.assertIn("\nACK_ROUTE repath\n", config)
@@ -72,6 +84,13 @@ class AckRouteModesTest(unittest.TestCase):
              "ack_route_set_size requires ack_route 'reverse_set'"),
             ({**HOLD, "ack_route_set_size": 2}, "ack_route_set_size requires ack_route 'reverse_set'"),
             ({**HOLD, "ack_route": "reverse_set", "ack_route_set_size": 0}, "ack_route_set_size"),
+            ({**HOLD, "ack_route": "spray", "ack_route_set_probe_rtts": 4},
+             "ack_route_set_probe_rtts requires ack_route 'reverse_set'"),
+            ({**HOLD, "ack_route": "reverse_set", "ack_route_set_probe_rtts": 0}, "ack_route_set_probe_rtts"),
+            ({**HOLD, "ack_route": "spray", "ack_route_set_reply": "answer"},
+             "ack_route_set_reply requires ack_route 'reverse_set'"),
+            ({**HOLD, "ack_route": "reverse_set", "ack_route_set_reply": "control"},
+             "ack_route_set_reply must be 'data' or 'answer'"),
             ({**HOLD, "tail_recovery": False, "ack_route": "repath"}, "'repath' requires tail_recovery true"),
             ({"mode": "spray_uniform", "path_seq": True, "ack_route": "repath"},
              "'repath' requires tail_recovery true"),

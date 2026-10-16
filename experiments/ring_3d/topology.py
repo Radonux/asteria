@@ -992,6 +992,12 @@ def _ack_route(value: Any, field: str) -> str:
     return value
 
 
+def _ack_route_set_reply(value: Any, field: str) -> str:
+    if value not in ("data", "answer"):
+        raise ValueError(f"{field} must be 'data' or 'answer'")
+    return value
+
+
 def _copy_expiry(value: Any, field: str) -> str:
     if value not in ("data_ack", "deadline"):
         raise ValueError(f"{field} must be 'data_ack' or 'deadline'")
@@ -1393,11 +1399,16 @@ PATH_STATE_KEY = BalancingParameter(
 # data_spine, or one the receiver draws uniformly per answer, spray; absent,
 # data_spine; or per connection, a sending host and priority group, a member
 # drawn per answer of a set of ack_route_set_size spines the receiver probes
-# once per base RTT and renews, reverse_set, or one spine the receiver draws
+# once per ack_route_set_probe_rtts base RTTs and renews, reverse_set, or one
+# spine the receiver draws
 # again at each duplicate data arrival, repath. ack_route_oracle, read only
 # under spray, leaves out of the draw the spines over which an answer toward
 # the sender's leaf crosses a fault the switches' state shows, from its onset;
-# absent, false. ack_route_set_size, read only under reverse_set; absent, 2.
+# absent, false. ack_route_set_size and ack_route_set_probe_rtts, read only
+# under reverse_set; absent, 2 and 1. ack_route_set_reply, read only under
+# reverse_set: how the switches queue the sender's return of a probe, data,
+# in its priority group's queue as a path probe, or answer, as the answers;
+# absent, data.
 ACK_ROUTE_KEYS: tuple[BalancingParameter, ...] = (
     BalancingParameter("ack_route", "ACK_ROUTE", "data_spine", _ack_route),
     BalancingParameter(
@@ -1405,6 +1416,12 @@ ACK_ROUTE_KEYS: tuple[BalancingParameter, ...] = (
     ),
     BalancingParameter(
         "ack_route_set_size", "ACK_ROUTE_SET_SIZE", 2, _positive_int
+    ),
+    BalancingParameter(
+        "ack_route_set_probe_rtts", "ACK_ROUTE_SET_PROBE_RTTS", 1.0, _positive_number
+    ),
+    BalancingParameter(
+        "ack_route_set_reply", "ACK_ROUTE_SET_REPLY", "data", _ack_route_set_reply
     ),
 )
 # stray_path_seq, after ack_route_oracle, read only with path_seq true: how
@@ -1652,6 +1669,8 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "ack_route",
     "ack_route_oracle",
     "ack_route_set_size",
+    "ack_route_set_probe_rtts",
+    "ack_route_set_reply",
     "copy_expiry",
     "stray_path_seq",
     "coverage_first",
@@ -1817,6 +1836,7 @@ def _load_uniform_draw(
             "takes no other key than path_seq, tail_recovery, "
             "tail_recovery_delay_ns, tail_loss_rtts, ack_loss_rtts, "
             "path_state, ack_route, ack_route_oracle, ack_route_set_size, "
+            "ack_route_set_probe_rtts, ack_route_set_reply, "
             "stray_path_seq, coverage_first, duplicate_report, overdue_repair "
             "and overdue_repair_limit; a selector "
             "and its parameters require mode 'ev_hash', or mode 'spray_uniform' "
@@ -1858,7 +1878,8 @@ def _spray_uniform_keys(
 ) -> tuple[tuple[str, ParameterValue], ...]:
     """path_seq, tail_recovery, tail_recovery_delay_ns, tail_loss_rtts,
     ack_loss_rtts, path_state, ack_route, ack_route_oracle, ack_route_set_size,
-    stray_path_seq, coverage_first and duplicate_report as given, each only
+    ack_route_set_probe_rtts, ack_route_set_reply, stray_path_seq,
+    coverage_first and duplicate_report as given, each only
     when set, refused where the backend refuses them."""
     parsed = _parsed(
         balancing,
@@ -1891,21 +1912,19 @@ def _require_ack_route(
     balancing: dict[str, Any], values: dict[str, ParameterValue]
 ) -> None:
     """ack_route_oracle is read only under ack_route spray and
-    ack_route_set_size only under reverse_set, and repath tells a copied send
+    ack_route_set_size, ack_route_set_probe_rtts and ack_route_set_reply only
+    under reverse_set, and repath tells a copied send
     by the tail flags tail_recovery puts on the wire, as the backend reads
     them."""
     if "ack_route_oracle" in balancing and values.get("ack_route") != "spray":
         raise ValueError(
             "network.load_balancing.ack_route_oracle requires ack_route 'spray'"
         )
-    if (
-        "ack_route_set_size" in balancing
-        and values.get("ack_route") != "reverse_set"
-    ):
-        raise ValueError(
-            "network.load_balancing.ack_route_set_size requires ack_route "
-            "'reverse_set'"
-        )
+    for name in ("ack_route_set_size", "ack_route_set_probe_rtts", "ack_route_set_reply"):
+        if name in balancing and values.get("ack_route") != "reverse_set":
+            raise ValueError(
+                f"network.load_balancing.{name} requires ack_route 'reverse_set'"
+            )
     if values.get("ack_route") == "repath" and values.get("tail_recovery") is not True:
         raise ValueError(
             "network.load_balancing.ack_route 'repath' requires tail_recovery true"
