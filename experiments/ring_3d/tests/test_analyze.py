@@ -442,6 +442,8 @@ class Ring3DAnalysisTests(unittest.TestCase):
                 "receiver_tail_missing_late",
                 "receiver_tail_missing_spine3",
                 "receiver_tail_missing_late_spine0",
+                "answer_drop_up",
+                "answer_drop_down_spine3",
             ):
                 (ns3 / "transport_summary.csv").write_text(
                     f"event,plane,event_count,total_bytes\n{event},data,1,0\n",
