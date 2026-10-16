@@ -2166,6 +2166,8 @@ def counter_files(load_balancing: LoadBalancing, output_dir: Path) -> dict[str, 
         files["RECEIVER_HOLD_OUTPUT_FILE"] = output_dir / "receiver_holds.csv"
     # The backend writes a row per retransmission timeout under every mode.
     files["RTO_EVENT_OUTPUT_FILE"] = output_dir / "rto_events.csv"
+    if load_balancing.traces_answer_hold():
+        files["ANSWER_HOLD_OUTPUT_FILE"] = output_dir / "answer_holds.csv"
     return files
 
 

@@ -297,6 +297,15 @@ class LoadBalancing:
             and dict(self.parameters).get("receiver_hold") is True
         )
 
+    def traces_answer_hold(self) -> bool:
+        """Whether the run traces both ends' answer route holds: under a
+        loss hold selector with answer_path_seq, the only configuration in
+        which the backend reads the trace."""
+        return (
+            self.selector in LOSS_HOLD_SELECTORS
+            and dict(self.parameters).get("answer_path_seq") is True
+        )
+
     def recovers_tail(self) -> bool:
         """Whether a message's last packets report each spine's sent count
         under spray_uniform, which names at most 8 spines."""
@@ -1321,6 +1330,14 @@ ACK_ROUTE_KEYS: tuple[BalancingParameter, ...] = (
 STRAY_PATH_SEQ_KEY = BalancingParameter(
     "stray_path_seq", "SPRAY_STRAY_PATH_SEQ", "fresh", _stray_path_seq
 )
+# coverage_first, after stray_path_seq: whether the per-path rule, the
+# held-loss rule, a tail repair request, a copy's expiry and ack_loss_rtts first
+# apply the queue pair's coverage (the cumulative acknowledgement, and for a
+# copy its data send's answer), a send it covers being an answer loss that
+# counts toward no spine's losses, no hold and no copy's; absent, false.
+COVERAGE_FIRST_KEY = BalancingParameter(
+    "coverage_first", "SPRAY_COVERAGE_FIRST", False, _flag, _on_off
+)
 SPRAY_UNIFORM_KEYS: tuple[BalancingParameter, ...] = (
     PATH_SEQ_KEY,
     *TAIL_RECOVERY_KEYS,
@@ -1328,6 +1345,30 @@ SPRAY_UNIFORM_KEYS: tuple[BalancingParameter, ...] = (
     PATH_STATE_KEY,
     *ACK_ROUTE_KEYS,
     STRAY_PATH_SEQ_KEY,
+    COVERAGE_FIRST_KEY,
+)
+# answer_path_seq with answer_probe_interval_ns and answer_hold_clean, last,
+# read only by the loss hold selectors under ack_route spray with path_seq
+# true: whether answers are numbered per route spine, the sender holds the
+# routes of a receiver leaf its answers are found lost on, at the top of
+# loss_thresholds over loss_interval_ns, until answer_hold_clean clean answers
+# in a row release them, its data packets carry those routes, and the
+# receiver leaves them out of its draw of its answers' routes but for one probe
+# answer per held spine every answer_probe_interval_ns; absent, false, with
+# 1,000,000 ns and 3.
+ANSWER_PATH_SEQ_KEYS: tuple[BalancingParameter, ...] = (
+    BalancingParameter(
+        "answer_path_seq", "SPRAY_ANSWER_PATH_SEQ", False, _flag, _on_off
+    ),
+    BalancingParameter(
+        "answer_probe_interval_ns",
+        "SPRAY_ANSWER_PROBE_INTERVAL_NS",
+        1000000,
+        _positive_int,
+    ),
+    BalancingParameter(
+        "answer_hold_clean", "SPRAY_ANSWER_HOLD_CLEAN", 3, _positive_int
+    ),
 )
 # copy_expiry, last, read only by the loss hold selectors under
 # sentinel_mode duplicate: when a copy its own acknowledgement has not
@@ -1405,7 +1446,8 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
 # Each loss hold selector's parameters: REPS's, or MRC's but its set, which
 # is the spines, defaults filled in; then the loss hold's, path_seq among
 # them, tail recovery's, ack_loss_rtts, receiver_tail_missing, path_state,
-# ack_route, ack_route_oracle, copy_expiry and stray_path_seq.
+# ack_route, ack_route_oracle, copy_expiry, stray_path_seq, coverage_first and
+# the answer path sequences' keys.
 LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
     "reps_hold": (
         *SELECTOR_PARAMETERS["reps"],
@@ -1417,6 +1459,8 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         *ACK_ROUTE_KEYS,
         COPY_EXPIRY_KEY,
         STRAY_PATH_SEQ_KEY,
+        COVERAGE_FIRST_KEY,
+        *ANSWER_PATH_SEQ_KEYS,
     ),
     "reps_flow_hold": (
         *SELECTOR_PARAMETERS["reps"],
@@ -1428,6 +1472,8 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         *ACK_ROUTE_KEYS,
         COPY_EXPIRY_KEY,
         STRAY_PATH_SEQ_KEY,
+        COVERAGE_FIRST_KEY,
+        *ANSWER_PATH_SEQ_KEYS,
     ),
     "mrc_hold": (
         *(
@@ -1443,6 +1489,8 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         *ACK_ROUTE_KEYS,
         COPY_EXPIRY_KEY,
         STRAY_PATH_SEQ_KEY,
+        COVERAGE_FIRST_KEY,
+        *ANSWER_PATH_SEQ_KEYS,
     ),
 }
 LOSS_HOLD_REQUIRED_PARAMETERS = (
@@ -1483,6 +1531,10 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "ack_route_oracle",
     "copy_expiry",
     "stray_path_seq",
+    "coverage_first",
+    "answer_path_seq",
+    "answer_probe_interval_ns",
+    "answer_hold_clean",
 }
 # reps_oracle: REPS's parameters, defaults filled in, and the cost source the
 # backend requires, switch_queue, which builds the switches' state it reads.
@@ -1635,7 +1687,8 @@ def _load_uniform_draw(
             "network.load_balancing.mode 'spray_uniform' without a selector "
             "takes no other key than path_seq, tail_recovery, "
             "tail_recovery_delay_ns, tail_loss_rtts, ack_loss_rtts, "
-            "path_state, ack_route, ack_route_oracle and stray_path_seq; a selector "
+            "path_state, ack_route, ack_route_oracle, stray_path_seq and "
+            "coverage_first; a selector "
             "and its parameters require mode 'ev_hash', or mode 'spray_uniform' "
             f"for a selector in {list(SPINE_SELECTORS)}"
         )
@@ -1649,8 +1702,9 @@ def _spray_uniform_keys(
     balancing: dict[str, Any],
 ) -> tuple[tuple[str, ParameterValue], ...]:
     """path_seq, tail_recovery, tail_recovery_delay_ns, tail_loss_rtts,
-    ack_loss_rtts, path_state, ack_route, ack_route_oracle and stray_path_seq
-    as given, each only when set, refused where the backend refuses them."""
+    ack_loss_rtts, path_state, ack_route, ack_route_oracle, stray_path_seq and
+    coverage_first as given, each only when set, refused where the backend
+    refuses them."""
     parsed = _parsed(
         balancing,
         tuple(parameter for parameter in SPRAY_UNIFORM_KEYS if parameter.name in balancing),
@@ -1697,6 +1751,27 @@ def _require_stray_path_seq(
         raise ValueError(
             "network.load_balancing.stray_path_seq requires path_seq true"
         )
+
+
+def _require_answer_path_seq(
+    balancing: dict[str, Any], values: dict[str, ParameterValue]
+) -> None:
+    """answer_path_seq needs ack_route spray and path_seq true, and its probe
+    interval and clean count are read only with it true, as the backend reads
+    them."""
+    on = values.get("answer_path_seq") is True
+    if "answer_path_seq" in balancing and (
+        values.get("ack_route") != "spray" or values.get("path_seq") is not True
+    ):
+        raise ValueError(
+            "network.load_balancing.answer_path_seq requires ack_route 'spray' "
+            "and path_seq true"
+        )
+    for name in ("answer_probe_interval_ns", "answer_hold_clean"):
+        if name in balancing and not on:
+            raise ValueError(
+                f"network.load_balancing.{name} requires answer_path_seq true"
+            )
 
 
 def _load_loss_hold_selector(
@@ -1781,6 +1856,7 @@ def _load_loss_hold_selector(
     _require_tail_recovery(balancing, values)
     _require_ack_route(balancing, values)
     _require_stray_path_seq(balancing, values)
+    _require_answer_path_seq(balancing, values)
     if "copy_expiry" in balancing and values.get("sentinel_mode", "data") != "duplicate":
         raise ValueError(
             "network.load_balancing.copy_expiry requires sentinel_mode 'duplicate'"
