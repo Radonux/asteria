@@ -928,6 +928,12 @@ def _ack_route(value: Any, field: str) -> str:
     return value
 
 
+def _copy_expiry(value: Any, field: str) -> str:
+    if value not in ("data_ack", "deadline"):
+        raise ValueError(f"{field} must be 'data_ack' or 'deadline'")
+    return value
+
+
 def _hold_rule(value: Any, field: str) -> str:
     if value not in ("count", "llr"):
         raise ValueError(f"{field} must be 'count' or 'llr'")
@@ -1300,6 +1306,14 @@ SPRAY_UNIFORM_KEYS: tuple[BalancingParameter, ...] = (
     PATH_STATE_KEY,
     *ACK_ROUTE_KEYS,
 )
+# copy_expiry, last, read only by the loss hold selectors under
+# sentinel_mode duplicate: when a copy its own acknowledgement has not
+# answered is declared lost, once its data send is acknowledged past one base
+# RTT, data_ack, or past tail_loss_rtts base RTTs since it was sent whatever
+# its data's acknowledgement, deadline; absent, data_ack.
+COPY_EXPIRY_KEY = BalancingParameter(
+    "copy_expiry", "SPRAY_COPY_EXPIRY", "data_ack", _copy_expiry
+)
 # receiver_tail_missing, after ack_loss_rtts, read only by the loss hold
 # selectors with receiver_hold and tail_recovery true: whether the receiver's
 # hold also counts missing the sends a tail repair request names that are
@@ -1368,7 +1382,7 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
 # Each loss hold selector's parameters: REPS's, or MRC's but its set, which
 # is the spines, defaults filled in; then the loss hold's, path_seq among
 # them, tail recovery's, ack_loss_rtts, receiver_tail_missing, path_state,
-# ack_route and ack_route_oracle.
+# ack_route, ack_route_oracle and copy_expiry.
 LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
     "reps_hold": (
         *SELECTOR_PARAMETERS["reps"],
@@ -1378,6 +1392,7 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         RECEIVER_TAIL_MISSING_KEY,
         PATH_STATE_KEY,
         *ACK_ROUTE_KEYS,
+        COPY_EXPIRY_KEY,
     ),
     "reps_flow_hold": (
         *SELECTOR_PARAMETERS["reps"],
@@ -1387,6 +1402,7 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         RECEIVER_TAIL_MISSING_KEY,
         PATH_STATE_KEY,
         *ACK_ROUTE_KEYS,
+        COPY_EXPIRY_KEY,
     ),
     "mrc_hold": (
         *(
@@ -1400,6 +1416,7 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         RECEIVER_TAIL_MISSING_KEY,
         PATH_STATE_KEY,
         *ACK_ROUTE_KEYS,
+        COPY_EXPIRY_KEY,
     ),
 }
 LOSS_HOLD_REQUIRED_PARAMETERS = (
@@ -1438,6 +1455,7 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "path_state",
     "ack_route",
     "ack_route_oracle",
+    "copy_expiry",
 }
 # reps_oracle: REPS's parameters, defaults filled in, and the cost source the
 # backend requires, switch_queue, which builds the switches' state it reads.
@@ -1712,6 +1730,17 @@ def _load_loss_hold_selector(
         raise ValueError("network.load_balancing.receiver_hold requires path_seq true")
     _require_tail_recovery(balancing, values)
     _require_ack_route(balancing, values)
+    if "copy_expiry" in balancing and values.get("sentinel_mode", "data") != "duplicate":
+        raise ValueError(
+            "network.load_balancing.copy_expiry requires sentinel_mode 'duplicate'"
+        )
+    if values.get("copy_expiry") == "deadline" and not float(
+        values.get("tail_loss_rtts", 1.0)
+    ) > 0:
+        raise ValueError(
+            "network.load_balancing.copy_expiry 'deadline' requires tail_loss_rtts "
+            "above 0"
+        )
     if "receiver_hold_clean" in balancing and not receiver_hold:
         raise ValueError(
             "network.load_balancing.receiver_hold_clean requires receiver_hold true"
