@@ -1062,6 +1062,17 @@ def _duplicate_report_value(value: ParameterValue) -> str:
     return "retract" if value == "retract" else _on_off(value)
 
 
+def _overdue_repair(value: Any, field: str) -> bool | str:
+    if value is not False and value not in ("evidence", "probe"):
+        raise ValueError(f"{field} must be 'evidence', 'probe' or false")
+    return value
+
+
+def _overdue_repair_value(value: ParameterValue) -> str:
+    """SPRAY_OVERDUE_REPAIR's evidence, probe or off."""
+    return value if value in ("evidence", "probe") else "off"
+
+
 def _hold_auto_leaves(value: Any, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 2:
         raise ValueError(f"{field} must be an integer of at least 2")
@@ -1520,7 +1531,9 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "held_loss_rtts", "SPRAY_HELD_LOSS_RTTS", 2, _nonnegative_int
     ),
-    BalancingParameter("overdue_repair", "SPRAY_OVERDUE_REPAIR", False, _flag, _on_off),
+    BalancingParameter(
+        "overdue_repair", "SPRAY_OVERDUE_REPAIR", False, _overdue_repair, _overdue_repair_value
+    ),
     PATH_SEQ_KEY,
     BalancingParameter("receiver_hold", "SPRAY_RECEIVER_HOLD", False, _flag, _on_off),
     BalancingParameter(
@@ -1976,7 +1989,9 @@ def _load_loss_hold_selector(
             "held_exploration 'sentinel'"
         )
     _require_hold_test(balancing, values, trickle)
-    if values.get("overdue_repair") is True and not values.get("held_loss_rtts", 2) > 0:
+    if values.get("overdue_repair") in ("evidence", "probe") and not (
+        values.get("held_loss_rtts", 2) > 0
+    ):
         raise ValueError(
             "network.load_balancing.overdue_repair requires held_loss_rtts above 0"
         )

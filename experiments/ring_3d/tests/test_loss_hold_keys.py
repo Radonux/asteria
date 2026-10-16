@@ -162,21 +162,23 @@ class LossHoldKeysTest(unittest.TestCase):
 
     def test_overdue_repair_is_written_only_when_set(self) -> None:
         for selector in ("reps_hold", "reps_flow_hold", "mrc_hold"):
-            for on in (True, False):
-                with self.subTest(selector=selector, on=on):
+            for value, written in (("evidence", "evidence"), ("probe", "probe"), (False, "off")):
+                with self.subTest(selector=selector, value=value):
                     manifest, config, _ = self.generated(
-                        {**HOLD, "selector": selector, "held_loss_rtts": 1, "overdue_repair": on}
+                        {**HOLD, "selector": selector, "held_loss_rtts": 1, "overdue_repair": value}
                     )
                     self.assertIn(
-                        f"\nSPRAY_HELD_LOSS_RTTS 1\nSPRAY_OVERDUE_REPAIR {'on' if on else 'off'}\n",
+                        f"\nSPRAY_HELD_LOSS_RTTS 1\nSPRAY_OVERDUE_REPAIR {written}\n",
                         config,
                     )
-                    self.assertEqual(manifest["load_balancing"]["overdue_repair"], on)
+                    self.assertEqual(manifest["load_balancing"]["overdue_repair"], value)
         manifest, config, _ = self.generated(HOLD)
         self.assertNotIn("SPRAY_OVERDUE_REPAIR", config)
         self.assertNotIn("overdue_repair", manifest["load_balancing"])
         with self.assertRaisesRegex(ValueError, "overdue_repair requires held_loss_rtts above 0"):
-            self.generated({**HOLD, "held_loss_rtts": 0, "overdue_repair": True})
+            self.generated({**HOLD, "held_loss_rtts": 0, "overdue_repair": "probe"})
+        with self.assertRaisesRegex(ValueError, "must be 'evidence', 'probe' or false"):
+            self.generated({**HOLD, "overdue_repair": True})
         with self.assertRaisesRegex(ValueError, "without a selector takes no other key"):
             self.generated({"mode": "spray_uniform", "overdue_repair": True})
 
