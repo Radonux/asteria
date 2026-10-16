@@ -182,7 +182,11 @@ class CongestionControl:
     threshold and leaves the marking probability alone. ``window_state``,
     under ``nscc`` alone, keeps NSCC's window per queue pair, ``message``, or
     per destination and priority group across the queue pairs to it,
-    ``connection``; None when the profile leaves it out.
+    ``connection``; None when the profile leaves it out. ``rtt_sample``,
+    under ``nscc`` alone, gives NSCC the round trip of every answer but a
+    first resend's after a declared loss, ``any``, or follows Karn's rule and
+    floors every sample at the queue pair's base RTT, ``karn``; None when the
+    profile leaves it out.
     """
 
     mode: str
@@ -191,6 +195,7 @@ class CongestionControl:
     min_rate_fraction: float = DEFAULT_MIN_RATE_FRACTION
     ecn_threshold_scale: float = 1.0
     window_state: str | None = None
+    rtt_sample: str | None = None
 
     @property
     def cc_mode(self) -> int:
@@ -233,6 +238,8 @@ class CongestionControl:
         }
         if self.window_state is not None:
             recorded["window_state"] = self.window_state
+        if self.rtt_sample is not None:
+            recorded["rtt_sample"] = self.rtt_sample
         return recorded
 
 
@@ -674,6 +681,7 @@ def _load_congestion_control(document: dict[str, Any]) -> CongestionControl:
         "min_rate_fraction",
         "ecn_threshold_scale",
         "window_state",
+        "rtt_sample",
     }
     if not isinstance(control, dict) or not {"mode"} <= set(control) <= (
         {"mode"} | optional
@@ -730,6 +738,16 @@ def _load_congestion_control(document: dict[str, Any]) -> CongestionControl:
             raise ValueError(
                 "network.congestion_control.window_state requires mode 'nscc'"
             )
+    rtt_sample = control.get("rtt_sample")
+    if "rtt_sample" in control:
+        if rtt_sample not in ("any", "karn"):
+            raise ValueError(
+                "network.congestion_control.rtt_sample must be 'any' or 'karn'"
+            )
+        if mode != "nscc":
+            raise ValueError(
+                "network.congestion_control.rtt_sample requires mode 'nscc'"
+            )
     return CongestionControl(
         mode=mode,
         rate_ai_fraction=rate_ai,
@@ -740,6 +758,7 @@ def _load_congestion_control(document: dict[str, Any]) -> CongestionControl:
         ),
         ecn_threshold_scale=float(scale),
         window_state=window_state,
+        rtt_sample=rtt_sample,
     )
 
 
@@ -1347,6 +1366,13 @@ STRAY_PATH_SEQ_KEY = BalancingParameter(
 COVERAGE_FIRST_KEY = BalancingParameter(
     "coverage_first", "SPRAY_COVERAGE_FIRST", False, _flag, _on_off
 )
+# duplicate_report, after coverage_first and read only with it true: whether
+# a receiver flags its answer to a data packet it held already, and a sender
+# tells a timed-out send's loss only at its resend's answer, none where that
+# answer is flagged; absent, false.
+DUPLICATE_REPORT_KEY = BalancingParameter(
+    "duplicate_report", "SPRAY_DUPLICATE_REPORT", False, _flag, _on_off
+)
 SPRAY_UNIFORM_KEYS: tuple[BalancingParameter, ...] = (
     PATH_SEQ_KEY,
     *TAIL_RECOVERY_KEYS,
@@ -1355,6 +1381,7 @@ SPRAY_UNIFORM_KEYS: tuple[BalancingParameter, ...] = (
     *ACK_ROUTE_KEYS,
     STRAY_PATH_SEQ_KEY,
     COVERAGE_FIRST_KEY,
+    DUPLICATE_REPORT_KEY,
 )
 # answer_path_seq with answer_probe_interval_ns and answer_hold_clean, last,
 # read only by the loss hold selectors under ack_route spray with path_seq
@@ -1469,6 +1496,7 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         COPY_EXPIRY_KEY,
         STRAY_PATH_SEQ_KEY,
         COVERAGE_FIRST_KEY,
+        DUPLICATE_REPORT_KEY,
         *ANSWER_PATH_SEQ_KEYS,
     ),
     "reps_flow_hold": (
@@ -1482,6 +1510,7 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         COPY_EXPIRY_KEY,
         STRAY_PATH_SEQ_KEY,
         COVERAGE_FIRST_KEY,
+        DUPLICATE_REPORT_KEY,
         *ANSWER_PATH_SEQ_KEYS,
     ),
     "mrc_hold": (
@@ -1499,6 +1528,7 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         COPY_EXPIRY_KEY,
         STRAY_PATH_SEQ_KEY,
         COVERAGE_FIRST_KEY,
+        DUPLICATE_REPORT_KEY,
         *ANSWER_PATH_SEQ_KEYS,
     ),
 }
@@ -1542,6 +1572,7 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "copy_expiry",
     "stray_path_seq",
     "coverage_first",
+    "duplicate_report",
     "answer_path_seq",
     "answer_probe_interval_ns",
     "answer_hold_clean",
@@ -1698,7 +1729,7 @@ def _load_uniform_draw(
             "takes no other key than path_seq, tail_recovery, "
             "tail_recovery_delay_ns, tail_loss_rtts, ack_loss_rtts, "
             "path_state, ack_route, ack_route_oracle, ack_route_set_size, "
-            "stray_path_seq and coverage_first; a selector "
+            "stray_path_seq, coverage_first and duplicate_report; a selector "
             "and its parameters require mode 'ev_hash', or mode 'spray_uniform' "
             f"for a selector in {list(SPINE_SELECTORS)}"
         )
@@ -1713,14 +1744,15 @@ def _spray_uniform_keys(
 ) -> tuple[tuple[str, ParameterValue], ...]:
     """path_seq, tail_recovery, tail_recovery_delay_ns, tail_loss_rtts,
     ack_loss_rtts, path_state, ack_route, ack_route_oracle, ack_route_set_size,
-    stray_path_seq and coverage_first as given, each only when set, refused
-    where the backend refuses them."""
+    stray_path_seq, coverage_first and duplicate_report as given, each only
+    when set, refused where the backend refuses them."""
     parsed = _parsed(
         balancing,
         tuple(parameter for parameter in SPRAY_UNIFORM_KEYS if parameter.name in balancing),
     )
     _require_tail_recovery(balancing, dict(parsed))
     _require_ack_route(balancing, dict(parsed))
+    _require_duplicate_report(balancing, dict(parsed))
     _require_stray_path_seq(balancing, dict(parsed))
     return parsed
 
@@ -1774,6 +1806,17 @@ def _require_stray_path_seq(
     if "stray_path_seq" in balancing and values.get("path_seq") is not True:
         raise ValueError(
             "network.load_balancing.stray_path_seq requires path_seq true"
+        )
+
+
+def _require_duplicate_report(
+    balancing: dict[str, Any], values: dict[str, ParameterValue]
+) -> None:
+    """duplicate_report is read only with coverage_first true, as the
+    backend reads it."""
+    if "duplicate_report" in balancing and values.get("coverage_first") is not True:
+        raise ValueError(
+            "network.load_balancing.duplicate_report requires coverage_first true"
         )
 
 
@@ -1881,6 +1924,7 @@ def _load_loss_hold_selector(
     _require_ack_route(balancing, values)
     _require_stray_path_seq(balancing, values)
     _require_answer_path_seq(balancing, values)
+    _require_duplicate_report(balancing, values)
     if "copy_expiry" in balancing and values.get("sentinel_mode", "data") != "duplicate":
         raise ValueError(
             "network.load_balancing.copy_expiry requires sentinel_mode 'duplicate'"

@@ -2096,6 +2096,8 @@ def write_network_config(
         congestion_settings += (
             f"NSCC_WINDOW_STATE {congestion_control.window_state}\n"
         )
+    if congestion_control.rtt_sample is not None:
+        congestion_settings += f"NSCC_RTT_SAMPLE {congestion_control.rtt_sample}\n"
     if packet_trimming is None:
         trim_settings = "PACKET_TRIM_MODE disabled\n"
     else:
