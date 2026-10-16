@@ -457,7 +457,10 @@ class ClosNetwork:
     pair's packets cross every spine; None when the profile leaves it out.
     ``port_counter_interval_ns``, under a load balancing mode that writes the
     switch port counters, also writes them at every multiple of it; None
-    writes them at the link events and the end alone.
+    writes them at the link events and the end alone. ``sparse_hold_trace``,
+    under a load balancing that writes ns3/spine_losses.csv, writes a row of
+    it only where its series sends, loses or changes grade (and one row of an
+    interval that would write none); False writes every row.
     """
 
     link_rate: str
@@ -474,6 +477,7 @@ class ClosNetwork:
     spine_link_rate: str | None = None
     pair_bandwidth: str | None = None
     port_counter_interval_ns: int | None = None
+    sparse_hold_trace: bool = False
 
     @property
     def live_spine_count(self) -> int:
@@ -2554,6 +2558,7 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
             "spine_link_rate",
             "pair_bandwidth",
             "port_counter_interval_ns",
+            "sparse_hold_trace",
         }
         if topology == "clos"
         else set()
@@ -2649,6 +2654,15 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
             "network.port_counter_interval_ns requires a load_balancing mode "
             "that writes the port counters, any but ecmp"
         )
+    if (
+        isinstance(network, ClosNetwork)
+        and network.sparse_hold_trace
+        and not network.load_balancing.traces_spine_loss()
+    ):
+        raise ValueError(
+            "network.sparse_hold_trace requires a load_balancing that writes "
+            "ns3/spine_losses.csv"
+        )
     _require_acknowledged_packets(network)
     return network
 
@@ -2722,6 +2736,9 @@ def _load_geometry(
             )
             if "port_counter_interval_ns" in document
             else None
+        ),
+        sparse_hold_trace=_flag(
+            document.get("sparse_hold_trace", False), "network.sparse_hold_trace"
         ),
     )
     index = clos.clos_index(host_count)
@@ -2903,6 +2920,7 @@ def _build_clos_topology(network: ClosNetwork, host_count: int) -> TopologyLayou
                 if network.port_counter_interval_ns is None
                 else (("port_counter_interval_ns", network.port_counter_interval_ns),)
             ),
+            *((("sparse_hold_trace", True),) if network.sparse_hold_trace else ()),
         ),
     )
 

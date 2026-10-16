@@ -151,5 +151,27 @@ class PortCounterIntervalTests(unittest.TestCase):
                 load_profile(path)
 
 
+class SparseHoldTraceTests(unittest.TestCase):
+    def test_the_sparse_trace_is_written_only_when_set(self) -> None:
+        document = _job(background=None)
+        document["network"]["sparse_hold_trace"] = True
+        manifest, _, config = _generated(document)
+        self.assertIn("\nSPINE_LOSS_SPARSE on\n", config)
+        self.assertIs(manifest["physical_topology"]["sparse_hold_trace"], True)
+        manifest, _, config = _generated(_job(background=None))
+        self.assertNotIn("SPINE_LOSS_SPARSE", config)
+        self.assertNotIn("sparse_hold_trace", manifest["physical_topology"])
+
+    def test_the_sparse_trace_needs_the_trace(self) -> None:
+        document = _all_to_all()
+        document["network"]["load_balancing"] = {"mode": "spray_uniform"}
+        document["network"]["sparse_hold_trace"] = True
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "profile.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "sparse_hold_trace requires"):
+                load_profile(path)
+
+
 if __name__ == "__main__":
     unittest.main()

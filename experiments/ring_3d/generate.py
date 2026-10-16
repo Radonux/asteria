@@ -2141,6 +2141,7 @@ def write_network_config(
     pair_bandwidth: str | None = None,
     trace_hosts: tuple[int, ...] | None = None,
     port_counter_interval_ns: int | None = None,
+    sparse_hold_trace: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     # The bundled ns-3 setup unconditionally opens these legacy input files,
@@ -2264,6 +2265,9 @@ def write_network_config(
             f"PORT_COUNTER_INTERVAL_NS {port_counter_interval_ns}\n"
             f"SWITCH_QUEUE_OUTPUT_FILE {output_dir / 'switch_queues.csv'}\n"
         )
+    # Written only when set (network.sparse_hold_trace).
+    if sparse_hold_trace:
+        load_balancing_settings += "SPINE_LOSS_SPARSE on\n"
     # The hold traces of the listed hosts alone, where they are written.
     hold_trace_settings = ""
     if trace_hosts is not None and (
@@ -2723,6 +2727,7 @@ def materialize(
         getattr(profile.network, "pair_bandwidth", None),
         hold_trace_hosts(profile),
         getattr(profile.network, "port_counter_interval_ns", None),
+        getattr(profile.network, "sparse_hold_trace", False),
     )
     experiment_config = output_dir / "experiment.json"
     write_experiment_config(
