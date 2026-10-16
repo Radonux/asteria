@@ -934,6 +934,12 @@ def _copy_expiry(value: Any, field: str) -> str:
     return value
 
 
+def _oracle_hops(value: Any, field: str) -> str:
+    if value not in ("round_trip", "forward"):
+        raise ValueError(f"{field} must be 'round_trip' or 'forward'")
+    return value
+
+
 def _hold_rule(value: Any, field: str) -> str:
     if value not in ("count", "llr"):
         raise ValueError(f"{field} must be 'count' or 'llr'")
@@ -1465,6 +1471,17 @@ REPS_ORACLE_PARAMETERS: tuple[BalancingParameter, ...] = (
 )
 
 
+# oracle_hops, last, read only by reps_oracle: the hops over which a spine
+# toward the destination's leaf is read as faulted, the data's two and the two
+# its acknowledgement returns over through the same spine, round_trip, or the
+# data's two alone, the source leaf's uplink to the spine and the spine's
+# downlink to the destination's leaf, forward, for answers that do not return
+# over the data's spine, as under ack_route spray; absent, round_trip.
+ORACLE_HOPS_KEY = BalancingParameter(
+    "oracle_hops", "REPS_ORACLE_HOPS", "round_trip", _oracle_hops
+)
+
+
 # reps_spine: REPS's parameters, defaults filled in; no loss hold, no
 # sentinel, and none of the loss hold's keys.
 REPS_SPINE_PARAMETERS: tuple[BalancingParameter, ...] = SELECTOR_PARAMETERS["reps"]
@@ -1480,7 +1497,7 @@ def _parameters_of(mode: str, selector: str) -> tuple[BalancingParameter, ...]:
     if selector in LOSS_HOLD_SELECTORS:
         return LOSS_HOLD_PARAMETERS[selector]
     if selector == "reps_oracle":
-        return REPS_ORACLE_PARAMETERS + SPRAY_UNIFORM_KEYS
+        return REPS_ORACLE_PARAMETERS + SPRAY_UNIFORM_KEYS + (ORACLE_HOPS_KEY,)
     if selector == "reps_spine":
         return REPS_SPINE_PARAMETERS + SPRAY_UNIFORM_KEYS
     if mode == "spray_uniform":
@@ -1801,8 +1818,12 @@ def _load_reps_oracle(
     trimming: PacketTrimming | None,
 ) -> LoadBalancing:
     """spray_uniform with reps_oracle, which reads the switches' state and so
-    requires grade_cost_source switch_queue, as the backend does."""
-    names = {parameter.name for parameter in REPS_ORACLE_PARAMETERS + SPRAY_UNIFORM_KEYS}
+    requires grade_cost_source switch_queue, as the backend does, and
+    oracle_hops only when set."""
+    names = {
+        parameter.name
+        for parameter in REPS_ORACLE_PARAMETERS + SPRAY_UNIFORM_KEYS + (ORACLE_HOPS_KEY,)
+    }
     unknown = set(balancing) - {"mode", "selector"} - names
     if unknown:
         raise ValueError(
@@ -1818,10 +1839,14 @@ def _load_reps_oracle(
             "grade_cost_source 'switch_queue'"
         )
     _require_reorder_tolerance("spray_uniform", recovery, trimming)
+    oracle_hops = _parsed(
+        balancing,
+        (ORACLE_HOPS_KEY,) if ORACLE_HOPS_KEY.name in balancing else (),
+    )
     return LoadBalancing(
         mode="spray_uniform",
         selector="reps_oracle",
-        parameters=parsed + _spray_uniform_keys(balancing),
+        parameters=parsed + _spray_uniform_keys(balancing) + oracle_hops,
     )
 
 
