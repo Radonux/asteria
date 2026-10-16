@@ -455,6 +455,9 @@ class ClosNetwork:
     path's bottleneck, or ``spines``, for hosts on two leaves the sum over the
     spines of each spine's path, at most either host's link, as a sprayed
     pair's packets cross every spine; None when the profile leaves it out.
+    ``port_counter_interval_ns``, under a load balancing mode that writes the
+    switch port counters, also writes them at every multiple of it; None
+    writes them at the link events and the end alone.
     """
 
     link_rate: str
@@ -470,6 +473,7 @@ class ClosNetwork:
     link_failures: tuple[LinkFailure, ...] = ()
     spine_link_rate: str | None = None
     pair_bandwidth: str | None = None
+    port_counter_interval_ns: int | None = None
 
     @property
     def live_spine_count(self) -> int:
@@ -2534,6 +2538,7 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
             "link_failures",
             "spine_link_rate",
             "pair_bandwidth",
+            "port_counter_interval_ns",
         }
         if topology == "clos"
         else set()
@@ -2620,6 +2625,15 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
             "network.pair_bandwidth 'spines' requires a load_balancing mode "
             f"that names spines: {sorted(SPINE_NAMING_MODES)}"
         )
+    if (
+        isinstance(network, ClosNetwork)
+        and network.port_counter_interval_ns is not None
+        and network.load_balancing.mode == "ecmp"
+    ):
+        raise ValueError(
+            "network.port_counter_interval_ns requires a load_balancing mode "
+            "that writes the port counters, any but ecmp"
+        )
     _require_acknowledged_packets(network)
     return network
 
@@ -2686,6 +2700,14 @@ def _load_geometry(
         switch_link_delay_ns=switch_link_delay_ns,
         spine_link_rate=_spine_link_rate(document),
         pair_bandwidth=_pair_bandwidth(document),
+        port_counter_interval_ns=(
+            _positive_int(
+                document["port_counter_interval_ns"],
+                "network.port_counter_interval_ns",
+            )
+            if "port_counter_interval_ns" in document
+            else None
+        ),
     )
     index = clos.clos_index(host_count)
     return replace(
@@ -2860,6 +2882,11 @@ def _build_clos_topology(network: ClosNetwork, host_count: int) -> TopologyLayou
                 ()
                 if network.pair_bandwidth is None
                 else (("pair_bandwidth", network.pair_bandwidth),)
+            ),
+            *(
+                ()
+                if network.port_counter_interval_ns is None
+                else (("port_counter_interval_ns", network.port_counter_interval_ns),)
             ),
         ),
     )

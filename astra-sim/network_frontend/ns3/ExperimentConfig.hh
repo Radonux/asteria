@@ -16,6 +16,7 @@ LICENSE file in the root directory of this source tree.
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -53,6 +54,9 @@ enum class FlowKind : uint8_t {
     ForegroundPayload = 0,
     ProvenanceControl,
     BackgroundMicroburst,
+    // A flow of the background load: started with each all-to-all, and
+    // waited for by no completion.
+    BackgroundLoad,
 };
 
 enum class FlowTerminalOutcome : uint8_t {
@@ -452,6 +456,17 @@ struct MicroburstFlow {
     uint16_t priority_group = 3;
 };
 
+// One flow of the background load, sent once per all-to-all collective of
+// the workload, from that collective's first flow; rate_bps paces it, zero
+// for the NIC's line rate.
+struct BackgroundFlow {
+    uint32_t src = 0;
+    uint32_t dst = 0;
+    uint64_t size_bytes = 0;
+    uint64_t rate_bps = 0;
+    uint16_t priority_group = 3;
+};
+
 struct ExperimentConfig {
     bool enabled = false;
     uint64_t seed = 0;
@@ -491,6 +506,10 @@ struct ExperimentConfig {
     uint32_t microburst_trigger_step = 2;
     std::vector<MicroburstFlow> microburst_flows;
     bool microburst_triggered = false;
+    // The background load's flows, and the all-to-all collectives, by
+    // (training step, workload node), that have started them.
+    std::vector<BackgroundFlow> background_flows;
+    std::set<std::pair<uint32_t, uint64_t>> background_started;
     // Where the telemetry will be written. Empty when no experiment is
     // configured. The files are not opened here: see open_experiment_telemetry.
     std::string telemetry_output_dir;
@@ -518,6 +537,8 @@ struct FlowRecord {
     uint16_t priority_group = 0;
     uint64_t logical_bytes = 0;
     uint64_t physical_bytes = 0;
+    // The rate the flow's queue pair is paced at; zero for the line rate.
+    uint64_t rate_bps = 0;
     uint64_t data_attempted_bytes = 0;
     uint64_t retransmitted_bytes = 0;
     uint64_t trimmed_payload_bytes = 0;
@@ -767,6 +788,8 @@ class ExperimentTelemetry {
             return "provenance_control";
         case FlowKind::BackgroundMicroburst:
             return "background_microburst";
+        case FlowKind::BackgroundLoad:
+            return "background_load";
         }
         return "unknown";
     }
@@ -1431,7 +1454,7 @@ inline void configure_experiment(const std::string& configuration_path,
                          "eligibility", "selection_probability_by_step",
                          "selection_policy", "scale",
                          "default_priority_group", "provenance",
-                         "vnet_to_priority_group", "microburst"},
+                         "vnet_to_priority_group", "microburst", "background"},
                         "experiment configuration");
     if (root.value("schema_version", 0) != 1) {
         throw std::runtime_error("Experiment schema_version must be 1");
@@ -1736,6 +1759,54 @@ inline void configure_experiment(const std::string& configuration_path,
                     : experiment_config.default_priority_group;
                 experiment_config.microburst_flows.push_back(parsed_flow);
             }
+        }
+    }
+
+    if (root.contains("background")) {
+        const auto& background = root.at("background");
+        if (!background.is_object()) {
+            throw std::runtime_error("background must be an object");
+        }
+        reject_unknown_keys(background, {"flows"}, "background");
+        if (!background.contains("flows") || !background.at("flows").is_array() ||
+            background.at("flows").empty()) {
+            throw std::runtime_error("background requires a nonempty flows array");
+        }
+        for (const auto& flow : background.at("flows")) {
+            if (!flow.is_object()) {
+                throw std::runtime_error("background flow must be an object");
+            }
+            reject_unknown_keys(flow,
+                                {"src", "dst", "size_bytes", "rate_bps",
+                                 "priority_group"},
+                                "background flow");
+            for (const char* key : {"src", "dst", "size_bytes"}) {
+                if (!flow.contains(key) || !flow.at(key).is_number_unsigned()) {
+                    throw std::runtime_error(
+                        std::string("background flow requires unsigned ") + key);
+                }
+            }
+            const uint64_t src = flow.at("src").get<uint64_t>();
+            const uint64_t dst = flow.at("dst").get<uint64_t>();
+            if (src > std::numeric_limits<uint32_t>::max() ||
+                dst > std::numeric_limits<uint32_t>::max() || src == dst ||
+                flow.at("size_bytes").get<uint64_t>() == 0) {
+                throw std::runtime_error(
+                    "background flow requires distinct uint32 endpoints and nonzero size_bytes");
+            }
+            if (flow.contains("rate_bps") && !flow.at("rate_bps").is_number_unsigned()) {
+                throw std::runtime_error("background flow rate_bps must be unsigned");
+            }
+            BackgroundFlow parsed_flow;
+            parsed_flow.src = static_cast<uint32_t>(src);
+            parsed_flow.dst = static_cast<uint32_t>(dst);
+            parsed_flow.size_bytes = flow.at("size_bytes").get<uint64_t>();
+            parsed_flow.rate_bps = flow.value("rate_bps", uint64_t{0});
+            parsed_flow.priority_group = flow.contains("priority_group")
+                ? parse_priority_group(flow.at("priority_group"),
+                                       "background.priority_group")
+                : experiment_config.default_priority_group;
+            experiment_config.background_flows.push_back(parsed_flow);
         }
     }
 

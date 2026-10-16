@@ -405,6 +405,19 @@ class Combine:
 
 
 @dataclass(frozen=True)
+class Background:
+    """The background load of an all-to-all whose group is the first hosts of
+    every leaf: each other host, host i of leaf l of L, sends to host i of
+    leaf (l + 1 + i mod (L - 1)) mod L, ``leaf_shift``, so that every one
+    sends one flow and receives one, and each leaf sends evenly to the
+    others. With each of the all-to-all's collectives each sends what a
+    member sends to the members on other leaves, paced at ``rate_bps``."""
+
+    pattern: str
+    rate_bps: int
+
+
+@dataclass(frozen=True)
 class AllToAll:
     """Every member of the group runs ``iterations`` native all-to-all
     collectives, each sending ``message_bytes`` to every other member, with a
@@ -413,9 +426,10 @@ class AllToAll:
     the combine's all-to-all, in a chain.
 
     ``leaves`` None is every host; otherwise the group is every host on the
-    listed leaves, in rank order. ``dataset_splits`` is the chunks the system
-    layer cuts each collective into, sent one after another; None is
-    PREFERRED_DATASET_SPLITS.
+    listed leaves, in rank order, or with ``hosts`` the first ``hosts`` of
+    each. ``dataset_splits`` is the chunks the system layer cuts each
+    collective into, sent one after another; None is PREFERRED_DATASET_SPLITS.
+    ``background``, with ``hosts``, is the load the other hosts send.
     """
 
     message_bytes: int
@@ -424,6 +438,8 @@ class AllToAll:
     leaves: tuple[int, ...] | None = None
     combine: Combine | None = None
     dataset_splits: int | None = None
+    hosts: int | None = None
+    background: Background | None = None
 
     def members(self, ranks: int, hosts_per_leaf: int | None) -> tuple[int, ...]:
         if self.leaves is None:
@@ -431,7 +447,10 @@ class AllToAll:
         if hosts_per_leaf is None:
             raise ValueError("workload.group.leaves needs a Clos fabric")
         return tuple(
-            rank for rank in range(ranks) if rank // hosts_per_leaf in self.leaves
+            rank
+            for rank in range(ranks)
+            if rank // hosts_per_leaf in self.leaves
+            and (self.hosts is None or rank % hosts_per_leaf < self.hosts)
         )
 
     def collective_bytes(self, group_size: int) -> int:
@@ -439,8 +458,12 @@ class AllToAll:
         member one group_size-th of it."""
         return self.message_bytes * group_size
 
-    def manifest_group(self) -> str | dict[str, list[int]]:
-        return "all" if self.leaves is None else {"leaves": list(self.leaves)}
+    def manifest_group(self) -> str | dict[str, Any]:
+        if self.leaves is None:
+            return "all"
+        if self.hosts is None:
+            return {"leaves": list(self.leaves)}
+        return {"leaves": list(self.leaves), "hosts": self.hosts}
 
 
 @dataclass(frozen=True)
@@ -508,6 +531,12 @@ class Workload:
                 manifest["expert_compute_ns"] = combine.expert_compute_ns
             if self.all_to_all.dataset_splits is not None:
                 manifest["dataset_splits"] = self.all_to_all.dataset_splits
+            background = self.all_to_all.background
+            if background is not None:
+                manifest["background"] = {
+                    "pattern": background.pattern,
+                    "rate_bps": background.rate_bps,
+                }
             return manifest
         return {"kind": self.kind}
 
@@ -776,21 +805,31 @@ def _load_all_to_all(value: dict[str, Any]) -> AllToAll:
     combine_keys = {"combine_bytes", "expert_compute_ns"}
     # The combine's two keys come together: the compute is what separates
     # the iteration's two all-to-alls.
-    if set(value) - {"dataset_splits"} not in (required, required | combine_keys):
+    if set(value) - {"dataset_splits", "background"} not in (
+        required,
+        required | combine_keys,
+    ):
         raise ValueError(
             "workload.kind 'all_to_all' must contain exactly "
             "['compute_ns', 'group', 'iterations', 'kind', 'message_bytes'], "
-            "and may contain ['combine_bytes', 'expert_compute_ns'] together "
-            "and 'dataset_splits'"
+            "and may contain ['combine_bytes', 'expert_compute_ns'] together, "
+            "'dataset_splits' and 'background'"
         )
     group = value["group"]
+    hosts = None
     if group == "all":
         leaves = None
     else:
-        if not isinstance(group, dict) or set(group) != {"leaves"}:
+        if not isinstance(group, dict) or set(group) not in (
+            {"leaves"},
+            {"leaves", "hosts"},
+        ):
             raise ValueError(
-                "workload.group must be 'all' or an object of exactly ['leaves']"
+                "workload.group must be 'all' or an object of ['leaves'] and "
+                "optionally 'hosts'"
             )
+        if "hosts" in group:
+            hosts = _require_positive_int(group["hosts"], "workload.group.hosts")
         listed = group["leaves"]
         if not isinstance(listed, list) or not listed:
             raise ValueError("workload.group.leaves must be a nonempty array")
@@ -824,7 +863,33 @@ def _load_all_to_all(value: dict[str, Any]) -> AllToAll:
             if "dataset_splits" in value
             else None
         ),
+        hosts=hosts,
+        background=(
+            _load_background(value["background"]) if "background" in value else None
+        ),
     )
+
+
+def _load_background(value: Any) -> Background:
+    """workload.background: its pattern, leaf_shift, and its pacing rate."""
+    if not isinstance(value, dict) or set(value) != {"pattern", "rate"}:
+        raise ValueError(
+            "workload.background must be an object of exactly ['pattern', 'rate']"
+        )
+    if value["pattern"] != "leaf_shift":
+        raise ValueError("workload.background.pattern must be 'leaf_shift'")
+    rate = value["rate"]
+    if not isinstance(rate, str) or not rate.endswith("Gbps"):
+        raise ValueError("workload.background.rate must be a rate such as 350Gbps")
+    try:
+        rate_bps = round(float(rate[: -len("Gbps")]) * 1_000_000_000)
+    except ValueError:
+        raise ValueError(
+            "workload.background.rate must be a rate such as 350Gbps"
+        ) from None
+    if rate_bps <= 0:
+        raise ValueError("workload.background.rate must be above 0")
+    return Background(pattern="leaf_shift", rate_bps=rate_bps)
 
 
 def _load_explicit_clr_schedule(
@@ -1255,6 +1320,27 @@ def _check_all_to_all(all_to_all: AllToAll, profile: Profile) -> None:
             raise ValueError(
                 "each of workload.group.leaves must be below the leaf count"
             )
+        if (
+            all_to_all.hosts is not None
+            and all_to_all.hosts > profile.network.hosts_per_leaf
+        ):
+            raise ValueError(
+                "workload.group.hosts must be at most network.hosts_per_leaf"
+            )
+    if all_to_all.background is not None:
+        if all_to_all.hosts is None or all_to_all.hosts == profile.network.hosts_per_leaf:
+            raise ValueError(
+                "workload.background needs workload.group.hosts below "
+                "network.hosts_per_leaf, whose other hosts send it"
+            )
+        if sorted(all_to_all.leaves or ()) != list(
+            range(profile.ranks // profile.network.hosts_per_leaf)
+        ):
+            raise ValueError("workload.background needs workload.group.leaves to be every leaf")
+        if profile.ranks // profile.network.hosts_per_leaf < 2:
+            raise ValueError("workload.background needs two leaves or more")
+        if all_to_all.background.rate_bps > _link_bits_per_second(profile.network.link_rate):
+            raise ValueError("workload.background.rate must be at most network.link_rate")
     group_size = len(all_to_all_members(profile))
     if group_size < 2:
         raise ValueError(
@@ -1309,6 +1395,48 @@ def all_to_all_members(profile: Profile) -> tuple[int, ...]:
         profile.ranks,
         profile.network.hosts_per_leaf if profile.network.kind == "clos" else None,
     )
+
+
+def _link_bits_per_second(link_rate: str) -> int:
+    return round(float(link_rate[: -len("Gbps")]) * 1_000_000_000)
+
+
+def background_flows(profile: Profile) -> list[dict[str, int]]:
+    """The background load's flows, sent with each of the all-to-all's
+    collectives (Background): one per host outside the group, its size what a
+    member sends to the members on other leaves; none without it."""
+    all_to_all = profile.workload.all_to_all
+    if all_to_all is None or all_to_all.background is None:
+        return []
+    hosts_per_leaf = profile.network.hosts_per_leaf
+    leaves = profile.ranks // hosts_per_leaf
+    members = set(all_to_all_members(profile))
+    size = all_to_all.message_bytes * (len(members) - all_to_all.hosts)
+    flows = []
+    for rank in range(profile.ranks):
+        if rank in members:
+            continue
+        leaf, index = divmod(rank, hosts_per_leaf)
+        destination = ((leaf + 1 + index % (leaves - 1)) % leaves) * hosts_per_leaf + index
+        flows.append(
+            {
+                "src": rank,
+                "dst": destination,
+                "size_bytes": size,
+                "rate_bps": all_to_all.background.rate_bps,
+                "priority_group": 3,
+            }
+        )
+    return flows
+
+
+def hold_trace_hosts(profile: Profile) -> tuple[int, ...] | None:
+    """The hosts whose hold traces a run writes: the all-to-all's members
+    where its group names the hosts of each leaf; every host otherwise."""
+    all_to_all = profile.workload.all_to_all
+    if all_to_all is None or all_to_all.hosts is None:
+        return None
+    return all_to_all_members(profile)
 
 
 def all_to_all_group_id(profile: Profile) -> int | None:
@@ -2011,6 +2139,8 @@ def write_network_config(
     link_failure_settings: str,
     link_rates_bps: frozenset[int] = frozenset(),
     pair_bandwidth: str | None = None,
+    trace_hosts: tuple[int, ...] | None = None,
+    port_counter_interval_ns: int | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     # The bundled ns-3 setup unconditionally opens these legacy input files,
@@ -2127,6 +2257,23 @@ def write_network_config(
     # needs (network.pair_bandwidth).
     if pair_bandwidth is not None:
         load_balancing_settings += f"PAIR_BANDWIDTH {pair_bandwidth}\n"
+    # Written only when set, after the counter files it reads
+    # (network.port_counter_interval_ns), with the switch queues' maxima.
+    if port_counter_interval_ns is not None:
+        load_balancing_settings += (
+            f"PORT_COUNTER_INTERVAL_NS {port_counter_interval_ns}\n"
+            f"SWITCH_QUEUE_OUTPUT_FILE {output_dir / 'switch_queues.csv'}\n"
+        )
+    # The hold traces of the listed hosts alone, where they are written.
+    hold_trace_settings = ""
+    if trace_hosts is not None and (
+        load_balancing.traces_spine_loss() or load_balancing.traces_receiver_hold()
+    ):
+        hold_trace_settings = (
+            f"HOLD_TRACE_HOSTS {len(trace_hosts)} "
+            + " ".join(str(host) for host in trace_hosts)
+            + "\n"
+        )
     # The ECN maps cover every link speed of the fabric (link_rates_bps).
     rows = ecn_rows(link_rates_bps)
     ecn_maps = switch.ecn_threshold_maps(
@@ -2162,6 +2309,7 @@ def write_network_config(
             f"{fabric_settings}"
             f"{switch.queue_maps(rows)}"
             f"{link_failure_settings}"
+            f"{hold_trace_settings}"
         )
 
 
@@ -2350,6 +2498,9 @@ def write_experiment_config(
             "flows": microburst_flows,
         },
     }
+    background = background_flows(profile)
+    if background:
+        policy["background"] = {"flows": background}
     path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
 
 
@@ -2570,6 +2721,8 @@ def materialize(
         profile.network.link_failure_config(profile.ranks),
         frozenset(link.rate_bps for link in physical_topology.links),
         getattr(profile.network, "pair_bandwidth", None),
+        hold_trace_hosts(profile),
+        getattr(profile.network, "port_counter_interval_ns", None),
     )
     experiment_config = output_dir / "experiment.json"
     write_experiment_config(

@@ -355,8 +355,12 @@ class AllToAllTraceTests(unittest.TestCase):
             (_all_to_all(group={"leaves": [1, 1]}), "leaves must be distinct"),
             (_all_to_all(group={"leaves": [8]}), "must be below the leaf count"),
             (
-                _all_to_all(group={"leaves": [1], "hosts": 2}),
+                _all_to_all(group={"leaves": [1], "size": 2}),
                 "group must be 'all' or an object",
+            ),
+            (
+                _all_to_all(group={"leaves": [1], "hosts": 99}),
+                "hosts must be at most network.hosts_per_leaf",
             ),
             (
                 _all_to_all(combine_bytes=4_096, expert_compute_ns=-1000),
