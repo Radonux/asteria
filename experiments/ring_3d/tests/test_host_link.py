@@ -109,7 +109,7 @@ class HostLinkTests(LinkTests):
         for failure, message in (
             ({**LOSS, "host": 64}, r"host must be an integer in \[0, 64\)"),
             ({**LOSS, "host": True}, r"host must be an integer"),
-            ({**LOSS, "spine": 3}, "must contain model, start_ns and spine, or model, start_ns and host"),
+            ({**LOSS, "spine": 3}, "must contain model, start_ns and spine, host or draw"),
             ({**LOSS, "leaf": 1}, "may contain"),
             ({"model": "graceful", "host": HOST, "start_ns": 0}, "would cut host 9 off"),
             ({**SILENT, "direction": "down"}, "must be 'up' for a silent host link"),

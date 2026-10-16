@@ -122,24 +122,18 @@ class TailRecoveryTest(unittest.TestCase):
             config,
         )
 
-    def test_tail_recovery_counts_at_most_8_spines(self) -> None:
+    def test_tail_recovery_counts_every_spine(self) -> None:
         for balancing in (UNIFORM, HOLD):
-            for spines, refused in ((8, False), (9, True)):
+            for spines, refused in ((256, False), (257, True)):
                 self.write({**balancing, **TAIL}, spines=spines)
                 with self.subTest(balancing=balancing, spines=spines):
                     if refused:
                         with self.assertRaisesRegex(
-                            ValueError, "tail_recovery counts at most 8 spines"
+                            ValueError, "spine_count must not exceed 256"
                         ):
                             load_profile(self.profile_path)
                     else:
                         load_profile(self.profile_path)
-        for balancing in (
-            {**UNIFORM, "path_seq": True},
-            {**UNIFORM, "path_seq": True, "tail_recovery": False},
-        ):
-            self.write(balancing, spines=9)
-            load_profile(self.profile_path)
 
     def test_refusals(self) -> None:
         refusals: list[tuple[dict[str, object], str]] = []

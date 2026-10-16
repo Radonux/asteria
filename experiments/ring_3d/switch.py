@@ -5,7 +5,10 @@
 HPCC-era ECN table, scaled by ``congestion_control.ecn_threshold_scale``, with
 a RED marking probability that the profile may now set. The ``ue`` profile is
 the configuration UEC 1.0.3 section 3.6.17 recommends for a UET-CC fabric
-that trims, every threshold derived from the fabric's Plane_BDP.
+that trims, every threshold derived from the fabric's Plane_BDP; with
+``port_rate_thresholds`` each port's thresholds are those bytes scaled by its
+link speed over the fabric's link_rate, so that every port marks, trims and
+drops at one queueing delay.
 
 This module imports nothing else from the package, so ``topology`` can import
 it without a cycle.
@@ -13,7 +16,7 @@ it without a cycle.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from math import isfinite
@@ -30,6 +33,15 @@ ECN_THRESHOLDS_KB = (
     (200_000_000_000, 600, 2400),
     (400_000_000_000, 800, 3200),
     (2_400_000_000_000, 800, 3200),
+)
+# Link speeds outside the HPCC table, each written into the maps, ahead of
+# the table, only where a link of the fabric runs at it, so that every other
+# fabric's maps stay as they were: 12.5 Gb/s, a leaf-spine link of a leaf's
+# 3.2 Tb/s over 256 spines, at half the 25 Gb/s thresholds.
+ECN_EXTRA_THRESHOLDS_KB = ((12_500_000_000, 50, 200),)
+# Every link speed the maps can cover.
+ECN_RATES_BPS = frozenset(
+    rate for rate, _, _ in ECN_EXTRA_THRESHOLDS_KB + ECN_THRESHOLDS_KB
 )
 # The marking probability at KMAX that the generator wrote for every link speed
 # before it could be set.
@@ -61,10 +73,23 @@ class _Layout(Protocol):
     links: Sequence[_Link]
 
 
-def _probability_map(probability: float) -> str:
-    """The PMAX_MAP line, one probability for every link speed."""
-    entries = " ".join(f"{rate} {probability!r}" for rate, _, _ in ECN_THRESHOLDS_KB)
-    return f"PMAX_MAP {len(ECN_THRESHOLDS_KB)} {entries}\n"
+def ecn_rows(rates_bps: Iterable[int] = ()) -> tuple[tuple[int, int, int], ...]:
+    """The ECN table's rows the maps write for a fabric whose links run at
+    rates_bps: ECN_THRESHOLDS_KB, after the ECN_EXTRA_THRESHOLDS_KB rows of
+    the rates among them."""
+    used = set(rates_bps)
+    return (
+        tuple(row for row in ECN_EXTRA_THRESHOLDS_KB if row[0] in used)
+        + ECN_THRESHOLDS_KB
+    )
+
+
+def _probability_map(
+    probability: float, rows: Sequence[tuple[int, int, int]] = ECN_THRESHOLDS_KB
+) -> str:
+    """The PMAX_MAP line, one probability for every link speed of rows."""
+    entries = " ".join(f"{rate} {probability!r}" for rate, _, _ in rows)
+    return f"PMAX_MAP {len(rows)} {entries}\n"
 
 
 @dataclass(frozen=True)
@@ -77,15 +102,30 @@ class DefaultSwitch:
     def profile(self) -> str:
         return "default"
 
-    def ecn_threshold_maps(self, scaled_maps: str) -> str:
-        """The KMAX_MAP and KMIN_MAP lines: the congestion-control knob's."""
+    def ecn_threshold_maps(
+        self,
+        scaled_maps: str,
+        rows: Sequence[tuple[int, int, int]] = ECN_THRESHOLDS_KB,
+    ) -> str:
+        """The KMAX_MAP and KMIN_MAP lines: the congestion-control knob's,
+        scaled over the same rows."""
+        del rows
         return scaled_maps
 
-    def probability_map(self) -> str:
-        return _probability_map(self.ecn_marking_probability)
+    def probability_map(
+        self, rows: Sequence[tuple[int, int, int]] = ECN_THRESHOLDS_KB
+    ) -> str:
+        return _probability_map(self.ecn_marking_probability, rows)
 
     def queue_bytes(self) -> None:
         """The default profile leaves the queue bounds to network.fabric."""
+
+    def queue_maps(
+        self, rows: Sequence[tuple[int, int, int]] = ECN_THRESHOLDS_KB
+    ) -> str:
+        """No per-speed queue bounds."""
+        del rows
+        return ""
 
     def manifest(self) -> dict[str, str | float]:
         return {
@@ -103,10 +143,20 @@ class UeSwitch:
     computes its maxRtt and maxBdp, so the thresholds and the transport's own
     BDP agree. ECN marks only queue_low: queue 0 (TC_high) is never marked and
     the switch never marks a trimmed packet, which is what queue_med holds.
+
+    With ``port_rate_thresholds`` a port of link speed r takes Plane_BDP's
+    thresholds times r / link_bps: its ECN thresholds in its KMAX_MAP and
+    KMIN_MAP rows, and its trim threshold and trimmed queue drop in the
+    DATA_QUEUE_BYTES_MAP and TRIMMED_QUEUE_BYTES_MAP rows the backend reads
+    in place of DATA_QUEUE_BYTES and TRIMMED_QUEUE_BYTES. A port at link_bps
+    keeps the bytes it has without it. ``port_rates_bps`` are the fabric's
+    link speeds, whose thresholds the manifest records.
     """
 
     config_base_rtt_ns: int
     link_bps: int
+    port_rate_thresholds: bool = False
+    port_rates_bps: tuple[int, ...] = ()
 
     @property
     def profile(self) -> str:
@@ -125,15 +175,61 @@ class UeSwitch:
     def ecn_max_kb(self) -> int:
         return _whole_kb(self.plane_bdp_bytes * UE_ECN_MAX_FRACTION)
 
-    def ecn_threshold_maps(self, scaled_maps: str) -> str:
+    def _port_kb(self, fraction: Decimal, rate: int) -> int:
+        """Plane_BDP's fraction scaled to a port of link speed rate, in the
+        whole kilobytes ns-3 reads."""
+        if not self.port_rate_thresholds:
+            return _whole_kb(self.plane_bdp_bytes * fraction)
+        return _whole_kb(self.plane_bdp_bytes * fraction * rate / self.link_bps)
+
+    def port_queue_bytes(self, rate: int) -> tuple[int, int]:
+        """queue_bytes for a port of link speed rate."""
+        trim_threshold, trimmed_drop = self.queue_bytes()
+        if not self.port_rate_thresholds:
+            return trim_threshold, trimmed_drop
+        return (
+            trim_threshold * rate // self.link_bps,
+            trimmed_drop * rate // self.link_bps,
+        )
+
+    def ecn_threshold_maps(
+        self,
+        scaled_maps: str,
+        rows: Sequence[tuple[int, int, int]] = ECN_THRESHOLDS_KB,
+    ) -> str:
         del scaled_maps  # the preset replaces the table
-        count = len(ECN_THRESHOLDS_KB)
-        kmax = " ".join(f"{rate} {self.ecn_max_kb}" for rate, _, _ in ECN_THRESHOLDS_KB)
-        kmin = " ".join(f"{rate} {self.ecn_min_kb}" for rate, _, _ in ECN_THRESHOLDS_KB)
+        count = len(rows)
+        kmax = " ".join(
+            f"{rate} {self._port_kb(UE_ECN_MAX_FRACTION, rate)}" for rate, _, _ in rows
+        )
+        kmin = " ".join(
+            f"{rate} {self._port_kb(UE_ECN_MIN_FRACTION, rate)}" for rate, _, _ in rows
+        )
         return f"KMAX_MAP {count} {kmax}\nKMIN_MAP {count} {kmin}\n"
 
-    def probability_map(self) -> str:
-        return _probability_map(UE_ECN_MARKING_PROBABILITY)
+    def queue_maps(
+        self, rows: Sequence[tuple[int, int, int]] = ECN_THRESHOLDS_KB
+    ) -> str:
+        """Under port_rate_thresholds, the DATA_QUEUE_BYTES_MAP and
+        TRIMMED_QUEUE_BYTES_MAP lines over rows; nothing otherwise."""
+        if not self.port_rate_thresholds:
+            return ""
+        count = len(rows)
+        data = " ".join(
+            f"{rate} {self.port_queue_bytes(rate)[0]}" for rate, _, _ in rows
+        )
+        trimmed = " ".join(
+            f"{rate} {self.port_queue_bytes(rate)[1]}" for rate, _, _ in rows
+        )
+        return (
+            f"DATA_QUEUE_BYTES_MAP {count} {data}\n"
+            f"TRIMMED_QUEUE_BYTES_MAP {count} {trimmed}\n"
+        )
+
+    def probability_map(
+        self, rows: Sequence[tuple[int, int, int]] = ECN_THRESHOLDS_KB
+    ) -> str:
+        return _probability_map(UE_ECN_MARKING_PROBABILITY, rows)
 
     def queue_bytes(self) -> tuple[int, int]:
         """DATA_QUEUE_BYTES (the trim threshold) and TRIMMED_QUEUE_BYTES."""
@@ -154,6 +250,23 @@ class UeSwitch:
             "ecn_marking_probability": UE_ECN_MARKING_PROBABILITY,
             "trim_threshold_bytes": trim_threshold,
             "trimmed_queue_drop_bytes": trimmed_drop,
+            **(
+                {
+                    "port_rate_thresholds": {
+                        str(rate): {
+                            "ecn_min_bytes": self._port_kb(UE_ECN_MIN_FRACTION, rate)
+                            * 1000,
+                            "ecn_max_bytes": self._port_kb(UE_ECN_MAX_FRACTION, rate)
+                            * 1000,
+                            "trim_threshold_bytes": self.port_queue_bytes(rate)[0],
+                            "trimmed_queue_drop_bytes": self.port_queue_bytes(rate)[1],
+                        }
+                        for rate in self.port_rates_bps
+                    }
+                }
+                if self.port_rate_thresholds
+                else {}
+            ),
         }
 
 
@@ -253,6 +366,7 @@ class SwitchRequest:
 
     profile: str
     ecn_marking_probability: float | None
+    port_rate_thresholds: bool = False
 
     def default_switch(self) -> DefaultSwitch:
         """The ``default`` profile, which needs nothing from the fabric."""
@@ -273,11 +387,21 @@ class SwitchRequest:
         switch = UeSwitch(
             config_base_rtt_ns=longest_round_trip_ns(layout, payload_bytes),
             link_bps=link_bps,
+            port_rate_thresholds=self.port_rate_thresholds,
+            port_rates_bps=tuple(sorted({link.rate_bps for link in layout.links})),
         )
         if switch.ecn_min_kb < 1:
             raise ValueError(
                 "network.switch.profile 'ue' needs a Plane_BDP of at least 2.5 KB "
                 "so that the ECN minimum is a whole kilobyte"
+            )
+        if any(
+            switch._port_kb(UE_ECN_MIN_FRACTION, rate) < 1
+            for rate in switch.port_rates_bps
+        ):
+            raise ValueError(
+                "network.switch.port_rate_thresholds needs every port's scaled ECN "
+                "minimum to be a whole kilobyte"
             )
         if switch.plane_bdp_bytes > MAX_QUEUE_BYTES:
             raise ValueError(
@@ -292,7 +416,7 @@ def load_switch_request(document: dict[str, Any]) -> SwitchRequest:
     if "switch" not in document:
         return SwitchRequest(profile="default", ecn_marking_probability=None)
     switch = document["switch"]
-    allowed = {"profile", "ecn_marking_probability"}
+    allowed = {"profile", "ecn_marking_probability", "port_rate_thresholds"}
     if not isinstance(switch, dict) or not set(switch) <= allowed:
         raise ValueError(f"network.switch may contain only {sorted(allowed)}")
     profile = switch.get("profile", "default")
@@ -317,4 +441,16 @@ def load_switch_request(document: dict[str, Any]) -> SwitchRequest:
                 "network.switch.ecn_marking_probability must be a number in (0, 1]"
             )
         probability = float(probability)
-    return SwitchRequest(profile=profile, ecn_marking_probability=probability)
+    port_rate = switch.get("port_rate_thresholds", False)
+    if not isinstance(port_rate, bool):
+        raise ValueError("network.switch.port_rate_thresholds must be a boolean")
+    if "port_rate_thresholds" in switch and profile != "ue":
+        raise ValueError(
+            "network.switch.port_rate_thresholds is read only by profile 'ue', "
+            "whose thresholds derive from Plane_BDP"
+        )
+    return SwitchRequest(
+        profile=profile,
+        ecn_marking_probability=probability,
+        port_rate_thresholds=port_rate,
+    )

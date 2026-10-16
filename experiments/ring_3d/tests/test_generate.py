@@ -2276,15 +2276,17 @@ class Ring3DGeneratorTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, message):
                         load_profile(profile_path)
 
-            # A report grades at most 32 spines.
-            for spines, refused in ((32, False), (33, True)):
+            # A report grades every spine a fabric names.
+            for spines, refused in ((256, False), (257, True)):
                 wide = json.loads(json.dumps(document))
                 wide["network"]["spine_count"] = spines
                 wide["network"]["load_balancing"] = policy
                 profile_path.write_text(json.dumps(wide), encoding="utf-8")
                 with self.subTest(spines=spines):
                     if refused:
-                        with self.assertRaisesRegex(ValueError, "at most 32 spines"):
+                        with self.assertRaisesRegex(
+                            ValueError, "spine_count must not exceed 256"
+                        ):
                             load_profile(profile_path)
                     else:
                         load_profile(profile_path)
@@ -2526,27 +2528,31 @@ class Ring3DGeneratorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "selective_repair"):
                 load_profile(profile_path)
 
-            # The field names a spine below 255.
-            for spines, refused in ((254, False), (255, True)):
+            # The field names every spine a fabric names, in two bytes at 256.
+            for spines, refused in ((256, False), (257, True)):
                 wide = json.loads(json.dumps(document))
                 wide["network"]["spine_count"] = spines
                 wide["network"]["load_balancing"] = redirect
                 profile_path.write_text(json.dumps(wide), encoding="utf-8")
                 with self.subTest(spines=spines):
                     if refused:
-                        with self.assertRaisesRegex(ValueError, "at most 254 spines"):
+                        with self.assertRaisesRegex(
+                            ValueError, "spine_count must not exceed 256"
+                        ):
                             load_profile(profile_path)
                     else:
                         load_profile(profile_path)
-            # The host's grader grades at most 32 spines.
-            for spines, refused in ((32, False), (33, True)):
+            # The host's grader grades every spine a fabric names.
+            for spines, refused in ((256, False), (257, True)):
                 wide = json.loads(json.dumps(document))
                 wide["network"]["spine_count"] = spines
                 wide["network"]["load_balancing"] = host
                 profile_path.write_text(json.dumps(wide), encoding="utf-8")
                 with self.subTest(spines=spines, scope="per_receiver"):
                     if refused:
-                        with self.assertRaisesRegex(ValueError, "at most 32 spines"):
+                        with self.assertRaisesRegex(
+                            ValueError, "spine_count must not exceed 256"
+                        ):
                             load_profile(profile_path)
                     else:
                         load_profile(profile_path)

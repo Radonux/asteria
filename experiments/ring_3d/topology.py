@@ -22,6 +22,7 @@ try:
         load_link_overrides,
     )
     from .switch import (
+        ECN_RATES_BPS,
         ECN_THRESHOLDS_KB,
         DefaultSwitch,
         SwitchProfile,
@@ -37,6 +38,7 @@ except ImportError:
         load_link_overrides,
     )
     from switch import (
+        ECN_RATES_BPS,
         ECN_THRESHOLDS_KB,
         DefaultSwitch,
         SwitchProfile,
@@ -60,8 +62,12 @@ PACKET_TRIM_MODES = {"ftd", "bts"}
 LOAD_BALANCING_MODES = {"ecmp", "ev_hash", "spray_uniform", "spray_policy"}
 # The modes whose identification names the spine a packet goes up.
 SPINE_NAMING_MODES = {"spray_uniform", "spray_policy"}
-# The most spines a spray_policy report grades.
-MAX_REPORTED_SPINES = 32
+# network.pair_bandwidth's values (ClosNetwork).
+PAIR_BANDWIDTHS = ("path", "spines")
+# The most spines a fabric names: the backend names a data packet's spines
+# in a byte each of its identification, and sizes every spine field, bitmap,
+# report and per-spine count to the fabric's spines, up to this many.
+MAX_SPINE_COUNT = 256
 # What chooses each data packet's entropy value under ev_hash.
 PATH_SELECTORS = ("ops", "reps", "ue_oblivious", "ue_aware", "mrc")
 # What chooses each data packet's spine under spray_uniform instead of the
@@ -94,17 +100,13 @@ TAIL_COUNT_BYTES = 2
 # The spines a byte of a spine bitmap names, as the answer_hold bitmap of a
 # data header under answer_path_seq does.
 SPINES_PER_BITMAP_BYTE = 8
-# The most spines a receiver's hold names in an acknowledgement's bitmap.
-MAX_RECEIVER_HOLD_SPINES = 8
-# The most spines a closing packet's per-spine counts name under
-# tail_recovery.
-MAX_TAIL_RECOVERY_SPINES = 8
+# The most spines over which every data header carries the per-spine counts
+# under tail_recovery (the backend's kFixedTailCounts); over more only a
+# header that closes its spine does, and every other one the flags byte.
+FIXED_TAIL_COUNT_SPINES = 8
 # The backend's tail recovery delay value for its default, the fabric's
 # largest base RTT, which it refuses as a given value.
 TAIL_RECOVERY_DELAY_DEFAULT_SENTINEL = 2**64 - 1
-# The value an acknowledgement's redirect field names no spine with, so
-# ack_redirect names at most this many spines.
-MAX_REDIRECT_SPINES = 255
 # The ns-3 CC_MODE number of each congestion_control.mode. 12 is no sender
 # reaction at all: a queue pair is set to link rate at creation and nothing ever
 # changes it. 1 is Mellanox DCQCN. 11 is UEC NSCC, a window per queue pair
@@ -214,17 +216,20 @@ class CongestionControl:
             round(link_bps * self.min_rate_fraction),
         )
 
-    def ecn_threshold_maps(self) -> str:
-        """The KMAX_MAP and KMIN_MAP lines, thresholds scaled, rates not."""
+    def ecn_threshold_maps(
+        self, rows: tuple[tuple[int, int, int], ...] = ECN_THRESHOLDS_KB
+    ) -> str:
+        """The KMAX_MAP and KMIN_MAP lines of rows (switch.ecn_rows),
+        thresholds scaled, rates not."""
         kmax = " ".join(
             f"{rate} {round(high * self.ecn_threshold_scale)}"
-            for rate, _, high in ECN_THRESHOLDS_KB
+            for rate, _, high in rows
         )
         kmin = " ".join(
             f"{rate} {round(low * self.ecn_threshold_scale)}"
-            for rate, low, _ in ECN_THRESHOLDS_KB
+            for rate, low, _ in rows
         )
-        count = len(ECN_THRESHOLDS_KB)
+        count = len(rows)
         return f"KMAX_MAP {count} {kmax}\nKMIN_MAP {count} {kmin}\n"
 
     def manifest(self, link_rate: str) -> dict[str, str | int | float]:
@@ -443,6 +448,13 @@ class ClosNetwork:
     by leaving that many designed spines dark. A rail-optimized 1:1 fabric
     with failed spines is how production AI clusters actually experience
     sustained oversubscription; it is an operating condition, not a design.
+    ``spine_link_rate`` is the leaf-spine links' rate, None for
+    ``link_rate``. ``pair_bandwidth``, under a load balancing mode that names
+    spines, is the bandwidth the backend gives a pair of hosts, whose BDP
+    sizes its window: ``path``, the backend's default, the best shortest
+    path's bottleneck, or ``spines``, for hosts on two leaves the sum over the
+    spines of each spine's path, at most either host's link, as a sprayed
+    pair's packets cross every spine; None when the profile leaves it out.
     """
 
     link_rate: str
@@ -456,6 +468,8 @@ class ClosNetwork:
     switch_link_delay_ns: int = DEFAULT_SWITCH_LINK_DELAY_NS
     link_overrides: tuple[LinkOverride, ...] = ()
     link_failures: tuple[LinkFailure, ...] = ()
+    spine_link_rate: str | None = None
+    pair_bandwidth: str | None = None
 
     @property
     def live_spine_count(self) -> int:
@@ -476,8 +490,9 @@ class ClosNetwork:
         DATA_FRAME_HEADER_BYTES, with the INT header's send time where
         ack_redirect or one_way_delay asks for it, the path sequence under
         path_seq, with a bit per spine of the answer_hold bitmap under
-        answer_path_seq, and the flags and a count per spine under
-        tail_recovery."""
+        answer_path_seq, and the flags under tail_recovery with a count per
+        spine over at most FIXED_TAIL_COUNT_SPINES spines, which over more
+        only a closing header carries."""
         balancing = dict(self.load_balancing.parameters)
         header = DATA_FRAME_HEADER_BYTES
         if (
@@ -490,7 +505,9 @@ class ClosNetwork:
         if balancing.get("answer_path_seq") is True:
             header += -(-self.live_spine_count // SPINES_PER_BITMAP_BYTE)
         if balancing.get("tail_recovery") is True:
-            header += 1 + TAIL_COUNT_BYTES * self.live_spine_count
+            header += 1
+            if self.live_spine_count <= FIXED_TAIL_COUNT_SPINES:
+                header += TAIL_COUNT_BYTES * self.live_spine_count
         return self.packet_payload_bytes + header
 
     def link_failure_config(self, host_count: int) -> str:
@@ -586,7 +603,7 @@ class TopologyLayout:
     switch_ids: tuple[int, ...]
     links: tuple[TopologyLink, ...]
     link_rate: str
-    details: tuple[tuple[str, int], ...] = ()
+    details: tuple[tuple[str, int | str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.host_count <= 0 or self.node_count <= 0:
@@ -2505,7 +2522,13 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
     }
     topology_keys = {"hosts_per_leaf", "spine_count"} if topology == "clos" else set()
     optional_topology_keys = (
-        {"failed_spine_count", "load_balancing", "link_failures"}
+        {
+            "failed_spine_count",
+            "load_balancing",
+            "link_failures",
+            "spine_link_rate",
+            "pair_bandwidth",
+        }
         if topology == "clos"
         else set()
     )
@@ -2582,7 +2605,15 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
                 document, transport_recovery, packet_trimming
             ),
         )
-        _require_reported_spines(network)
+    if (
+        isinstance(network, ClosNetwork)
+        and network.pair_bandwidth == "spines"
+        and network.load_balancing.mode not in SPINE_NAMING_MODES
+    ):
+        raise ValueError(
+            "network.pair_bandwidth 'spines' requires a load_balancing mode "
+            f"that names spines: {sorted(SPINE_NAMING_MODES)}"
+        )
     _require_acknowledged_packets(network)
     return network
 
@@ -2626,8 +2657,8 @@ def _load_geometry(
         raise ValueError(
             "parallelism product must be divisible by network.hosts_per_leaf"
         )
-    if spine_count > 255:
-        raise ValueError("network.spine_count must not exceed 255")
+    if spine_count > MAX_SPINE_COUNT:
+        raise ValueError(f"network.spine_count must not exceed {MAX_SPINE_COUNT}")
     failed_value = document.get("failed_spine_count", 0)
     if isinstance(failed_value, bool) or not isinstance(failed_value, int):
         raise ValueError("network.failed_spine_count must be an integer")
@@ -2647,6 +2678,8 @@ def _load_geometry(
         failed_spine_count=failed_value,
         host_link_delay_ns=host_link_delay_ns,
         switch_link_delay_ns=switch_link_delay_ns,
+        spine_link_rate=_spine_link_rate(document),
+        pair_bandwidth=_pair_bandwidth(document),
     )
     index = clos.clos_index(host_count)
     return replace(
@@ -2654,6 +2687,40 @@ def _load_geometry(
         link_overrides=_load_link_overrides(document, clos, host_count, index),
         link_failures=load_link_failures(document, index),
     )
+
+
+def _pair_bandwidth(document: dict[str, Any]) -> str | None:
+    """network.pair_bandwidth as given, None when the profile leaves it out."""
+    if "pair_bandwidth" not in document:
+        return None
+    value = document["pair_bandwidth"]
+    if value not in PAIR_BANDWIDTHS:
+        raise ValueError(
+            f"network.pair_bandwidth must be one of {list(PAIR_BANDWIDTHS)}"
+        )
+    return value
+
+
+def _spine_link_rate(document: dict[str, Any]) -> str | None:
+    """network.spine_link_rate, the leaf-spine links' rate, None when the
+    profile leaves it out: a rate the switch ECN maps cover."""
+    if "spine_link_rate" not in document:
+        return None
+    value = document["spine_link_rate"]
+    if not isinstance(value, str) or not value.endswith("Gbps"):
+        raise ValueError("network.spine_link_rate must be a rate such as 100Gbps")
+    try:
+        bps = link_rate_bits_per_second(value)
+    except ValueError as error:
+        raise ValueError(
+            "network.spine_link_rate must be a rate such as 100Gbps"
+        ) from error
+    if bps not in ECN_RATES_BPS:
+        raise ValueError(
+            "network.spine_link_rate must be a link speed the switch ECN table "
+            f"covers: {sorted(ECN_RATES_BPS)} bps"
+        )
+    return value
 
 
 def _load_link_overrides(
@@ -2668,7 +2735,7 @@ def _load_link_overrides(
         document,
         ((link.source, link.destination) for link in links),
         index,
-        (rate for rate, _, _ in ECN_THRESHOLDS_KB),
+        ECN_RATES_BPS,
     )
 
 
@@ -2713,60 +2780,6 @@ def _require_acknowledged_packets(network: PhysicalNetwork) -> None:
         )
 
 
-def _require_reported_spines(network: ClosNetwork) -> None:
-    """Refuse a spray_policy report over more spines than it can grade, and an
-    ack_redirect field over more spines than it can name."""
-    if (
-        network.load_balancing.mode == "spray_policy"
-        and network.live_spine_count > MAX_REPORTED_SPINES
-    ):
-        raise ValueError(
-            "network.load_balancing.mode 'spray_policy' grades at most "
-            f"{MAX_REPORTED_SPINES} spines"
-        )
-    if (
-        network.load_balancing.selector == "ack_redirect"
-        and dict(network.load_balancing.parameters).get("scope") == "per_receiver"
-        and network.live_spine_count > MAX_REPORTED_SPINES
-    ):
-        raise ValueError(
-            "network.load_balancing.selector 'ack_redirect' with scope "
-            f"'per_receiver' grades at most {MAX_REPORTED_SPINES} spines"
-        )
-    if (
-        network.load_balancing.selector in LOSS_HOLD_SELECTORS
-        and network.live_spine_count > MAX_REPORTED_SPINES
-    ):
-        raise ValueError(
-            f"network.load_balancing.selector '{network.load_balancing.selector}' "
-            f"holds at most {MAX_REPORTED_SPINES} spines"
-        )
-    if (
-        network.load_balancing.traces_receiver_hold()
-        and network.live_spine_count > MAX_RECEIVER_HOLD_SPINES
-    ):
-        raise ValueError(
-            "network.load_balancing.receiver_hold holds at most "
-            f"{MAX_RECEIVER_HOLD_SPINES} spines"
-        )
-    if (
-        network.load_balancing.recovers_tail()
-        and network.live_spine_count > MAX_TAIL_RECOVERY_SPINES
-    ):
-        raise ValueError(
-            "network.load_balancing.tail_recovery counts at most "
-            f"{MAX_TAIL_RECOVERY_SPINES} spines"
-        )
-    if (
-        network.load_balancing.selector == "ack_redirect"
-        and network.live_spine_count >= MAX_REDIRECT_SPINES
-    ):
-        raise ValueError(
-            "network.load_balancing.selector 'ack_redirect' names at most "
-            f"{MAX_REDIRECT_SPINES - 1} spines"
-        )
-
-
 def build_topology(network: PhysicalNetwork, host_count: int) -> TopologyLayout:
     """Build a validated physical layout for the requested network variant."""
     if isinstance(network, ClosNetwork):
@@ -2807,7 +2820,7 @@ def _build_clos_topology(network: ClosNetwork, host_count: int) -> TopologyLayou
             source=leaf,
             destination=spine,
             delay_ns=network.switch_link_delay_ns,
-            rate=network.link_rate,
+            rate=network.spine_link_rate or network.link_rate,
         )
         for leaf in range(leaf_start, spine_start)
         for spine in range(spine_start, node_count)
@@ -2832,6 +2845,16 @@ def _build_clos_topology(network: ClosNetwork, host_count: int) -> TopologyLayou
             ("hosts_per_leaf", network.hosts_per_leaf),
             ("host_link_delay_ns", network.host_link_delay_ns),
             ("switch_link_delay_ns", network.switch_link_delay_ns),
+            *(
+                ()
+                if network.spine_link_rate is None
+                else (("spine_link_rate", network.spine_link_rate),)
+            ),
+            *(
+                ()
+                if network.pair_bandwidth is None
+                else (("pair_bandwidth", network.pair_bandwidth),)
+            ),
         ),
     )
 

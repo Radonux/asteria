@@ -130,16 +130,13 @@ class RepsSpineTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     load_profile(self.profile_path)
 
-    def test_tail_recovery_counts_at_most_8_spines(self) -> None:
+    def test_tail_recovery_counts_every_spine(self) -> None:
         balancing = {**SPINE, "path_seq": True, "tail_recovery": True}
-        self.write(balancing, spines=8)
+        self.write(balancing, spines=256)
         load_profile(self.profile_path)
-        self.write(balancing, spines=9)
-        with self.assertRaisesRegex(ValueError, "8 spines"):
+        self.write(balancing, spines=257)
+        with self.assertRaisesRegex(ValueError, "spine_count must not exceed 256"):
             load_profile(self.profile_path)
-        # Without tail recovery nothing is held or counted per spine.
-        self.write(SPINE, spines=33)
-        load_profile(self.profile_path)
 
     def test_reorder_tolerance_is_required(self) -> None:
         self.document["network"]["transport_recovery"]["selective_repair"] = False

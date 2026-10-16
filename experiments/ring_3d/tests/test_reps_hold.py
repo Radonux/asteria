@@ -335,22 +335,18 @@ class RepsSpineSelectorTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     load_profile(self.profile_path)
 
-    def test_loss_hold_holds_at_most_32_spines(self) -> None:
+    def test_loss_hold_holds_every_spine(self) -> None:
         for balancing in (HOLD, FLOW_HOLD):
-            for spines, refused in ((32, False), (33, True)):
+            for spines, refused in ((256, False), (257, True)):
                 self.write(balancing, spines=spines)
                 with self.subTest(selector=balancing["selector"], spines=spines):
                     if refused:
                         with self.assertRaisesRegex(
-                            ValueError,
-                            f"'{balancing['selector']}' holds at most 32 spines",
+                            ValueError, "spine_count must not exceed 256"
                         ):
                             load_profile(self.profile_path)
                     else:
                         load_profile(self.profile_path)
-        # reps_oracle keeps no per-spine report or hold.
-        self.write(ORACLE, spines=33)
-        load_profile(self.profile_path)
 
     def test_reorder_tolerance_is_required(self) -> None:
         for balancing in (HOLD, FLOW_HOLD, ORACLE):

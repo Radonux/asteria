@@ -48,7 +48,7 @@ try:
         schedule_metadata,
         write_clr_mask,
     )
-    from .switch import SwitchProfile
+    from .switch import SwitchProfile, ecn_rows
     from .topology import (
         CongestionControl,
         DataPlaneLoss,
@@ -70,7 +70,7 @@ except ImportError:
         schedule_metadata,
         write_clr_mask,
     )
-    from switch import SwitchProfile
+    from switch import SwitchProfile, ecn_rows
     from topology import (
         CongestionControl,
         DataPlaneLoss,
@@ -2009,6 +2009,8 @@ def write_network_config(
     load_balancing: LoadBalancing,
     switch: SwitchProfile,
     link_failure_settings: str,
+    link_rates_bps: frozenset[int] = frozenset(),
+    pair_bandwidth: str | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     # The bundled ns-3 setup unconditionally opens these legacy input files,
@@ -2121,6 +2123,15 @@ def write_network_config(
     )
     for key, counter_file in counter_files(load_balancing, output_dir).items():
         load_balancing_settings += f"{key} {counter_file}\n"
+    # Written only when the profile sets it, after the load balancing it
+    # needs (network.pair_bandwidth).
+    if pair_bandwidth is not None:
+        load_balancing_settings += f"PAIR_BANDWIDTH {pair_bandwidth}\n"
+    # The ECN maps cover every link speed of the fabric (link_rates_bps).
+    rows = ecn_rows(link_rates_bps)
+    ecn_maps = switch.ecn_threshold_maps(
+        congestion_control.ecn_threshold_maps(rows), rows
+    )
     with path.open("w", encoding="utf-8") as config:
         config.write(
             "ENABLE_QCN 1\nUSE_DYNAMIC_PFC_THRESHOLD 1\n\n"
@@ -2146,9 +2157,10 @@ def write_network_config(
             "SAMPLE_FEEDBACK 0\nPINT_LOG_BASE 1.05\nPINT_PROB 1.0\n"
             "NIC_TOTAL_PAUSE_TIME 0\n\nRATE_BOUND 1\nACK_HIGH_PRIO 1\n"
             "LINK_DOWN 0 0 0\nENABLE_TRACE 1\n\n"
-            f"{switch.ecn_threshold_maps(congestion_control.ecn_threshold_maps())}"
-            f"{switch.probability_map()}"
+            f"{ecn_maps}"
+            f"{switch.probability_map(rows)}"
             f"{fabric_settings}"
+            f"{switch.queue_maps(rows)}"
             f"{link_failure_settings}"
         )
 
@@ -2556,6 +2568,8 @@ def materialize(
         profile.network.load_balancing,
         profile.network.switch,
         profile.network.link_failure_config(profile.ranks),
+        frozenset(link.rate_bps for link in physical_topology.links),
+        getattr(profile.network, "pair_bandwidth", None),
     )
     experiment_config = output_dir / "experiment.json"
     write_experiment_config(

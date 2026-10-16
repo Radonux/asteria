@@ -7,7 +7,9 @@ in the run, through ``LINK_FAILURE`` lines in the network configuration, and,
 for a failure with a duration, restores them through ``LINK_RESTORE`` lines. A
 Clos link is named by its leaf and spine index, the spine index counting the
 spines that are built, or a host's link by the host's index; any link may also
-be named by the node ids at its two ends.
+be named by the node ids at its two ends. A failure with ``draw`` instead fails
+a fraction of the leaf-spine link directions, drawn by its seed
+(draw_link_directions).
 
 This module imports nothing else from the package, so ``topology`` can import
 it without a cycle.
@@ -15,8 +17,10 @@ it without a cycle.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable
 from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal
 from math import expm1, isfinite, log1p
 from typing import Any
 
@@ -30,6 +34,9 @@ LOSS_UNITS = ("frame", "byte")
 # link, "up" is what the host sends its leaf and "down" what the leaf sends the
 # host.
 FAILURE_DIRECTIONS = ("up", "down", "both")
+# The models a drawn failure (draw) can take: a loss, a lower rate or a
+# black hole in one direction of each drawn link leaves its routes up.
+DRAWN_MODELS = ("gray", "silent")
 
 
 @dataclass(frozen=True)
@@ -118,6 +125,9 @@ class LinkFailure:
     loss_unit: str | None = None
     # The host whose link to its leaf fails; None for a leaf-spine failure.
     host: int | None = None
+    # The draw (fraction, seed) that chose this link and direction; None for
+    # a failure the profile names.
+    draw: tuple[float, int] | None = None
 
     def effective_direction(self) -> str:
         """The direction the failure applies in: "up" for an unspecified
@@ -261,7 +271,102 @@ class LinkFailure:
         if self.loss_unit == "byte":
             recorded["reference_frame_bytes"] = frame_bytes
             recorded["per_byte_error_rate"] = self.per_byte_rate(frame_bytes)
+        if self.draw is not None:
+            recorded["draw"] = {"fraction": self.draw[0], "seed": self.draw[1]}
         return recorded
+
+
+def draw_link_directions(
+    fraction: float, seed: int, leaf_count: int, spine_count: int
+) -> list[tuple[int, int, str]]:
+    """The leaf-spine link directions a draw fails, as (leaf, spine,
+    direction) in leaf and spine order, "up" and "down" merged into "both".
+
+    Of the 2 * leaf_count * spine_count directions, round(fraction * that)
+    (half up) are drawn: those whose SHA-256 of "<seed> <leaf> <spine>
+    <direction>" is least, so that the draw depends on the seed and the
+    fabric alone and the same fraction fails at every spine count.
+    """
+    directions = [
+        (leaf, spine, direction)
+        for leaf in range(leaf_count)
+        for spine in range(spine_count)
+        for direction in ("up", "down")
+    ]
+    count = int(
+        (Decimal(repr(fraction)) * len(directions)).to_integral_value(ROUND_HALF_UP)
+    )
+
+    def rank(entry: tuple[int, int, str]) -> bytes:
+        leaf, spine, direction = entry
+        return hashlib.sha256(f"{seed} {leaf} {spine} {direction}".encode()).digest()
+
+    drawn = sorted(directions, key=rank)[:count]
+    links: dict[tuple[int, int], set[str]] = {}
+    for leaf, spine, direction in drawn:
+        links.setdefault((leaf, spine), set()).add(direction)
+    return [
+        (leaf, spine, "both" if len(found) == 2 else next(iter(found)))
+        for (leaf, spine), found in sorted(links.items())
+    ]
+
+
+def _drawn_failures(
+    entry: dict[str, Any],
+    field: str,
+    clos: ClosIndex,
+    start_ns: int,
+    duration_ns: int | None,
+    repeat: int | None,
+    period_ns: int | None,
+) -> list[LinkFailure]:
+    """A drawn failure's links: one failure per link draw_link_directions
+    gives, in its direction, at the entry's model and times."""
+    draw = entry["draw"]
+    if not isinstance(draw, dict) or set(draw) != {"fraction", "seed"}:
+        raise ValueError(f"{field}.draw must contain exactly fraction and seed")
+    fraction = draw["fraction"]
+    if (
+        isinstance(fraction, bool)
+        or not isinstance(fraction, (int, float))
+        or not isfinite(fraction)
+        or not 0.0 < fraction <= 1.0
+    ):
+        raise ValueError(f"{field}.draw.fraction must be a number in (0, 1]")
+    seed = draw["seed"]
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError(f"{field}.draw.seed must be a nonnegative integer")
+    drawn = draw_link_directions(
+        float(fraction), seed, clos.leaf_count, clos.spine_count
+    )
+    if not drawn:
+        raise ValueError(
+            f"{field}.draw.fraction draws no link direction of the "
+            f"{2 * clos.leaf_count * clos.spine_count}"
+        )
+    return [
+        LinkFailure(
+            model=entry["model"],
+            start_ns=start_ns,
+            spine=spine,
+            leaf=leaf,
+            error_rate=(
+                _error_rate(entry["error_rate"], f"{field}.error_rate")
+                if "error_rate" in entry
+                else None
+            ),
+            rate=(
+                _rate(entry["rate"], f"{field}.rate", None) if "rate" in entry else None
+            ),
+            duration_ns=duration_ns,
+            repeat=repeat,
+            period_ns=period_ns,
+            direction=direction,
+            loss_unit=entry.get("loss_unit"),
+            draw=(float(fraction), seed),
+        )
+        for leaf, spine, direction in drawn
+    ]
 
 
 def _direction(entry: dict[str, Any], field: str, model: str) -> str | None:
@@ -411,6 +516,25 @@ def load_link_failures(
     # host's link by ("host", host).
     failed: dict[tuple[Any, int], list[LinkFailure]] = {}
     down: dict[int, set[int]] = {}
+
+    def record(failure: LinkFailure, field: str) -> None:
+        """Take failure, refused where it fails a link while an earlier
+        failure of the link lasts."""
+        links: list[tuple[Any, int]] = (
+            [("host", failure.host)]
+            if failure.host is not None
+            else [(leaf, failure.spine) for leaf in failure.leaves(clos.leaf_count)]
+        )
+        for leaf, spine in links:
+            earlier = failed.setdefault((leaf, spine), [])
+            if any(failure.overlaps(other) for other in earlier):
+                raise ValueError(
+                    f"{field} fails a link while an earlier failure of it lasts"
+                )
+            earlier.append(failure)
+            if failure.model == "graceful":
+                down.setdefault(leaf, set()).add(spine)
+        failures.append(failure)
     for position, entry in enumerate(value):
         field = f"network.link_failures[{position}]"
         if not isinstance(entry, dict):
@@ -418,11 +542,24 @@ def load_link_failures(
         model = entry.get("model")
         if model not in FAILURE_MODELS:
             raise ValueError(f"{field}.model must be one of {list(FAILURE_MODELS)}")
-        # A host's link is named by the host alone.
-        named = ("host",) if "host" in entry else ("spine",)
-        allowed = {"model", "start_ns", *named, "direction"}
-        if "host" not in entry:
+        # A host's link is named by the host alone, and drawn links by the
+        # draw alone, which also chooses their directions.
+        if "host" in entry:
+            named: tuple[str, ...] = ("host",)
+        elif "draw" in entry:
+            named = ("draw",)
+        else:
+            named = ("spine",)
+        allowed = {"model", "start_ns", *named}
+        if "draw" not in entry:
+            allowed.add("direction")
+        if "host" not in entry and "draw" not in entry:
             allowed.add("leaf")
+        if "draw" in entry and model not in DRAWN_MODELS:
+            raise ValueError(
+                f"{field} draws its links and must be one of {list(DRAWN_MODELS)}, "
+                "which leave the drawn links' routes up"
+            )
         if model == "gray":
             allowed |= {"error_rate", "rate"}
             if len({"error_rate", "rate"} & set(entry)) != 1:
@@ -443,8 +580,8 @@ def load_link_failures(
         unknown = set(entry) - allowed
         if unknown or not {"model", "start_ns", *named} <= set(entry):
             raise ValueError(
-                f"{field} must contain model, start_ns and spine, or model, "
-                f"start_ns and host, and may contain "
+                f"{field} must contain model, start_ns and spine, host or draw, "
+                f"and may contain "
                 f"{sorted(allowed - {'model', 'start_ns', *named})}"
             )
         start_ns = entry["start_ns"]
@@ -485,6 +622,12 @@ def load_link_failures(
                 f"{field}.direction must be 'up' for a silent host link: only "
                 "the leaf, a switch, drops what arrives over it"
             )
+        if "draw" in entry:
+            for drawn in _drawn_failures(
+                entry, field, clos, start_ns, duration_ns, repeat, period_ns
+            ):
+                record(drawn, field)
+            continue
         failure = LinkFailure(
             model=model,
             start_ns=start_ns,
@@ -513,21 +656,7 @@ def load_link_failures(
             loss_unit=entry.get("loss_unit"),
             host=host,
         )
-        links: list[tuple[Any, int]] = (
-            [("host", host)]
-            if host is not None
-            else [(leaf, failure.spine) for leaf in failure.leaves(clos.leaf_count)]
-        )
-        for leaf, spine in links:
-            earlier = failed.setdefault((leaf, spine), [])
-            if any(failure.overlaps(other) for other in earlier):
-                raise ValueError(
-                    f"{field} fails a link while an earlier failure of it lasts"
-                )
-            earlier.append(failure)
-            if model == "graceful":
-                down.setdefault(leaf, set()).add(spine)
-        failures.append(failure)
+        record(failure, field)
     # A leaf with every uplink down is cut off and no flow to it can finish.
     if any(len(spines) == clos.spine_count for spines in down.values()):
         raise ValueError(

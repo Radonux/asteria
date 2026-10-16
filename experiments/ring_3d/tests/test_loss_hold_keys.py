@@ -202,19 +202,17 @@ class LossHoldKeysTest(unittest.TestCase):
                 self.assertIn(f"\nRTO_EVENT_OUTPUT_FILE {trace}\n", config)
                 self.assertEqual(manifest["counter_files"]["RTO_EVENT_OUTPUT_FILE"], trace)
 
-    def test_receiver_hold_names_at_most_8_spines(self) -> None:
-        for spines, refused in ((8, False), (9, True)):
+    def test_receiver_hold_names_every_spine(self) -> None:
+        for spines, refused in ((256, False), (257, True)):
             self.write(RECEIVER, spines=spines)
             with self.subTest(spines=spines):
                 if refused:
                     with self.assertRaisesRegex(
-                        ValueError, "receiver_hold holds at most 8 spines"
+                        ValueError, "spine_count must not exceed 256"
                     ):
                         load_profile(self.profile_path)
                 else:
                     load_profile(self.profile_path)
-        self.write({**HOLD, "path_seq": True}, spines=9)
-        load_profile(self.profile_path)
 
     def test_refusals(self) -> None:
         refusals: list[tuple[dict[str, object], str]] = [
