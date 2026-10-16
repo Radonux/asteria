@@ -2265,9 +2265,12 @@ def write_network_config(
             f"PORT_COUNTER_INTERVAL_NS {port_counter_interval_ns}\n"
             f"SWITCH_QUEUE_OUTPUT_FILE {output_dir / 'switch_queues.csv'}\n"
         )
-    # Written only when set (network.sparse_hold_trace).
-    if sparse_hold_trace:
+    # Written only when set (network.sparse_hold_trace), for each hold trace
+    # the run writes.
+    if sparse_hold_trace and load_balancing.traces_spine_loss():
         load_balancing_settings += "SPINE_LOSS_SPARSE on\n"
+    if sparse_hold_trace and load_balancing.traces_receiver_hold():
+        load_balancing_settings += "RECEIVER_HOLD_SPARSE on\n"
     # The hold traces of the listed hosts alone, where they are written.
     hold_trace_settings = ""
     if trace_hosts is not None and (

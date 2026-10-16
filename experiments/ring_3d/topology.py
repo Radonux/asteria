@@ -458,9 +458,10 @@ class ClosNetwork:
     ``port_counter_interval_ns``, under a load balancing mode that writes the
     switch port counters, also writes them at every multiple of it; None
     writes them at the link events and the end alone. ``sparse_hold_trace``,
-    under a load balancing that writes ns3/spine_losses.csv, writes a row of
-    it only where its series sends, loses or changes grade (and one row of an
-    interval that would write none); False writes every row.
+    under a load balancing that writes ns3/spine_losses.csv or
+    ns3/receiver_holds.csv, writes a row of each only where its series sends
+    or receives, loses or changes grade or hold (and one row of an interval
+    that would write none); False writes every row.
     """
 
     link_rate: str
@@ -2658,10 +2659,11 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
         isinstance(network, ClosNetwork)
         and network.sparse_hold_trace
         and not network.load_balancing.traces_spine_loss()
+        and not network.load_balancing.traces_receiver_hold()
     ):
         raise ValueError(
             "network.sparse_hold_trace requires a load_balancing that writes "
-            "ns3/spine_losses.csv"
+            "ns3/spine_losses.csv or ns3/receiver_holds.csv"
         )
     _require_acknowledged_packets(network)
     return network

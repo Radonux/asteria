@@ -164,9 +164,24 @@ class SparseHoldTraceTests(unittest.TestCase):
         manifest, _, config = _generated(document)
         self.assertIn("\nSPINE_LOSS_SPARSE on\n", config)
         self.assertIs(manifest["physical_topology"]["sparse_hold_trace"], True)
+        self.assertNotIn("RECEIVER_HOLD_SPARSE", config)
         manifest, _, config = _generated(_job(background=None))
         self.assertNotIn("SPINE_LOSS_SPARSE", config)
         self.assertNotIn("sparse_hold_trace", manifest["physical_topology"])
+
+    def test_each_hold_trace_written_is_sparse(self) -> None:
+        receiver = {"path_seq": True, "receiver_hold": True}
+        for selector, sender in (("reps_hold", True), ("reps_flow_hold", False)):
+            with self.subTest(selector=selector):
+                document = _job(background=None)
+                document["network"]["load_balancing"] = {**HOLD, "selector": selector, **receiver}
+                document["network"]["sparse_hold_trace"] = True
+                _, _, config = _generated(document)
+                self.assertEqual("\nSPINE_LOSS_SPARSE on\n" in config, sender)
+                self.assertIn("\nRECEIVER_HOLD_SPARSE on\n", config)
+                document["network"]["sparse_hold_trace"] = False
+                _, _, config = _generated(document)
+                self.assertNotIn("RECEIVER_HOLD_SPARSE", config)
 
     def test_the_sparse_trace_needs_the_trace(self) -> None:
         document = _all_to_all()
