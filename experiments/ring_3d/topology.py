@@ -84,12 +84,16 @@ HOLD_SCOPE_SELECTORS = ("reps_hold", "mrc_hold")
 # The bytes the backend puts before a data packet's payload as a device
 # receives it, in the plain configuration: the PPP header (2), the IPv4
 # header (20), the UDP header (8) and the data header's priority group (2)
-# and sequence (4). The INT header's send time, the path sequence and the
-# tail counts add theirs where set (ClosNetwork.data_frame_bytes).
+# and sequence (4). The INT header's send time, the path sequence, the
+# answer_hold bitmap and the tail counts add theirs where set
+# (ClosNetwork.data_frame_bytes).
 DATA_FRAME_HEADER_BYTES = 36
 INT_SEND_TIME_BYTES = 8
 PATH_SEQ_BYTES = 2
 TAIL_COUNT_BYTES = 2
+# The spines a byte of a spine bitmap names, as the answer_hold bitmap of a
+# data header under answer_path_seq does.
+SPINES_PER_BITMAP_BYTE = 8
 # The most spines a receiver's hold names in an acknowledgement's bitmap.
 MAX_RECEIVER_HOLD_SPINES = 8
 # The most spines a closing packet's per-spine counts name under
@@ -471,7 +475,9 @@ class ClosNetwork:
         byte is derived at and the backend checks: the payload and
         DATA_FRAME_HEADER_BYTES, with the INT header's send time where
         ack_redirect or one_way_delay asks for it, the path sequence under
-        path_seq and the flags and a count per spine under tail_recovery."""
+        path_seq, with a bit per spine of the answer_hold bitmap under
+        answer_path_seq, and the flags and a count per spine under
+        tail_recovery."""
         balancing = dict(self.load_balancing.parameters)
         header = DATA_FRAME_HEADER_BYTES
         if (
@@ -481,6 +487,8 @@ class ClosNetwork:
             header += INT_SEND_TIME_BYTES
         if balancing.get("path_seq") is True:
             header += PATH_SEQ_BYTES
+        if balancing.get("answer_path_seq") is True:
+            header += -(-self.live_spine_count // SPINES_PER_BITMAP_BYTE)
         if balancing.get("tail_recovery") is True:
             header += 1 + TAIL_COUNT_BYTES * self.live_spine_count
         return self.packet_payload_bytes + header

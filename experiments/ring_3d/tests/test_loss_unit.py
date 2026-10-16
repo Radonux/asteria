@@ -68,6 +68,20 @@ class LossUnitTests(LinkTests):
                 FRAME + 2 + 1 + 2 * 8,
             ),
             ({"mode": "spray_uniform", "selector": "ack_redirect"}, FRAME + 8),
+            (
+                {
+                    "mode": "spray_uniform",
+                    "selector": "reps_hold",
+                    "loss_thresholds": [0.01, 0.02, 0.05],
+                    "loss_interval_ns": 100000,
+                    "loss_hold_clean_sentinels": 4,
+                    "held_exploration": "sentinel",
+                    "path_seq": True,
+                    "ack_route": "spray",
+                    "answer_path_seq": True,
+                },
+                FRAME + 2 + 1,
+            ),
         ):
             with self.subTest(balancing=balancing):
                 lines = self._lines({**LOSS, "loss_unit": "byte"}, balancing=balancing)
