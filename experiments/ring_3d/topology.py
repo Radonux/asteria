@@ -932,8 +932,10 @@ def _path_state(value: Any, field: str) -> str:
 
 
 def _ack_route(value: Any, field: str) -> str:
-    if value not in ("data_spine", "spray"):
-        raise ValueError(f"{field} must be 'data_spine' or 'spray'")
+    if value not in ("data_spine", "spray", "reverse_set", "repath"):
+        raise ValueError(
+            f"{field} must be 'data_spine', 'spray', 'reverse_set' or 'repath'"
+        )
     return value
 
 
@@ -1311,13 +1313,20 @@ PATH_STATE_KEY = BalancingParameter(
 # receiver sends back to a sender is routed over, an acknowledgement, a NACK or
 # a repair request, the spine that carried the data packet it answers,
 # data_spine, or one the receiver draws uniformly per answer, spray; absent,
-# data_spine. ack_route_oracle, read only under spray, leaves out of the draw
-# the spines over which an answer toward the sender's leaf crosses a fault the
-# switches' state shows, from its onset; absent, false.
+# data_spine; or per connection, a sending host and priority group, a member
+# drawn per answer of a set of ack_route_set_size spines the receiver probes
+# once per base RTT and renews, reverse_set, or one spine the receiver draws
+# again at each duplicate data arrival, repath. ack_route_oracle, read only
+# under spray, leaves out of the draw the spines over which an answer toward
+# the sender's leaf crosses a fault the switches' state shows, from its onset;
+# absent, false. ack_route_set_size, read only under reverse_set; absent, 2.
 ACK_ROUTE_KEYS: tuple[BalancingParameter, ...] = (
     BalancingParameter("ack_route", "ACK_ROUTE", "data_spine", _ack_route),
     BalancingParameter(
         "ack_route_oracle", "ACK_ROUTE_ORACLE", False, _flag, _on_off
+    ),
+    BalancingParameter(
+        "ack_route_set_size", "ACK_ROUTE_SET_SIZE", 2, _positive_int
     ),
 )
 # stray_path_seq, after ack_route_oracle, read only with path_seq true: how
@@ -1529,6 +1538,7 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "path_state",
     "ack_route",
     "ack_route_oracle",
+    "ack_route_set_size",
     "copy_expiry",
     "stray_path_seq",
     "coverage_first",
@@ -1687,8 +1697,8 @@ def _load_uniform_draw(
             "network.load_balancing.mode 'spray_uniform' without a selector "
             "takes no other key than path_seq, tail_recovery, "
             "tail_recovery_delay_ns, tail_loss_rtts, ack_loss_rtts, "
-            "path_state, ack_route, ack_route_oracle, stray_path_seq and "
-            "coverage_first; a selector "
+            "path_state, ack_route, ack_route_oracle, ack_route_set_size, "
+            "stray_path_seq and coverage_first; a selector "
             "and its parameters require mode 'ev_hash', or mode 'spray_uniform' "
             f"for a selector in {list(SPINE_SELECTORS)}"
         )
@@ -1702,9 +1712,9 @@ def _spray_uniform_keys(
     balancing: dict[str, Any],
 ) -> tuple[tuple[str, ParameterValue], ...]:
     """path_seq, tail_recovery, tail_recovery_delay_ns, tail_loss_rtts,
-    ack_loss_rtts, path_state, ack_route, ack_route_oracle, stray_path_seq and
-    coverage_first as given, each only when set, refused where the backend
-    refuses them."""
+    ack_loss_rtts, path_state, ack_route, ack_route_oracle, ack_route_set_size,
+    stray_path_seq and coverage_first as given, each only when set, refused
+    where the backend refuses them."""
     parsed = _parsed(
         balancing,
         tuple(parameter for parameter in SPRAY_UNIFORM_KEYS if parameter.name in balancing),
@@ -1734,11 +1744,25 @@ def _require_tail_recovery(
 def _require_ack_route(
     balancing: dict[str, Any], values: dict[str, ParameterValue]
 ) -> None:
-    """ack_route_oracle is read only under ack_route spray, as the backend
-    reads it."""
+    """ack_route_oracle is read only under ack_route spray and
+    ack_route_set_size only under reverse_set, and repath tells a copied send
+    by the tail flags tail_recovery puts on the wire, as the backend reads
+    them."""
     if "ack_route_oracle" in balancing and values.get("ack_route") != "spray":
         raise ValueError(
             "network.load_balancing.ack_route_oracle requires ack_route 'spray'"
+        )
+    if (
+        "ack_route_set_size" in balancing
+        and values.get("ack_route") != "reverse_set"
+    ):
+        raise ValueError(
+            "network.load_balancing.ack_route_set_size requires ack_route "
+            "'reverse_set'"
+        )
+    if values.get("ack_route") == "repath" and values.get("tail_recovery") is not True:
+        raise ValueError(
+            "network.load_balancing.ack_route 'repath' requires tail_recovery true"
         )
 
 

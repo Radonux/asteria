@@ -121,7 +121,7 @@ class AckRouteTest(unittest.TestCase):
         refusals: list[tuple[dict[str, object], str]] = [
             (
                 {**HOLD, "ack_route": value},
-                "ack_route must be 'data_spine' or 'spray'",
+                "ack_route must be 'data_spine', 'spray', 'reverse_set' or 'repath'",
             )
             for value in ("data", "", None, True, 1)
         ]
