@@ -2,11 +2,12 @@
 
 ``network.link_overrides`` gives chosen links their own rate, delay or error
 rate for the whole run, in the topology file. ``network.link_failures`` changes
-a spine's links, or one leaf-spine link, at a time in the run, through
-``LINK_FAILURE`` lines in the network configuration, and, for a failure with a
-duration, restores them through ``LINK_RESTORE`` lines. A Clos link is named by
-its leaf and spine index, the spine index counting the spines that are built;
-any link may also be named by the node ids at its two ends.
+a spine's links, one leaf-spine link, or one host's link to its leaf, at a time
+in the run, through ``LINK_FAILURE`` lines in the network configuration, and,
+for a failure with a duration, restores them through ``LINK_RESTORE`` lines. A
+Clos link is named by its leaf and spine index, the spine index counting the
+spines that are built, or a host's link by the host's index; any link may also
+be named by the node ids at its two ends.
 
 This module imports nothing else from the package, so ``topology`` can import
 it without a cycle.
@@ -25,7 +26,9 @@ FAILURE_MODELS = ("graceful", "silent", "gray")
 # size, the rate derived so that a full data frame keeps error_rate.
 LOSS_UNITS = ("frame", "byte")
 # A failure's direction on its leaf-spine link: "up" is what the leaf sends
-# the spine, "down" what the spine sends the leaf, "both" the two.
+# the spine, "down" what the spine sends the leaf, "both" the two; on a host's
+# link, "up" is what the host sends its leaf and "down" what the leaf sends the
+# host.
 FAILURE_DIRECTIONS = ("up", "down", "both")
 
 
@@ -37,11 +40,19 @@ class ClosIndex:
     leaf_count: int
     spine_count: int
 
+    def host(self, index: int) -> int:
+        return index
+
     def leaf(self, index: int) -> int:
         return self.host_count + index
 
     def spine(self, index: int) -> int:
         return self.host_count + self.leaf_count + index
+
+    def host_leaf(self, host: int) -> int:
+        """The node id of the leaf host is attached to: hosts are attached
+        to the leaves in order, the same number to each."""
+        return self.leaf(host // (self.host_count // self.leaf_count))
 
 
 @dataclass(frozen=True)
@@ -64,7 +75,8 @@ class LinkOverride:
 
 @dataclass(frozen=True)
 class LinkFailure:
-    """A spine's links, or one leaf-spine link, failing at start_ns.
+    """A spine's links, one leaf-spine link, or one host's link to its leaf,
+    failing at start_ns.
 
     ``graceful`` takes the links down, so the routing and every leaf see it.
     ``silent`` leaves them up while a switch drops every packet arriving over
@@ -83,11 +95,17 @@ class LinkFailure:
     and the failure happens ``repeat`` times, ``period_ns`` apart; without it
     the failure lasts to the end of the run. ``repeat`` and ``period_ns`` are
     None when the profile leaves them out.
+
+    With ``host`` the failure is of that host's link to its leaf, and
+    ``spine`` and ``leaf`` are None: ``direction`` "up" is what the host
+    sends the leaf and "down" what the leaf sends the host. Only the leaf
+    can drop what arrives as ``silent``, so a silent host link fails "up"
+    alone, and a ``graceful`` one, which would cut the host off, is refused.
     """
 
     model: str
     start_ns: int
-    spine: int
+    spine: int | None
     leaf: int | None
     error_rate: float | None
     rate: str | None
@@ -98,6 +116,8 @@ class LinkFailure:
     direction: str | None = None
     # As the profile gives it; None when it leaves it out.
     loss_unit: str | None = None
+    # The host whose link to its leaf fails; None for a leaf-spine failure.
+    host: int | None = None
 
     def effective_direction(self) -> str:
         """The direction the failure applies in: "up" for an unspecified
@@ -194,14 +214,26 @@ class LinkFailure:
         if self.loss_unit == "byte":
             token += f" byte {frame_bytes}"
         lines = []
-        for leaf in self.leaves(index.leaf_count):
-            for a, b in self._ends(index.leaf(leaf), index.spine(self.spine)):
-                link = f"{a} {b}"
-                for start, end in self.occurrences():
-                    lines.append(f"LINK_FAILURE {start} {kind} {link}{value}{token}\n")
-                    if end is not None:
-                        lines.append(f"LINK_RESTORE {end} {link}\n")
+        for a, b in self._node_pairs(index):
+            link = f"{a} {b}"
+            for start, end in self.occurrences():
+                lines.append(f"LINK_FAILURE {start} {kind} {link}{value}{token}\n")
+                if end is not None:
+                    lines.append(f"LINK_RESTORE {end} {link}\n")
         return lines
+
+    def _node_pairs(self, index: ClosIndex) -> list[tuple[int, int]]:
+        """The node pairs _ends gives for every affected link: the host's
+        link, its host's end taking a leaf's place and its leaf's a spine's,
+        or each leaf-spine link."""
+        if self.host is not None:
+            return self._ends(index.host(self.host), index.host_leaf(self.host))
+        assert self.spine is not None
+        return [
+            pair
+            for leaf in self.leaves(index.leaf_count)
+            for pair in self._ends(index.leaf(leaf), index.spine(self.spine))
+        ]
 
     def manifest(self, frame_bytes: int) -> dict[str, Any]:
         """The failure as given; direction and loss_unit only when the
@@ -211,8 +243,11 @@ class LinkFailure:
         recorded: dict[str, Any] = {
             "model": self.model,
             "start_ns": self.start_ns,
-            "spine": self.spine,
-            "leaf": self.leaf,
+            **(
+                {"spine": self.spine, "leaf": self.leaf}
+                if self.host is None
+                else {"host": self.host}
+            ),
             "error_rate": self.error_rate,
             "rate": self.rate,
             "duration_ns": self.duration_ns,
@@ -362,7 +397,8 @@ def load_link_overrides(
 def load_link_failures(
     document: dict[str, Any], clos: ClosIndex | None
 ) -> tuple[LinkFailure, ...]:
-    """Parse ``network.link_failures`` against the spines and leaves built."""
+    """Parse ``network.link_failures`` against the hosts, spines and leaves
+    built."""
     value = document.get("link_failures", [])
     if not isinstance(value, list):
         raise ValueError("network.link_failures must be an array")
@@ -371,7 +407,9 @@ def load_link_failures(
     if clos is None:
         raise ValueError("network.link_failures needs a Clos fabric")
     failures: list[LinkFailure] = []
-    failed: dict[tuple[int, int], list[LinkFailure]] = {}
+    # Per link, the failures of it: a leaf-spine link by (leaf, spine), a
+    # host's link by ("host", host).
+    failed: dict[tuple[Any, int], list[LinkFailure]] = {}
     down: dict[int, set[int]] = {}
     for position, entry in enumerate(value):
         field = f"network.link_failures[{position}]"
@@ -380,7 +418,11 @@ def load_link_failures(
         model = entry.get("model")
         if model not in FAILURE_MODELS:
             raise ValueError(f"{field}.model must be one of {list(FAILURE_MODELS)}")
-        allowed = {"model", "start_ns", "spine", "leaf", "direction"}
+        # A host's link is named by the host alone.
+        named = ("host",) if "host" in entry else ("spine",)
+        allowed = {"model", "start_ns", *named, "direction"}
+        if "host" not in entry:
+            allowed.add("leaf")
         if model == "gray":
             allowed |= {"error_rate", "rate"}
             if len({"error_rate", "rate"} & set(entry)) != 1:
@@ -399,10 +441,11 @@ def load_link_failures(
             if "duration_ns" in entry:
                 allowed |= {"repeat", "period_ns"}
         unknown = set(entry) - allowed
-        if unknown or not {"model", "start_ns", "spine"} <= set(entry):
+        if unknown or not {"model", "start_ns", *named} <= set(entry):
             raise ValueError(
-                f"{field} must contain model, start_ns and spine and may contain "
-                f"{sorted(allowed - {'model', 'start_ns', 'spine'})}"
+                f"{field} must contain model, start_ns and spine, or model, "
+                f"start_ns and host, and may contain "
+                f"{sorted(allowed - {'model', 'start_ns', *named})}"
             )
         start_ns = entry["start_ns"]
         if isinstance(start_ns, bool) or not isinstance(start_ns, int) or start_ns < 0:
@@ -426,10 +469,30 @@ def load_link_failures(
             period_ns <= duration_ns
         ):
             raise ValueError(f"{field}.period_ns must be greater than duration_ns")
+        host = (
+            _index(entry["host"], f"{field}.host", clos.host_count)
+            if "host" in entry
+            else None
+        )
+        direction = _direction(entry, field, model)
+        if host is not None and model == "graceful":
+            raise ValueError(
+                f"{field} is graceful, which would cut host {host} off from "
+                "its leaf; a host's link fails silent or gray"
+            )
+        if host is not None and model == "silent" and direction not in (None, "up"):
+            raise ValueError(
+                f"{field}.direction must be 'up' for a silent host link: only "
+                "the leaf, a switch, drops what arrives over it"
+            )
         failure = LinkFailure(
             model=model,
             start_ns=start_ns,
-            spine=_index(entry["spine"], f"{field}.spine", clos.spine_count),
+            spine=(
+                None
+                if host is not None
+                else _index(entry["spine"], f"{field}.spine", clos.spine_count)
+            ),
             leaf=(
                 _index(entry["leaf"], f"{field}.leaf", clos.leaf_count)
                 if "leaf" in entry
@@ -446,18 +509,24 @@ def load_link_failures(
             duration_ns=duration_ns,
             repeat=repeat,
             period_ns=period_ns,
-            direction=_direction(entry, field, model),
+            direction=direction,
             loss_unit=entry.get("loss_unit"),
+            host=host,
         )
-        for leaf in failure.leaves(clos.leaf_count):
-            earlier = failed.setdefault((leaf, failure.spine), [])
+        links: list[tuple[Any, int]] = (
+            [("host", host)]
+            if host is not None
+            else [(leaf, failure.spine) for leaf in failure.leaves(clos.leaf_count)]
+        )
+        for leaf, spine in links:
+            earlier = failed.setdefault((leaf, spine), [])
             if any(failure.overlaps(other) for other in earlier):
                 raise ValueError(
                     f"{field} fails a link while an earlier failure of it lasts"
                 )
             earlier.append(failure)
             if model == "graceful":
-                down.setdefault(leaf, set()).add(failure.spine)
+                down.setdefault(leaf, set()).add(spine)
         failures.append(failure)
     # A leaf with every uplink down is cut off and no flow to it can finish.
     if any(len(spines) == clos.spine_count for spines in down.values()):
