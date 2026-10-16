@@ -68,13 +68,19 @@ class GroupHostsTests(unittest.TestCase):
         self.assertIn(
             f"\nHOLD_TRACE_HOSTS 16 {' '.join(map(str, members))}\n", config
         )
+        self.assertIn(
+            f"\nTRANSPORT_EVENT_HOSTS 16 {' '.join(map(str, members))}\n", config
+        )
+        self.assertEqual(manifest["transport_event_hosts"], members)
 
     def test_a_group_of_whole_leaves_traces_every_host(self) -> None:
         document = _all_to_all(group={"leaves": [0, 1]})
         document["network"]["spine_count"] = 4
         document["network"]["load_balancing"] = HOLD
-        _, _, config = _generated(document)
+        manifest, _, config = _generated(document)
         self.assertNotIn("HOLD_TRACE_HOSTS", config)
+        self.assertNotIn("TRANSPORT_EVENT_HOSTS", config)
+        self.assertNotIn("transport_event_hosts", manifest)
 
 
 class BackgroundTests(unittest.TestCase):

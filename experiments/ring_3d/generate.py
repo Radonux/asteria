@@ -2278,6 +2278,14 @@ def write_network_config(
             + " ".join(str(host) for host in trace_hosts)
             + "\n"
         )
+    # The transport event rows of the packets from or to the listed hosts
+    # alone; the summary still counts every packet.
+    if trace_hosts is not None:
+        hold_trace_settings += (
+            f"TRANSPORT_EVENT_HOSTS {len(trace_hosts)} "
+            + " ".join(str(host) for host in trace_hosts)
+            + "\n"
+        )
     # The ECN maps cover every link speed of the fabric (link_rates_bps).
     rows = ecn_rows(link_rates_bps)
     ecn_maps = switch.ecn_threshold_maps(
@@ -2857,6 +2865,11 @@ def materialize(
             ).items()
         },
     }
+    # The raw stream holds the rows of the packets from or to these hosts
+    # alone (TRANSPORT_EVENT_HOSTS); the summary still counts every packet.
+    event_hosts = hold_trace_hosts(profile)
+    if event_hosts is not None:
+        manifest["transport_event_hosts"] = list(event_hosts)
     if model_metadata is not None:
         manifest["model_trace"] = model_metadata
     (output_dir / "manifest.json").write_text(
