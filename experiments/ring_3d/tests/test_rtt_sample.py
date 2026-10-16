@@ -1,5 +1,5 @@
 """congestion_control.rtt_sample under nscc, and load_balancing
-duplicate_report with coverage_first."""
+duplicate_report, true or retract, with coverage_first."""
 
 from __future__ import annotations
 
@@ -77,6 +77,27 @@ class RttSampleTest(unittest.TestCase):
             self.write({"mode": "nscc"}, balancing)
             with self.subTest(balancing=balancing):
                 with self.assertRaisesRegex(ValueError, "duplicate_report requires coverage_first true"):
+                    load_profile(self.profile_path)
+
+    def test_duplicate_report_retract(self) -> None:
+        manifest, config = self.generated(
+            {"mode": "nscc"}, {**HOLD, "coverage_first": True, "duplicate_report": "retract"})
+        self.assertIn("\nSPRAY_COVERAGE_FIRST on\nSPRAY_DUPLICATE_REPORT retract\n", config)
+        self.assertEqual(manifest["load_balancing"]["duplicate_report"], "retract")
+        for balancing, message in (
+            ({**HOLD, "coverage_first": True, "duplicate_report": "later"}, "a boolean or 'retract'"),
+            ({**HOLD, "duplicate_report": "retract"}, "duplicate_report requires coverage_first true"),
+            ({**HOLD, "coverage_first": True, "duplicate_report": "retract", "hold_scope": "leaf"},
+             "'retract' requires selector 'reps_hold' or 'mrc_hold' with hold_scope 'auto'"),
+            ({**HOLD, "coverage_first": True, "duplicate_report": "retract", "hold_rule": "llr",
+              "loss_p0": 0.0},
+             "'retract' requires selector"),
+            ({"mode": "spray_uniform", "path_seq": True, "coverage_first": True, "duplicate_report": "retract"},
+             "'retract' requires selector"),
+        ):
+            self.write({"mode": "nscc"}, balancing)
+            with self.subTest(balancing=balancing):
+                with self.assertRaisesRegex(ValueError, message):
                     load_profile(self.profile_path)
 
 

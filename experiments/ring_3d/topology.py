@@ -1030,6 +1030,17 @@ def _on_off(value: ParameterValue) -> str:
     return "on" if value else "off"
 
 
+def _duplicate_report(value: Any, field: str) -> bool | str:
+    if not isinstance(value, bool) and value != "retract":
+        raise ValueError(f"{field} must be a boolean or 'retract'")
+    return value
+
+
+def _duplicate_report_value(value: ParameterValue) -> str:
+    """SPRAY_DUPLICATE_REPORT's on, off or retract."""
+    return "retract" if value == "retract" else _on_off(value)
+
+
 def _hold_auto_leaves(value: Any, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 2:
         raise ValueError(f"{field} must be an integer of at least 2")
@@ -1375,11 +1386,18 @@ COVERAGE_FIRST_KEY = BalancingParameter(
     "coverage_first", "SPRAY_COVERAGE_FIRST", False, _flag, _on_off
 )
 # duplicate_report, after coverage_first and read only with it true: whether
-# a receiver flags its answer to a data packet it held already, and a sender
-# tells a timed-out send's loss only at its resend's answer, none where that
-# answer is flagged; absent, false.
+# a receiver flags its answer to a data packet it held already, and what a
+# sender makes of the flag on a timed-out send's resend's answer: true tells
+# the loss only at that answer, none where it is flagged; "retract" tells
+# each timed-out send's loss at once and takes it back where the answer is
+# flagged, the hold it began graded again without it, under reps_hold or
+# mrc_hold with hold_scope auto and hold_rule count; absent, false.
 DUPLICATE_REPORT_KEY = BalancingParameter(
-    "duplicate_report", "SPRAY_DUPLICATE_REPORT", False, _flag, _on_off
+    "duplicate_report",
+    "SPRAY_DUPLICATE_REPORT",
+    False,
+    _duplicate_report,
+    _duplicate_report_value,
 )
 SPRAY_UNIFORM_KEYS: tuple[BalancingParameter, ...] = (
     PATH_SEQ_KEY,
@@ -1820,11 +1838,21 @@ def _require_stray_path_seq(
 def _require_duplicate_report(
     balancing: dict[str, Any], values: dict[str, ParameterValue]
 ) -> None:
-    """duplicate_report is read only with coverage_first true, as the
-    backend reads it."""
+    """duplicate_report is read only with coverage_first true, and its
+    "retract" takes a loss back from the host's auto loss hold alone, as the
+    backend does."""
     if "duplicate_report" in balancing and values.get("coverage_first") is not True:
         raise ValueError(
             "network.load_balancing.duplicate_report requires coverage_first true"
+        )
+    if values.get("duplicate_report") == "retract" and (
+        balancing.get("selector") not in HOLD_SCOPE_SELECTORS
+        or balancing.get("hold_scope", "auto") != "auto"
+        or balancing.get("hold_rule", "count") != "count"
+    ):
+        raise ValueError(
+            "network.load_balancing.duplicate_report 'retract' requires selector "
+            "'reps_hold' or 'mrc_hold' with hold_scope 'auto' and hold_rule 'count'"
         )
 
 
