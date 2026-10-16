@@ -934,6 +934,12 @@ def _copy_expiry(value: Any, field: str) -> str:
     return value
 
 
+def _stray_path_seq(value: Any, field: str) -> str:
+    if value not in ("fresh", "closed"):
+        raise ValueError(f"{field} must be 'fresh' or 'closed'")
+    return value
+
+
 def _oracle_hops(value: Any, field: str) -> str:
     if value not in ("round_trip", "forward"):
         raise ValueError(f"{field} must be 'round_trip' or 'forward'")
@@ -1305,12 +1311,23 @@ ACK_ROUTE_KEYS: tuple[BalancingParameter, ...] = (
         "ack_route_oracle", "ACK_ROUTE_ORACLE", False, _flag, _on_off
     ),
 )
+# stray_path_seq, after ack_route_oracle, read only with path_seq true: how
+# the receiver reads the path sequences of a packet arriving after its flow's
+# receive queue pair was removed at the flow's completion (a copy, a repaired
+# send or a repair still in flight), as a new flow's, fresh, or against the
+# removed queue pair, closed, so that it counts no gap, asks no tail repair
+# and counts nothing in the receiver's hold, and only takes its sequence out
+# of that queue pair's waiting tail runs; absent, fresh.
+STRAY_PATH_SEQ_KEY = BalancingParameter(
+    "stray_path_seq", "SPRAY_STRAY_PATH_SEQ", "fresh", _stray_path_seq
+)
 SPRAY_UNIFORM_KEYS: tuple[BalancingParameter, ...] = (
     PATH_SEQ_KEY,
     *TAIL_RECOVERY_KEYS,
     ACK_LOSS_KEY,
     PATH_STATE_KEY,
     *ACK_ROUTE_KEYS,
+    STRAY_PATH_SEQ_KEY,
 )
 # copy_expiry, last, read only by the loss hold selectors under
 # sentinel_mode duplicate: when a copy its own acknowledgement has not
@@ -1388,7 +1405,7 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
 # Each loss hold selector's parameters: REPS's, or MRC's but its set, which
 # is the spines, defaults filled in; then the loss hold's, path_seq among
 # them, tail recovery's, ack_loss_rtts, receiver_tail_missing, path_state,
-# ack_route, ack_route_oracle and copy_expiry.
+# ack_route, ack_route_oracle, copy_expiry and stray_path_seq.
 LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
     "reps_hold": (
         *SELECTOR_PARAMETERS["reps"],
@@ -1399,6 +1416,7 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         PATH_STATE_KEY,
         *ACK_ROUTE_KEYS,
         COPY_EXPIRY_KEY,
+        STRAY_PATH_SEQ_KEY,
     ),
     "reps_flow_hold": (
         *SELECTOR_PARAMETERS["reps"],
@@ -1409,6 +1427,7 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         PATH_STATE_KEY,
         *ACK_ROUTE_KEYS,
         COPY_EXPIRY_KEY,
+        STRAY_PATH_SEQ_KEY,
     ),
     "mrc_hold": (
         *(
@@ -1423,6 +1442,7 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         PATH_STATE_KEY,
         *ACK_ROUTE_KEYS,
         COPY_EXPIRY_KEY,
+        STRAY_PATH_SEQ_KEY,
     ),
 }
 LOSS_HOLD_REQUIRED_PARAMETERS = (
@@ -1462,6 +1482,7 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "ack_route",
     "ack_route_oracle",
     "copy_expiry",
+    "stray_path_seq",
 }
 # reps_oracle: REPS's parameters, defaults filled in, and the cost source the
 # backend requires, switch_queue, which builds the switches' state it reads.
@@ -1614,7 +1635,7 @@ def _load_uniform_draw(
             "network.load_balancing.mode 'spray_uniform' without a selector "
             "takes no other key than path_seq, tail_recovery, "
             "tail_recovery_delay_ns, tail_loss_rtts, ack_loss_rtts, "
-            "path_state, ack_route and ack_route_oracle; a selector "
+            "path_state, ack_route, ack_route_oracle and stray_path_seq; a selector "
             "and its parameters require mode 'ev_hash', or mode 'spray_uniform' "
             f"for a selector in {list(SPINE_SELECTORS)}"
         )
@@ -1628,14 +1649,15 @@ def _spray_uniform_keys(
     balancing: dict[str, Any],
 ) -> tuple[tuple[str, ParameterValue], ...]:
     """path_seq, tail_recovery, tail_recovery_delay_ns, tail_loss_rtts,
-    ack_loss_rtts, path_state, ack_route and ack_route_oracle as given, each
-    only when set, refused where the backend refuses them."""
+    ack_loss_rtts, path_state, ack_route, ack_route_oracle and stray_path_seq
+    as given, each only when set, refused where the backend refuses them."""
     parsed = _parsed(
         balancing,
         tuple(parameter for parameter in SPRAY_UNIFORM_KEYS if parameter.name in balancing),
     )
     _require_tail_recovery(balancing, dict(parsed))
     _require_ack_route(balancing, dict(parsed))
+    _require_stray_path_seq(balancing, dict(parsed))
     return parsed
 
 
@@ -1663,6 +1685,17 @@ def _require_ack_route(
     if "ack_route_oracle" in balancing and values.get("ack_route") != "spray":
         raise ValueError(
             "network.load_balancing.ack_route_oracle requires ack_route 'spray'"
+        )
+
+
+def _require_stray_path_seq(
+    balancing: dict[str, Any], values: dict[str, ParameterValue]
+) -> None:
+    """stray_path_seq is read only with path_seq true, as the backend reads
+    it."""
+    if "stray_path_seq" in balancing and values.get("path_seq") is not True:
+        raise ValueError(
+            "network.load_balancing.stray_path_seq requires path_seq true"
         )
 
 
@@ -1747,6 +1780,7 @@ def _load_loss_hold_selector(
         raise ValueError("network.load_balancing.receiver_hold requires path_seq true")
     _require_tail_recovery(balancing, values)
     _require_ack_route(balancing, values)
+    _require_stray_path_seq(balancing, values)
     if "copy_expiry" in balancing and values.get("sentinel_mode", "data") != "duplicate":
         raise ValueError(
             "network.load_balancing.copy_expiry requires sentinel_mode 'duplicate'"
