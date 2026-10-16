@@ -1506,6 +1506,19 @@ RECEIVER_TAIL_MISSING_KEY = BalancingParameter(
 # absent; the backend reads loss_p0, loss_p1 and
 # hold_alpha only under hold_rule llr or hold_release trickle, hold_beta only
 # under llr.
+# overdue_repair and overdue_repair_limit, in LOSS_HOLD_KEYS, are also read
+# by reps_spine, reps_oracle and the uniform draw, whose sends no hold holds,
+# last and only when set: overdue_repair "reprobe" or false alone there, its
+# repair counting no loss, after the backend's held_loss_rtts wait, which
+# they do not set.
+OVERDUE_REPAIR_KEYS: tuple[BalancingParameter, ...] = (
+    BalancingParameter(
+        "overdue_repair", "SPRAY_OVERDUE_REPAIR", False, _overdue_repair, _overdue_repair_value
+    ),
+    BalancingParameter(
+        "overdue_repair_limit", "SPRAY_OVERDUE_REPAIR_LIMIT", 2, _positive_int
+    ),
+)
 LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
     _policy_parameter("loss_thresholds"),
     BalancingParameter("loss_interval_ns", "SPRAY_LOSS_INTERVAL_NS", 0, _positive_int),
@@ -1540,12 +1553,7 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "held_loss_rtts", "SPRAY_HELD_LOSS_RTTS", 2, _nonnegative_int
     ),
-    BalancingParameter(
-        "overdue_repair", "SPRAY_OVERDUE_REPAIR", False, _overdue_repair, _overdue_repair_value
-    ),
-    BalancingParameter(
-        "overdue_repair_limit", "SPRAY_OVERDUE_REPAIR_LIMIT", 2, _positive_int
-    ),
+    *OVERDUE_REPAIR_KEYS,
     PATH_SEQ_KEY,
     BalancingParameter("receiver_hold", "SPRAY_RECEIVER_HOLD", False, _flag, _on_off),
     BalancingParameter(
@@ -1686,11 +1694,13 @@ def _parameters_of(mode: str, selector: str) -> tuple[BalancingParameter, ...]:
     if selector in LOSS_HOLD_SELECTORS:
         return LOSS_HOLD_PARAMETERS[selector]
     if selector == "reps_oracle":
-        return REPS_ORACLE_PARAMETERS + SPRAY_UNIFORM_KEYS + (ORACLE_HOPS_KEY,)
+        return (
+            REPS_ORACLE_PARAMETERS + SPRAY_UNIFORM_KEYS + (ORACLE_HOPS_KEY,) + OVERDUE_REPAIR_KEYS
+        )
     if selector == "reps_spine":
-        return REPS_SPINE_PARAMETERS + SPRAY_UNIFORM_KEYS
+        return REPS_SPINE_PARAMETERS + SPRAY_UNIFORM_KEYS + OVERDUE_REPAIR_KEYS
     if mode == "spray_uniform":
-        return SPRAY_UNIFORM_KEYS
+        return SPRAY_UNIFORM_KEYS + OVERDUE_REPAIR_KEYS
     return ()
 
 
@@ -1796,22 +1806,51 @@ def _load_uniform_draw(
     trimming: PacketTrimming | None,
 ) -> LoadBalancing:
     """spray_uniform without a selector, the uniform draw, which reads only
-    the keys spray_uniform reads under every selector."""
-    unknown = set(balancing) - {"mode"} - {p.name for p in SPRAY_UNIFORM_KEYS}
+    the keys spray_uniform reads under every selector and
+    OVERDUE_REPAIR_KEYS."""
+    unknown = (
+        set(balancing) - {"mode"} - {p.name for p in SPRAY_UNIFORM_KEYS + OVERDUE_REPAIR_KEYS}
+    )
     if unknown:
         raise ValueError(
             "network.load_balancing.mode 'spray_uniform' without a selector "
             "takes no other key than path_seq, tail_recovery, "
             "tail_recovery_delay_ns, tail_loss_rtts, ack_loss_rtts, "
             "path_state, ack_route, ack_route_oracle, ack_route_set_size, "
-            "stray_path_seq, coverage_first and duplicate_report; a selector "
+            "stray_path_seq, coverage_first, duplicate_report, overdue_repair "
+            "and overdue_repair_limit; a selector "
             "and its parameters require mode 'ev_hash', or mode 'spray_uniform' "
             f"for a selector in {list(SPINE_SELECTORS)}"
         )
     _require_reorder_tolerance("spray_uniform", recovery, trimming)
     return LoadBalancing(
-        mode="spray_uniform", parameters=_spray_uniform_keys(balancing)
+        mode="spray_uniform",
+        parameters=_spray_uniform_keys(balancing) + _spray_overdue_keys(balancing),
     )
+
+
+def _spray_overdue_keys(
+    balancing: dict[str, Any],
+) -> tuple[tuple[str, ParameterValue], ...]:
+    """overdue_repair and overdue_repair_limit as given, each only when set,
+    under a selector without a loss hold (OVERDUE_REPAIR_KEYS): overdue_repair
+    "reprobe" or false alone, and the limit under "reprobe", as the backend
+    reads them."""
+    parsed = _parsed(
+        balancing,
+        tuple(parameter for parameter in OVERDUE_REPAIR_KEYS if parameter.name in balancing),
+    )
+    values = dict(parsed)
+    if values.get("overdue_repair") not in (None, False, "reprobe"):
+        raise ValueError(
+            "network.load_balancing.overdue_repair must be 'reprobe' or false "
+            "without a loss hold selector"
+        )
+    if "overdue_repair_limit" in balancing and values.get("overdue_repair") != "reprobe":
+        raise ValueError(
+            "network.load_balancing.overdue_repair_limit requires overdue_repair 'reprobe'"
+        )
+    return parsed
 
 
 def _spray_uniform_keys(
@@ -2092,10 +2131,13 @@ def _load_reps_oracle(
 ) -> LoadBalancing:
     """spray_uniform with reps_oracle, which reads the switches' state and so
     requires grade_cost_source switch_queue, as the backend does, and
-    oracle_hops only when set."""
+    oracle_hops and OVERDUE_REPAIR_KEYS only when set."""
     names = {
         parameter.name
-        for parameter in REPS_ORACLE_PARAMETERS + SPRAY_UNIFORM_KEYS + (ORACLE_HOPS_KEY,)
+        for parameter in REPS_ORACLE_PARAMETERS
+        + SPRAY_UNIFORM_KEYS
+        + (ORACLE_HOPS_KEY,)
+        + OVERDUE_REPAIR_KEYS
     }
     unknown = set(balancing) - {"mode", "selector"} - names
     if unknown:
@@ -2119,7 +2161,10 @@ def _load_reps_oracle(
     return LoadBalancing(
         mode="spray_uniform",
         selector="reps_oracle",
-        parameters=parsed + _spray_uniform_keys(balancing) + oracle_hops,
+        parameters=parsed
+        + _spray_uniform_keys(balancing)
+        + oracle_hops
+        + _spray_overdue_keys(balancing),
     )
 
 
@@ -2128,10 +2173,14 @@ def _load_reps_spine(
     recovery: TransportRecovery | None,
     trimming: PacketTrimming | None,
 ) -> LoadBalancing:
-    """spray_uniform with reps_spine, which reads REPS's parameters and the
-    keys spray_uniform reads under every selector, and refuses the loss
-    hold's keys and every spray_policy key, as the backend does."""
-    names = {parameter.name for parameter in REPS_SPINE_PARAMETERS + SPRAY_UNIFORM_KEYS}
+    """spray_uniform with reps_spine, which reads REPS's parameters, the
+    keys spray_uniform reads under every selector and OVERDUE_REPAIR_KEYS,
+    and refuses the loss hold's other keys and every spray_policy key, as the
+    backend does."""
+    names = {
+        parameter.name
+        for parameter in REPS_SPINE_PARAMETERS + SPRAY_UNIFORM_KEYS + OVERDUE_REPAIR_KEYS
+    }
     unknown = set(balancing) - {"mode", "selector"} - names
     if unknown:
         raise ValueError(
@@ -2143,7 +2192,8 @@ def _load_reps_spine(
         mode="spray_uniform",
         selector="reps_spine",
         parameters=_parsed(balancing, REPS_SPINE_PARAMETERS)
-        + _spray_uniform_keys(balancing),
+        + _spray_uniform_keys(balancing)
+        + _spray_overdue_keys(balancing),
     )
 
 

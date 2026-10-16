@@ -195,8 +195,41 @@ class LossHoldKeysTest(unittest.TestCase):
                 self.generated({**HOLD, "overdue_repair": value, "overdue_repair_limit": 2})
         with self.assertRaisesRegex(ValueError, "overdue_repair_limit"):
             self.generated({**HOLD, "overdue_repair": "reprobe", "overdue_repair_limit": 0})
-        with self.assertRaisesRegex(ValueError, "without a selector takes no other key"):
+        with self.assertRaisesRegex(ValueError, "must be 'evidence', 'probe', 'reprobe' or false"):
             self.generated({"mode": "spray_uniform", "overdue_repair": True})
+
+    def test_overdue_reprobe_without_a_loss_hold(self) -> None:
+        # reps_spine, reps_oracle and the uniform draw read reprobe and its
+        # limit, written last and only when set, after the backend's wait.
+        for balancing in (
+            {"mode": "spray_uniform", "selector": "reps_spine"},
+            {"mode": "spray_uniform", "selector": "reps_oracle", "grade_cost_source": "switch_queue"},
+            {"mode": "spray_uniform"},
+        ):
+            with self.subTest(balancing=balancing):
+                manifest, config, _ = self.generated(
+                    {**balancing, "path_seq": True, "overdue_repair": "reprobe", "overdue_repair_limit": 3}
+                )
+                written = config.index("\nSPRAY_OVERDUE_REPAIR reprobe\nSPRAY_OVERDUE_REPAIR_LIMIT 3\n")
+                self.assertLess(config.index("\nSPRAY_PATH_SEQ on\n"), written)
+                self.assertNotIn("SPRAY_HELD_LOSS_RTTS", config)
+                self.assertEqual(
+                    (manifest["load_balancing"]["overdue_repair"], manifest["load_balancing"]["overdue_repair_limit"]),
+                    ("reprobe", 3),
+                )
+                self.assertEqual(list(manifest["load_balancing"])[-2:], ["overdue_repair", "overdue_repair_limit"])
+                manifest, config, _ = self.generated(balancing)
+                self.assertNotIn("SPRAY_OVERDUE_REPAIR", config)
+                self.assertNotIn("overdue_repair", manifest["load_balancing"])
+                manifest, config, _ = self.generated({**balancing, "overdue_repair": False})
+                self.assertIn("\nSPRAY_OVERDUE_REPAIR off\n", config)
+                for value in ("evidence", "probe"):
+                    with self.assertRaisesRegex(ValueError, "must be 'reprobe' or false without a loss hold selector"):
+                        self.generated({**balancing, "overdue_repair": value})
+                with self.assertRaisesRegex(ValueError, "overdue_repair_limit requires overdue_repair 'reprobe'"):
+                    self.generated({**balancing, "overdue_repair_limit": 3})
+        with self.assertRaisesRegex(ValueError, "does not take"):
+            self.generated({"mode": "spray_uniform", "selector": "ack_redirect", "overdue_repair": "reprobe"})
 
     def test_receiver_hold_writes_its_trace(self) -> None:
         for selector in ("reps_hold", "reps_flow_hold", "mrc_hold"):
