@@ -265,6 +265,14 @@ class LossHoldKeysTest(unittest.TestCase):
         self.assertIn("\nSPRAY_PATH_SEQ off\nSPRAY_RECEIVER_HOLD off\n", config)
         self.assertNotIn("RECEIVER_HOLD_OUTPUT_FILE", config)
 
+    def test_receiver_hold_slots_is_written_only_when_set(self) -> None:
+        manifest, config, _ = self.generated({**RECEIVER, "receiver_hold_slots": 8})
+        self.assertIn("\nSPRAY_RECEIVER_HOLD on\nSPRAY_RECEIVER_HOLD_SLOTS 8\n", config)
+        self.assertEqual(manifest["load_balancing"]["receiver_hold_slots"], 8)
+        manifest, config, _ = self.generated(RECEIVER)
+        self.assertNotIn("SPRAY_RECEIVER_HOLD_SLOTS", config)
+        self.assertNotIn("receiver_hold_slots", manifest["load_balancing"])
+
     def test_every_run_writes_the_rto_trace(self) -> None:
         for balancing in ({"mode": "ecmp"}, {"mode": "spray_uniform"}, HOLD, MRC_HOLD):
             with self.subTest(balancing=balancing):
@@ -349,6 +357,13 @@ class LossHoldKeysTest(unittest.TestCase):
             ),
             ({**RECEIVER, "receiver_hold_clean": 0}, "receiver_hold_clean must be a positive"),
             (
+                {**HOLD, "path_seq": True, "receiver_hold_slots": 8},
+                "receiver_hold_slots requires receiver_hold true",
+            ),
+            ({**RECEIVER, "receiver_hold_slots": 0}, "receiver_hold_slots must be an integer from 1"),
+            ({**RECEIVER, "receiver_hold_slots": 128}, "receiver_hold_slots must be an integer from 1"),
+            ({**RECEIVER, "receiver_hold_slots": True}, "receiver_hold_slots must be an integer from 1"),
+            (
                 {**HOLD, "hold_scope": "host", "hold_auto_leaves": 2},
                 "hold_auto_leaves requires hold_scope 'auto' or receiver_hold true",
             ),
@@ -363,6 +378,7 @@ class LossHoldKeysTest(unittest.TestCase):
             ("held_loss_rtts", 2),
             ("receiver_hold", True),
             ("receiver_hold_clean", 8),
+            ("receiver_hold_slots", 8),
             ("loss_p0", 0.0),
         ):
             refusals += [

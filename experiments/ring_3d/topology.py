@@ -678,6 +678,12 @@ def _positive_int(value: Any, field: str) -> int:
     return value
 
 
+def _receiver_hold_slots(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 127:
+        raise ValueError(f"{field} must be an integer from 1 to 127")
+    return value
+
+
 def _nonnegative_int(value: Any, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field} must be a nonnegative integer")
@@ -1519,8 +1525,9 @@ RECEIVER_TAIL_MISSING_KEY = BalancingParameter(
 # spine from which the hold covers every one. hold_rule, the hold test's
 # probabilities, hold_release with hold_trickle, sentinel_mode,
 # held_loss_rtts with overdue_repair and overdue_repair_limit, path_seq and
-# receiver_hold with receiver_hold_clean take the backend's defaults when
-# absent; the backend reads loss_p0, loss_p1 and
+# receiver_hold with receiver_hold_clean and receiver_hold_slots (the spine
+# list that replaces the per-spine bitmap on acknowledgements) take the
+# backend's defaults when absent; the backend reads loss_p0, loss_p1 and
 # hold_alpha only under hold_rule llr or hold_release trickle, hold_beta only
 # under llr.
 # overdue_repair and overdue_repair_limit, in LOSS_HOLD_KEYS, are also read
@@ -1575,6 +1582,9 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
     BalancingParameter("receiver_hold", "SPRAY_RECEIVER_HOLD", False, _flag, _on_off),
     BalancingParameter(
         "receiver_hold_clean", "SPRAY_RECEIVER_HOLD_CLEAN", 1024, _positive_int
+    ),
+    BalancingParameter(
+        "receiver_hold_slots", "SPRAY_RECEIVER_HOLD_SLOTS", 0, _receiver_hold_slots
     ),
 )
 # Each loss hold selector's parameters: REPS's, or MRC's but its set, which
@@ -1660,6 +1670,7 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "path_seq",
     "receiver_hold",
     "receiver_hold_clean",
+    "receiver_hold_slots",
     "tail_recovery",
     "tail_recovery_delay_ns",
     "tail_loss_rtts",
@@ -2092,6 +2103,10 @@ def _load_loss_hold_selector(
     if "receiver_hold_clean" in balancing and not receiver_hold:
         raise ValueError(
             "network.load_balancing.receiver_hold_clean requires receiver_hold true"
+        )
+    if "receiver_hold_slots" in balancing and not receiver_hold:
+        raise ValueError(
+            "network.load_balancing.receiver_hold_slots requires receiver_hold true"
         )
     if "receiver_tail_missing" in balancing and not (
         receiver_hold and values.get("tail_recovery") is True
