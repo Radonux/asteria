@@ -122,6 +122,7 @@ class RepsSpineTest(unittest.TestCase):
             ("receiver_hold", True),
             ("receiver_hold_clean", 8),
             ("receiver_hold_slots", 8),
+            ("receiver_hold_widen", 2),
             ("grade_cost_source", "switch_queue"),
             ("ev_set_size", 8),
         ):

@@ -684,6 +684,12 @@ def _receiver_hold_slots(value: Any, field: str) -> int:
     return value
 
 
+def _receiver_hold_widen(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 2:
+        raise ValueError(f"{field} must be an integer of at least 2")
+    return value
+
+
 def _nonnegative_int(value: Any, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field} must be a nonnegative integer")
@@ -1531,9 +1537,11 @@ RECEIVER_TAIL_MISSING_KEY = BalancingParameter(
 # spine from which the hold covers every one. hold_rule, the hold test's
 # probabilities, hold_release with hold_trickle, sentinel_mode,
 # held_loss_rtts with overdue_repair and overdue_repair_limit, path_seq and
-# receiver_hold with receiver_hold_clean and receiver_hold_slots (the spine
-# list that replaces the per-spine bitmap on acknowledgements) take the
-# backend's defaults when absent; the backend reads loss_p0, loss_p1 and
+# receiver_hold with receiver_hold_clean, receiver_hold_slots (the spine
+# list that replaces the per-spine bitmap on acknowledgements) and
+# receiver_hold_widen (a sender holding a spine toward every leaf once
+# receivers on that many destination leaves hold it, not under
+# reps_flow_hold) take the backend's defaults when absent; the backend reads loss_p0, loss_p1 and
 # hold_alpha only under hold_rule llr or hold_release trickle, hold_beta only
 # under llr.
 # overdue_repair and overdue_repair_limit, in LOSS_HOLD_KEYS, are also read
@@ -1592,6 +1600,9 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
     ),
     BalancingParameter(
         "receiver_hold_slots", "SPRAY_RECEIVER_HOLD_SLOTS", 0, _receiver_hold_slots
+    ),
+    BalancingParameter(
+        "receiver_hold_widen", "SPRAY_RECEIVER_HOLD_WIDEN", 0, _receiver_hold_widen
     ),
 )
 # Each loss hold selector's parameters: REPS's, or MRC's but its set, which
@@ -1680,6 +1691,7 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "receiver_hold",
     "receiver_hold_clean",
     "receiver_hold_slots",
+    "receiver_hold_widen",
     "tail_recovery",
     "tail_recovery_delay_ns",
     "tail_loss_rtts",
@@ -2029,6 +2041,10 @@ def _load_loss_hold_selector(
             )
         )
     )
+    # reps_flow_hold keeps each queue pair's receiver hold apart, so there
+    # is nothing to widen across leaves.
+    if selector == "reps_flow_hold":
+        parameters = tuple(p for p in parameters if p.name != "receiver_hold_widen")
     unknown = set(balancing) - {"mode", "selector"} - {p.name for p in parameters}
     if unknown:
         raise ValueError(
@@ -2112,6 +2128,10 @@ def _load_loss_hold_selector(
     if "receiver_hold_clean" in balancing and not receiver_hold:
         raise ValueError(
             "network.load_balancing.receiver_hold_clean requires receiver_hold true"
+        )
+    if "receiver_hold_widen" in balancing and not receiver_hold:
+        raise ValueError(
+            "network.load_balancing.receiver_hold_widen requires receiver_hold true"
         )
     if "receiver_hold_slots" in balancing and not receiver_hold:
         raise ValueError(

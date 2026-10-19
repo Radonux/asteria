@@ -265,6 +265,14 @@ class LossHoldKeysTest(unittest.TestCase):
         self.assertIn("\nSPRAY_PATH_SEQ off\nSPRAY_RECEIVER_HOLD off\n", config)
         self.assertNotIn("RECEIVER_HOLD_OUTPUT_FILE", config)
 
+    def test_receiver_hold_widen_is_written_only_when_set(self) -> None:
+        manifest, config, _ = self.generated({**RECEIVER, "receiver_hold_widen": 2})
+        self.assertIn("\nSPRAY_RECEIVER_HOLD on\nSPRAY_RECEIVER_HOLD_WIDEN 2\n", config)
+        self.assertEqual(manifest["load_balancing"]["receiver_hold_widen"], 2)
+        manifest, config, _ = self.generated(RECEIVER)
+        self.assertNotIn("SPRAY_RECEIVER_HOLD_WIDEN", config)
+        self.assertNotIn("receiver_hold_widen", manifest["load_balancing"])
+
     def test_receiver_hold_slots_is_written_only_when_set(self) -> None:
         manifest, config, _ = self.generated({**RECEIVER, "receiver_hold_slots": 8})
         self.assertIn("\nSPRAY_RECEIVER_HOLD on\nSPRAY_RECEIVER_HOLD_SLOTS 8\n", config)
@@ -364,6 +372,16 @@ class LossHoldKeysTest(unittest.TestCase):
             ({**RECEIVER, "receiver_hold_slots": 128}, "receiver_hold_slots must be an integer from 1"),
             ({**RECEIVER, "receiver_hold_slots": True}, "receiver_hold_slots must be an integer from 1"),
             (
+                {**HOLD, "path_seq": True, "receiver_hold_widen": 2},
+                "receiver_hold_widen requires receiver_hold true",
+            ),
+            ({**RECEIVER, "receiver_hold_widen": 1}, "receiver_hold_widen must be an integer of at least 2"),
+            ({**RECEIVER, "receiver_hold_widen": True}, "receiver_hold_widen must be an integer of at least 2"),
+            (
+                {**FLOW_HOLD, "path_seq": True, "receiver_hold": True, "receiver_hold_widen": 2},
+                "'reps_flow_hold' does not take",
+            ),
+            (
                 {**HOLD, "hold_scope": "host", "hold_auto_leaves": 2},
                 "hold_auto_leaves requires hold_scope 'auto' or receiver_hold true",
             ),
@@ -379,6 +397,7 @@ class LossHoldKeysTest(unittest.TestCase):
             ("receiver_hold", True),
             ("receiver_hold_clean", 8),
             ("receiver_hold_slots", 8),
+            ("receiver_hold_widen", 2),
             ("loss_p0", 0.0),
         ):
             refusals += [
