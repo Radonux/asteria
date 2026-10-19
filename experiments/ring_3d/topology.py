@@ -1265,12 +1265,17 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "held_exploration", "SPRAY_HELD_EXPLORATION", "epsilon", _held_exploration
     ),
-    # Read only with held_exploration sentinel.
+    # Read only with held_exploration sentinel, as is held_sentinel_spread:
+    # a sentinel once due rides one send in that many, drawn per host, in
+    # place of the first send.
     BalancingParameter(
         "held_sentinel_interval_ns",
         "SPRAY_HELD_SENTINEL_INTERVAL_NS",
         0,
         _nonnegative_int,
+    ),
+    BalancingParameter(
+        "held_sentinel_spread", "SPRAY_HELD_SENTINEL_SPREAD", 1, _positive_int
     ),
     BalancingParameter("candidates", "SPRAY_CANDIDATES", 1, _positive_int),
     BalancingParameter(
@@ -1309,6 +1314,7 @@ WRITTEN_WHEN_SET_PARAMETERS = {
     "loss_hold_clean_sentinels",
     "held_exploration",
     "held_sentinel_interval_ns",
+    "held_sentinel_spread",
     "pool_decay_interval_ns",
     "pool_hold_propagates",
 }
@@ -1554,6 +1560,7 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
     ),
     _policy_parameter("held_exploration"),
     _policy_parameter("held_sentinel_interval_ns"),
+    _policy_parameter("held_sentinel_spread"),
     BalancingParameter("hold_scope", "SPRAY_HOLD_SCOPE", "auto", _hold_scope),
     BalancingParameter(
         "hold_auto_leaves", "SPRAY_HOLD_AUTO_LEAVES", 2, _hold_auto_leaves
@@ -1650,10 +1657,12 @@ LOSS_HOLD_REQUIRED_PARAMETERS = (
 SENTINEL_RELEASE_PARAMETERS = (
     "loss_hold_clean_sentinels",
     "held_sentinel_interval_ns",
+    "held_sentinel_spread",
 )
 LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "loss_hold_clean_sentinels",
     "held_sentinel_interval_ns",
+    "held_sentinel_spread",
     "hold_scope",
     "hold_auto_leaves",
     "hold_rule",
@@ -2264,14 +2273,11 @@ def _load_spray_policy(
             "network.load_balancing.held_exploration 'none' requires "
             "grade_cost_source 'switch_queue'"
         )
-    if (
-        "held_sentinel_interval_ns" in balancing
-        and balancing.get("held_exploration") != "sentinel"
-    ):
-        raise ValueError(
-            "network.load_balancing.held_sentinel_interval_ns requires "
-            "held_exploration 'sentinel'"
-        )
+    for key in ("held_sentinel_interval_ns", "held_sentinel_spread"):
+        if key in balancing and balancing.get("held_exploration") != "sentinel":
+            raise ValueError(
+                f"network.load_balancing.{key} requires held_exploration 'sentinel'"
+            )
     for key in ("pool_decay_interval_ns", "pool_hold_propagates"):
         if key in balancing and not (
             _probability(

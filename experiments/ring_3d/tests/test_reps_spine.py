@@ -112,6 +112,7 @@ class RepsSpineTest(unittest.TestCase):
             ("loss_hold_clean_sentinels", 4),
             ("held_exploration", "sentinel"),
             ("held_sentinel_interval_ns", 1000),
+            ("held_sentinel_spread", 64),
             ("hold_scope", "host"),
             ("hold_auto_leaves", 2),
             ("hold_rule", "llr"),

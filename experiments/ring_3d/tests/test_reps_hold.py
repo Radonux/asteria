@@ -114,6 +114,16 @@ class RepsSpineSelectorTest(unittest.TestCase):
         self.assertEqual(balancing["hold_scope"], "host")
         self.assertIn("SPINE_LOSS_OUTPUT_FILE", manifest["counter_files"])
 
+    def test_reps_hold_sentinel_spread_is_written_only_when_set(self) -> None:
+        manifest, config, _ = self.generated({**HOLD, "held_sentinel_spread": 64})
+        self.assertIn(
+            "\nSPRAY_HELD_EXPLORATION sentinel\nSPRAY_HELD_SENTINEL_SPREAD 64\n", config
+        )
+        self.assertEqual(manifest["load_balancing"]["held_sentinel_spread"], 64)
+        manifest, config, _ = self.generated(HOLD)
+        self.assertNotIn("SPRAY_HELD_SENTINEL_SPREAD", config)
+        self.assertNotIn("held_sentinel_spread", manifest["load_balancing"])
+
     def test_reps_hold_leaf_scope_is_written_when_set(self) -> None:
         manifest, config, _ = self.generated({**HOLD, "hold_scope": "leaf"})
         self.assertIn("\nSPRAY_HOLD_SCOPE leaf\n", config)
@@ -245,6 +255,10 @@ class RepsSpineSelectorTest(unittest.TestCase):
                     {**hold, "held_sentinel_interval_ns": -1},
                     "held_sentinel_interval_ns must be a nonnegative integer",
                 ),
+                (
+                    {**hold, "held_sentinel_spread": 0},
+                    "held_sentinel_spread must be a positive integer",
+                ),
                 ({**hold, "buffer_size": 256}, "buffer_size must be at most 255"),
                 (
                     {**hold, "freezing_timeout_ns": 0},
@@ -306,6 +320,7 @@ class RepsSpineSelectorTest(unittest.TestCase):
             ("loss_hold_clean_sentinels", 4),
             ("held_exploration", "sentinel"),
             ("held_sentinel_interval_ns", 0),
+            ("held_sentinel_spread", 64),
             ("hold_scope", "leaf"),
             ("hold_auto_leaves", 2),
             ("congestion_grade_floor", 1),
