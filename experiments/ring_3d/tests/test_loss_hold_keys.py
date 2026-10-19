@@ -265,6 +265,14 @@ class LossHoldKeysTest(unittest.TestCase):
         self.assertIn("\nSPRAY_PATH_SEQ off\nSPRAY_RECEIVER_HOLD off\n", config)
         self.assertNotIn("RECEIVER_HOLD_OUTPUT_FILE", config)
 
+    def test_receiver_hold_auto_leaves_is_written_only_when_set(self) -> None:
+        manifest, config, _ = self.generated({**RECEIVER, "receiver_hold_auto_leaves": 1})
+        self.assertIn("\nSPRAY_RECEIVER_HOLD on\nSPRAY_RECEIVER_HOLD_AUTO_LEAVES 1\n", config)
+        self.assertEqual(manifest["load_balancing"]["receiver_hold_auto_leaves"], 1)
+        manifest, config, _ = self.generated(RECEIVER)
+        self.assertNotIn("SPRAY_RECEIVER_HOLD_AUTO_LEAVES", config)
+        self.assertNotIn("receiver_hold_auto_leaves", manifest["load_balancing"])
+
     def test_receiver_hold_widen_is_written_only_when_set(self) -> None:
         manifest, config, _ = self.generated({**RECEIVER, "receiver_hold_widen": 2})
         self.assertIn("\nSPRAY_RECEIVER_HOLD on\nSPRAY_RECEIVER_HOLD_WIDEN 2\n", config)
@@ -376,6 +384,11 @@ class LossHoldKeysTest(unittest.TestCase):
                 "receiver_hold_widen requires receiver_hold true",
             ),
             ({**RECEIVER, "receiver_hold_widen": 1}, "receiver_hold_widen must be an integer of at least 2"),
+            (
+                {**HOLD, "path_seq": True, "receiver_hold_auto_leaves": 1},
+                "receiver_hold_auto_leaves requires receiver_hold true",
+            ),
+            ({**RECEIVER, "receiver_hold_auto_leaves": 0}, "receiver_hold_auto_leaves must be a positive integer"),
             ({**RECEIVER, "receiver_hold_widen": True}, "receiver_hold_widen must be an integer of at least 2"),
             (
                 {**FLOW_HOLD, "path_seq": True, "receiver_hold": True, "receiver_hold_widen": 2},
@@ -398,6 +411,7 @@ class LossHoldKeysTest(unittest.TestCase):
             ("receiver_hold_clean", 8),
             ("receiver_hold_slots", 8),
             ("receiver_hold_widen", 2),
+            ("receiver_hold_auto_leaves", 1),
             ("loss_p0", 0.0),
         ):
             refusals += [

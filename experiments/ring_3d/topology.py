@@ -1541,7 +1541,10 @@ RECEIVER_TAIL_MISSING_KEY = BalancingParameter(
 # list that replaces the per-spine bitmap on acknowledgements) and
 # receiver_hold_widen (a sender holding a spine toward every leaf once
 # receivers on that many destination leaves hold it, not under
-# reps_flow_hold) take the backend's defaults when absent; the backend reads loss_p0, loss_p1 and
+# reps_flow_hold) and receiver_hold_auto_leaves (the sender leaves losing on
+# a spine from which a receiver holds it for every sender leaf, in place of
+# hold_auto_leaves; 1 at its first loss) take the backend's defaults when
+# absent; the backend reads loss_p0, loss_p1 and
 # hold_alpha only under hold_rule llr or hold_release trickle, hold_beta only
 # under llr.
 # overdue_repair and overdue_repair_limit, in LOSS_HOLD_KEYS, are also read
@@ -1603,6 +1606,12 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
     ),
     BalancingParameter(
         "receiver_hold_widen", "SPRAY_RECEIVER_HOLD_WIDEN", 0, _receiver_hold_widen
+    ),
+    BalancingParameter(
+        "receiver_hold_auto_leaves",
+        "SPRAY_RECEIVER_HOLD_AUTO_LEAVES",
+        0,
+        _positive_int,
     ),
 )
 # Each loss hold selector's parameters: REPS's, or MRC's but its set, which
@@ -1692,6 +1701,7 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "receiver_hold_clean",
     "receiver_hold_slots",
     "receiver_hold_widen",
+    "receiver_hold_auto_leaves",
     "tail_recovery",
     "tail_recovery_delay_ns",
     "tail_loss_rtts",
@@ -2128,6 +2138,10 @@ def _load_loss_hold_selector(
     if "receiver_hold_clean" in balancing and not receiver_hold:
         raise ValueError(
             "network.load_balancing.receiver_hold_clean requires receiver_hold true"
+        )
+    if "receiver_hold_auto_leaves" in balancing and not receiver_hold:
+        raise ValueError(
+            "network.load_balancing.receiver_hold_auto_leaves requires receiver_hold true"
         )
     if "receiver_hold_widen" in balancing and not receiver_hold:
         raise ValueError(
