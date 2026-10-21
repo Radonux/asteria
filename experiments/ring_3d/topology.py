@@ -1474,6 +1474,14 @@ DUPLICATE_REPORT_KEY = BalancingParameter(
     _duplicate_report,
     _duplicate_report_value,
 )
+# rack_reorder_ns, after duplicate_report: the reorder window, in ns, of the
+# sender's loss rule across paths, an answer to a send made at t declaring
+# lost every outstanding send of the queue pair made at or before t less the
+# window, along any path (RACK, RFC 8985 section 6.2, without its reorder
+# timer); absent, off.
+RACK_REORDER_KEY = BalancingParameter(
+    "rack_reorder_ns", "SPRAY_RACK_REORDER_NS", 0, _positive_int
+)
 SPRAY_UNIFORM_KEYS: tuple[BalancingParameter, ...] = (
     PATH_SEQ_KEY,
     *TAIL_RECOVERY_KEYS,
@@ -1483,6 +1491,7 @@ SPRAY_UNIFORM_KEYS: tuple[BalancingParameter, ...] = (
     STRAY_PATH_SEQ_KEY,
     COVERAGE_FIRST_KEY,
     DUPLICATE_REPORT_KEY,
+    RACK_REORDER_KEY,
 )
 # answer_path_seq with answer_probe_interval_ns and answer_hold_clean, last,
 # read only by the loss hold selectors under ack_route spray with path_seq
@@ -1617,8 +1626,8 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
 # Each loss hold selector's parameters: REPS's, or MRC's but its set, which
 # is the spines, defaults filled in; then the loss hold's, path_seq among
 # them, tail recovery's, ack_loss_rtts, receiver_tail_missing, path_state,
-# ack_route, ack_route_oracle, copy_expiry, stray_path_seq, coverage_first and
-# the answer path sequences' keys.
+# ack_route, ack_route_oracle, copy_expiry, stray_path_seq, coverage_first,
+# duplicate_report, rack_reorder_ns and the answer path sequences' keys.
 LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
     "reps_hold": (
         *SELECTOR_PARAMETERS["reps"],
@@ -1632,6 +1641,7 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         STRAY_PATH_SEQ_KEY,
         COVERAGE_FIRST_KEY,
         DUPLICATE_REPORT_KEY,
+        RACK_REORDER_KEY,
         *ANSWER_PATH_SEQ_KEYS,
     ),
     "reps_flow_hold": (
@@ -1646,6 +1656,7 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         STRAY_PATH_SEQ_KEY,
         COVERAGE_FIRST_KEY,
         DUPLICATE_REPORT_KEY,
+        RACK_REORDER_KEY,
         *ANSWER_PATH_SEQ_KEYS,
     ),
     "mrc_hold": (
@@ -1664,6 +1675,7 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         STRAY_PATH_SEQ_KEY,
         COVERAGE_FIRST_KEY,
         DUPLICATE_REPORT_KEY,
+        RACK_REORDER_KEY,
         *ANSWER_PATH_SEQ_KEYS,
     ),
 }
@@ -1717,6 +1729,7 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "stray_path_seq",
     "coverage_first",
     "duplicate_report",
+    "rack_reorder_ns",
     "answer_path_seq",
     "answer_probe_interval_ns",
     "answer_hold_clean",
