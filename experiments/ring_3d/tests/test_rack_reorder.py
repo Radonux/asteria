@@ -1,4 +1,4 @@
-"""rack_reorder_ns under spray_uniform with any selector."""
+"""rack_reorder_ns and rack_defer_loss under spray_uniform with any selector."""
 
 from __future__ import annotations
 
@@ -63,6 +63,33 @@ class RackReorderTest(unittest.TestCase):
         for value in (0, -1, 1.5, "3081"):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "rack_reorder_ns"):
                 self.generated({**HOLD, "rack_reorder_ns": value})
+
+    def test_defer_loss_written_when_set(self) -> None:
+        for balancing in (HOLD, {"mode": "spray_uniform", "path_seq": True}):
+            with self.subTest(balancing=balancing):
+                manifest, config = self.generated(
+                    {**balancing, "rack_reorder_ns": 3081, "rack_defer_loss": True}
+                )
+                self.assertIn("\nSPRAY_RACK_DEFER_LOSS on\n", config)
+                self.assertTrue(manifest["load_balancing"]["rack_defer_loss"])
+        manifest, config = self.generated({**HOLD, "rack_reorder_ns": 3081})
+        self.assertNotIn("SPRAY_RACK_DEFER_LOSS", config)
+        self.assertNotIn("rack_defer_loss", manifest["load_balancing"])
+
+    def test_defer_loss_needs_the_rule_and_a_delay(self) -> None:
+        with self.assertRaisesRegex(ValueError, "rack_defer_loss requires"):
+            self.generated({**HOLD, "rack_defer_loss": True})
+        with self.assertRaisesRegex(ValueError, "rack_defer_loss requires"):
+            self.generated(
+                {
+                    **HOLD,
+                    "path_seq": True,
+                    "tail_recovery": True,
+                    "tail_loss_rtts": 0,
+                    "rack_reorder_ns": 3081,
+                    "rack_defer_loss": True,
+                }
+            )
 
 
 if __name__ == "__main__":
