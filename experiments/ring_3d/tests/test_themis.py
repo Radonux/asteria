@@ -42,6 +42,7 @@ class ThemisTest(unittest.TestCase):
         for line in (
             "SPRAY_THEMIS_PATHS 0",
             "SPRAY_THEMIS_OOO_THRESHOLD 448",
+            "SPRAY_THEMIS_STASH_MIN_NS 0",
             "SPRAY_THEMIS_AVOIDANCE_WINDOW 2000000",
             "SPRAY_THEMIS_RETX_REROUTE on",
         ):
@@ -55,6 +56,7 @@ class ThemisTest(unittest.TestCase):
                 **THEMIS,
                 "themis_paths": 2,
                 "themis_ooo_threshold": 5,
+                "themis_stash_min_ns": 24648,
                 "themis_avoidance_window": 0,
                 "themis_retx_reroute": False,
                 "path_seq": True,
@@ -65,6 +67,7 @@ class ThemisTest(unittest.TestCase):
         for line in (
             "SPRAY_THEMIS_PATHS 2",
             "SPRAY_THEMIS_OOO_THRESHOLD 5",
+            "SPRAY_THEMIS_STASH_MIN_NS 24648",
             "SPRAY_THEMIS_AVOIDANCE_WINDOW 0",
             "SPRAY_THEMIS_RETX_REROUTE off",
             "SPRAY_PATH_SEQ on",
@@ -80,8 +83,9 @@ class ThemisTest(unittest.TestCase):
                 self.generated({**THEMIS, key: value})
 
     def test_refuses_a_negative_threshold(self) -> None:
-        with self.assertRaisesRegex(ValueError, "themis_ooo_threshold"):
-            self.generated({**THEMIS, "themis_ooo_threshold": -1})
+        for key in ("themis_ooo_threshold", "themis_stash_min_ns"):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                self.generated({**THEMIS, key: -1})
 
 
 if __name__ == "__main__":

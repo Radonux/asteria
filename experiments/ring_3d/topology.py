@@ -1775,12 +1775,17 @@ REPS_SPINE_PARAMETERS: tuple[BalancingParameter, ...] = SELECTOR_PARAMETERS["rep
 # themis, defaults filled in: the paths a queue pair's packets are sprayed
 # over by sequence number, 0 for every spine; the out-of-order degree in
 # packets past which the destination signals a stashed head's path, 0 for
-# none; the redirected packets a signal avoids its path for, 0 for none; and
-# whether a repair goes up another path. The backend's defaults are Themis's.
+# none; how long in ns the head must have been stashed before it signals, 0
+# for no wait; the redirected packets a signal avoids its path for, 0 for
+# none; and whether a repair goes up another path. The backend's defaults are
+# Themis's.
 THEMIS_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter("themis_paths", "SPRAY_THEMIS_PATHS", 0, _nonnegative_int),
     BalancingParameter(
         "themis_ooo_threshold", "SPRAY_THEMIS_OOO_THRESHOLD", 448, _nonnegative_int
+    ),
+    BalancingParameter(
+        "themis_stash_min_ns", "SPRAY_THEMIS_STASH_MIN_NS", 0, _nonnegative_int
     ),
     BalancingParameter(
         "themis_avoidance_window", "SPRAY_THEMIS_AVOIDANCE_WINDOW", 2000000, _nonnegative_int
