@@ -79,6 +79,7 @@ SPINE_SELECTORS = (
     "reps_oracle",
     "mrc_hold",
     "reps_spine",
+    "themis",
 )
 # The spine selectors that keep a loss hold: per host, per destination leaf,
 # per spine either of the two, or per destination host under hold_scope, for
@@ -270,8 +271,9 @@ class LoadBalancing:
     the spines, leaving out those its loss hold holds, with ``mrc_hold`` by
     MRC over the spines with the same loss hold, and with
     ``reps_oracle`` by REPS over the spines, leaving out those the switches'
-    state shows a fault on, and with ``reps_spine`` by REPS over the spines,
-    leaving out none. ``spray_policy`` names a spine per packet the same
+    state shows a fault on, with ``reps_spine`` by REPS over the spines,
+    leaving out none, and with ``themis`` by packet sequence number with
+    Themis's path avoidance (Liu et al., EuroSys 2026). ``spray_policy`` names a spine per packet the same
     way, drawn from scores the sender builds out of the grades the receiver
     reports in every acknowledgement. Every mode but ``ecmp`` reorders a
     flow's packets on the way.
@@ -1770,6 +1772,23 @@ ORACLE_HOPS_KEY = BalancingParameter(
 # reps_spine: REPS's parameters, defaults filled in; no loss hold, no
 # sentinel, and none of the loss hold's keys.
 REPS_SPINE_PARAMETERS: tuple[BalancingParameter, ...] = SELECTOR_PARAMETERS["reps"]
+# themis, defaults filled in: the paths a queue pair's packets are sprayed
+# over by sequence number, 0 for every spine; the out-of-order degree in
+# packets past which the destination signals a stashed head's path, 0 for
+# none; the redirected packets a signal avoids its path for, 0 for none; and
+# whether a repair goes up another path. The backend's defaults are Themis's.
+THEMIS_PARAMETERS: tuple[BalancingParameter, ...] = (
+    BalancingParameter("themis_paths", "SPRAY_THEMIS_PATHS", 0, _nonnegative_int),
+    BalancingParameter(
+        "themis_ooo_threshold", "SPRAY_THEMIS_OOO_THRESHOLD", 448, _nonnegative_int
+    ),
+    BalancingParameter(
+        "themis_avoidance_window", "SPRAY_THEMIS_AVOIDANCE_WINDOW", 2000000, _nonnegative_int
+    ),
+    BalancingParameter(
+        "themis_retx_reroute", "SPRAY_THEMIS_RETX_REROUTE", True, _flag, _on_off
+    ),
+)
 
 
 def _parameters_of(mode: str, selector: str) -> tuple[BalancingParameter, ...]:
@@ -1787,6 +1806,8 @@ def _parameters_of(mode: str, selector: str) -> tuple[BalancingParameter, ...]:
         )
     if selector == "reps_spine":
         return REPS_SPINE_PARAMETERS + SPRAY_UNIFORM_KEYS + OVERDUE_REPAIR_KEYS
+    if selector == "themis":
+        return THEMIS_PARAMETERS + SPRAY_UNIFORM_KEYS + OVERDUE_REPAIR_KEYS
     if mode == "spray_uniform":
         return SPRAY_UNIFORM_KEYS + OVERDUE_REPAIR_KEYS
     return ()
@@ -1817,6 +1838,8 @@ def _load_load_balancing(
         return _load_reps_oracle(balancing, recovery, trimming)
     if mode == "spray_uniform" and balancing.get("selector") == "reps_spine":
         return _load_reps_spine(balancing, recovery, trimming)
+    if mode == "spray_uniform" and balancing.get("selector") == "themis":
+        return _load_themis(balancing, recovery, trimming)
     if mode == "spray_uniform" and balancing.get("selector") in SPINE_SELECTORS:
         return _load_spine_selector(balancing, recovery, trimming)
     if mode == "spray_uniform" and "selector" not in balancing:
@@ -2312,6 +2335,34 @@ def _load_reps_spine(
         mode="spray_uniform",
         selector="reps_spine",
         parameters=_parsed(balancing, REPS_SPINE_PARAMETERS)
+        + _spray_uniform_keys(balancing)
+        + _spray_overdue_keys(balancing),
+    )
+
+
+def _load_themis(
+    balancing: dict[str, Any],
+    recovery: TransportRecovery | None,
+    trimming: PacketTrimming | None,
+) -> LoadBalancing:
+    """spray_uniform with themis, which reads THEMIS_PARAMETERS, the keys
+    spray_uniform reads under every selector and OVERDUE_REPAIR_KEYS, and
+    refuses every loss hold and spray_policy key, as the backend does."""
+    names = {
+        parameter.name
+        for parameter in THEMIS_PARAMETERS + SPRAY_UNIFORM_KEYS + OVERDUE_REPAIR_KEYS
+    }
+    unknown = set(balancing) - {"mode", "selector"} - names
+    if unknown:
+        raise ValueError(
+            "network.load_balancing.selector 'themis' does not take "
+            f"{sorted(unknown)}"
+        )
+    _require_reorder_tolerance("spray_uniform", recovery, trimming)
+    return LoadBalancing(
+        mode="spray_uniform",
+        selector="themis",
+        parameters=_parsed(balancing, THEMIS_PARAMETERS)
         + _spray_uniform_keys(balancing)
         + _spray_overdue_keys(balancing),
     )
