@@ -878,15 +878,12 @@ SELECTOR_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         ),
     ),
     "ue_oblivious": (_UE_EV_SET_SIZE,),
-    # UEC 1.0.3 section 3.6.16.4's default saturation; how long in ns a value
-    # with a declared loss is passed over (section 3.6.16.5 leaves the time
-    # to the implementation), 0 for none.
+    # UEC 1.0.3 section 3.6.16.4's default saturation.
     "ue_aware": (
         _UE_EV_SET_SIZE,
         BalancingParameter(
             "saturation_fraction", "UE_SATURATION_FRACTION", 0.5, _fraction
         ),
-        BalancingParameter("loss_avoid_ns", "UE_LOSS_AVOID_NS", 0, _nonnegative_int),
     ),
     # A set within OCP MRC 1.0 section 11.2.1's one to two windows; a SKIP
     # value out of use for a round trip, as UEC 1.0.3 section 3.6.16.4 keeps a

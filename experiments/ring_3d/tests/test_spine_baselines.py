@@ -55,29 +55,25 @@ class SpineBaselineTest(unittest.TestCase):
 
     def test_ue_aware_spine_writes_its_keys_and_the_transport(self) -> None:
         manifest, config = self.generated(
-            {"mode": "spray_uniform", "selector": "ue_aware_spine", "loss_avoid_ns": 20000000,
+            {"mode": "spray_uniform", "selector": "ue_aware_spine",
              "path_seq": True, "rack_reorder_ns": 3081, "overdue_repair": "reprobe"}
         )
         self.assertIn(
             "\nLOAD_BALANCING spray_uniform\n"
             "PATH_SELECTOR ue_aware_spine\n"
-            "UE_SATURATION_FRACTION 0.5\n"
-            "UE_LOSS_AVOID_NS 20000000\n",
+            "UE_SATURATION_FRACTION 0.5\n",
             config,
         )
         for line in ("SPRAY_PATH_SEQ on", "SPRAY_RACK_REORDER_NS 3081", "SPRAY_OVERDUE_REPAIR reprobe"):
             self.assertIn(f"\n{line}\n", config)
         self.assertNotIn("UE_EV_SET_SIZE", config)
-        self.assertEqual(manifest["load_balancing"]["loss_avoid_ns"], 20000000)
-
-    def test_ue_aware_keeps_no_avoidance_by_default(self) -> None:
-        _, config = self.generated({"mode": "ev_hash", "selector": "ue_aware"})
-        self.assertIn("\nUE_LOSS_AVOID_NS 0\n", config)
+        self.assertEqual(manifest["load_balancing"]["saturation_fraction"], 0.5)
 
     def test_refuses_loss_hold_keys_and_the_set_size(self) -> None:
         for selector, key, value in (("mrc_spine", "ev_set_size", 8), ("mrc_spine", "loss_interval_ns", 1000),
                                      ("ue_aware_spine", "ev_set_size", 8),
-                                     ("ue_aware_spine", "receiver_hold", True)):
+                                     ("ue_aware_spine", "receiver_hold", True),
+                                     ("ue_aware_spine", "loss_avoid_ns", 1000)):
             with self.subTest(selector=selector, key=key), self.assertRaisesRegex(
                     ValueError, f"'{selector}' does not take"):
                 self.generated({"mode": "spray_uniform", "selector": selector, key: value})
