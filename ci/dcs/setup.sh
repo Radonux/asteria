@@ -16,18 +16,18 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$ROOT/bin" "$ROOT/jobs"
 
 # The forced SSH command runs outside any checkout, so it is installed to
-# a stable path, once; every job script it runs comes from a branch on
-# GitHub at submission (slice.sh).
-install -m 700 "$script_dir/slice.sh" "$ROOT/bin/"
+# a stable path; everything else deploys via the fast-forward pull in
+# accept-runner.sh on each provision.
+install -m 700 "$script_dir/accept-runner.sh" "$ROOT/bin/"
 
 cat <<EOF
 
 Setup OK under $ROOT.
 
 Next: add the CI deploy key to ~/.ssh/authorized_keys as a forced command,
-so the key can apply for SLURM slices and do nothing else:
+so the key can submit runner jobs and do nothing else:
 
-  command="$ROOT/bin/slice.sh",restrict ssh-ed25519 AAAA... asteria-ci
+  command="$ROOT/bin/accept-runner.sh",restrict ssh-ed25519 AAAA... asteria-ci
 
 Then create the GitHub secrets/vars listed in ci/dcs/README.md.
 EOF
