@@ -41,7 +41,8 @@ cluster only ever holds a `contents: read` token.
 
 `accept-runner.sh` fast-forwards the repository clone and submits the
 repo's own `runner-job.sbatch`, so a push deploys cluster-side changes on
-the next provision. Jobs are self-contained: each downloads its pinned
+the next provision. A runner name ending in `-c<N>` (N from 3 to 128)
+submits it with N cores and 4 GB per core instead of 2 cores and 16 GB. Jobs are self-contained: each downloads its pinned
 runner onto job-local scratch, and the home directory stays control-plane
 only (checkout, forced-command script, jitconfigs, logs - under 1 GB).
 
