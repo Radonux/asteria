@@ -80,14 +80,15 @@ SPINE_SELECTORS = (
     "mrc_hold",
     "reps_spine",
     "themis",
+    "themis_hold",
 )
 # The spine selectors that keep a loss hold: per host, per destination leaf,
 # per spine either of the two, or per destination host under hold_scope, for
-# reps_hold and mrc_hold; per queue pair for reps_flow_hold.
-LOSS_HOLD_SELECTORS = ("reps_hold", "reps_flow_hold", "mrc_hold")
+# reps_hold, mrc_hold and themis_hold; per queue pair for reps_flow_hold.
+LOSS_HOLD_SELECTORS = ("reps_hold", "reps_flow_hold", "mrc_hold", "themis_hold")
 # The loss hold selectors that read hold_scope and write the host's loss
 # trace.
-HOLD_SCOPE_SELECTORS = ("reps_hold", "mrc_hold")
+HOLD_SCOPE_SELECTORS = ("reps_hold", "mrc_hold", "themis_hold")
 # The bytes the backend puts before a data packet's payload as a device
 # receives it, in the plain configuration: the PPP header (2), the IPv4
 # header (20), the UDP header (8) and the data header's priority group (2)
@@ -1798,6 +1799,16 @@ THEMIS_PARAMETERS: tuple[BalancingParameter, ...] = (
         "themis_leaf_avoidance", "SPRAY_THEMIS_LEAF_AVOIDANCE", False, _flag, _on_off
     ),
 )
+# themis_hold, themis leaving out the spines the loss hold holds: Themis's
+# parameters, then mrc_hold's but MRC's own.
+LOSS_HOLD_PARAMETERS["themis_hold"] = (
+    *THEMIS_PARAMETERS,
+    *(
+        parameter
+        for parameter in LOSS_HOLD_PARAMETERS["mrc_hold"]
+        if parameter not in SELECTOR_PARAMETERS["mrc"]
+    ),
+)
 
 
 def _parameters_of(mode: str, selector: str) -> tuple[BalancingParameter, ...]:
@@ -2061,7 +2072,8 @@ def _require_duplicate_report(
     ):
         raise ValueError(
             "network.load_balancing.duplicate_report 'retract' requires selector "
-            "'reps_hold' or 'mrc_hold' with hold_scope 'auto' and hold_rule 'count'"
+            "'reps_hold', 'mrc_hold' or 'themis_hold' with hold_scope 'auto' and "
+            "hold_rule 'count'"
         )
 
 
@@ -2105,7 +2117,7 @@ def _load_loss_hold_selector(
     recovery: TransportRecovery | None,
     trimming: PacketTrimming | None,
 ) -> LoadBalancing:
-    """spray_uniform with reps_hold, reps_flow_hold or mrc_hold, which
+    """spray_uniform with reps_hold, reps_flow_hold, mrc_hold or themis_hold, which
     require the loss hold's keys and held_exploration sentinel, and read the
     keys of its rule, its release, its exploration sends and the receiver's
     hold where the backend reads them."""

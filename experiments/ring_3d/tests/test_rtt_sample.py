@@ -88,7 +88,7 @@ class RttSampleTest(unittest.TestCase):
             ({**HOLD, "coverage_first": True, "duplicate_report": "later"}, "a boolean or 'retract'"),
             ({**HOLD, "duplicate_report": "retract"}, "duplicate_report requires coverage_first true"),
             ({**HOLD, "coverage_first": True, "duplicate_report": "retract", "hold_scope": "leaf"},
-             "'retract' requires selector 'reps_hold' or 'mrc_hold' with hold_scope 'auto'"),
+             "'retract' requires selector 'reps_hold', 'mrc_hold' or 'themis_hold' with hold_scope 'auto'"),
             ({**HOLD, "coverage_first": True, "duplicate_report": "retract", "hold_rule": "llr",
               "loss_p0": 0.0},
              "'retract' requires selector"),

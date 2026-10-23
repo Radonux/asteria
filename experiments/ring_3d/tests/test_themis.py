@@ -16,6 +16,14 @@ from experiments.ring_3d.generate import materialize
 
 PROFILE = REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
 THEMIS = {"mode": "spray_uniform", "selector": "themis"}
+THEMIS_HOLD = {
+    "mode": "spray_uniform",
+    "selector": "themis_hold",
+    "loss_thresholds": [0.01, 0.02, 0.05],
+    "loss_interval_ns": 100000,
+    "loss_hold_clean_sentinels": 4,
+    "held_exploration": "sentinel",
+}
 
 
 class ThemisTest(unittest.TestCase):
@@ -85,6 +93,40 @@ class ThemisTest(unittest.TestCase):
         for key, value in (("loss_interval_ns", 100000), ("receiver_hold", True)):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, "'themis' does not take"):
                 self.generated({**THEMIS, key: value})
+
+    def test_themis_hold_reads_themis_and_the_loss_hold(self) -> None:
+        manifest, config = self.generated(
+            {
+                **THEMIS_HOLD,
+                "themis_ooo_threshold": 2,
+                "themis_stash_min_ns": 6162,
+                "themis_leaf_avoidance": True,
+                "hold_scope": "auto",
+                "path_seq": True,
+                "receiver_hold": True,
+                "rack_reorder_ns": 3081,
+            }
+        )
+        for line in (
+            "PATH_SELECTOR themis_hold",
+            "SPRAY_THEMIS_OOO_THRESHOLD 2",
+            "SPRAY_THEMIS_STASH_MIN_NS 6162",
+            "SPRAY_THEMIS_LEAF_AVOIDANCE on",
+            "SPRAY_LOSS_THRESHOLDS 0.01 0.02 0.05",
+            "SPRAY_LOSS_INTERVAL_NS 100000",
+            "SPRAY_HOLD_SCOPE auto",
+            "SPRAY_RECEIVER_HOLD on",
+            "SPRAY_RACK_REORDER_NS 3081",
+        ):
+            self.assertIn(f"\n{line}\n", config)
+        self.assertNotIn("\nMRC_SKIP_BASE_RTTS", config)
+        self.assertEqual(manifest["load_balancing"]["selector"], "themis_hold")
+
+    def test_themis_hold_requires_the_loss_hold_and_refuses_mrc_keys(self) -> None:
+        with self.assertRaisesRegex(ValueError, "loss_interval_ns"):
+            self.generated({key: value for key, value in THEMIS_HOLD.items() if key != "loss_interval_ns"})
+        with self.assertRaises(ValueError):
+            self.generated({**THEMIS_HOLD, "mrc_skip_base_rtts": 2.0})
 
     def test_refuses_a_negative_threshold(self) -> None:
         for key in ("themis_ooo_threshold", "themis_stash_min_ns"):
