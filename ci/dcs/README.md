@@ -12,8 +12,8 @@ Every record in the evaluation matrix runs on the cluster, whatever its
 1. `provision` (GitHub-hosted, ~1 min) validates the record's `kind`, then
    mints a single-job JIT runner config with a one-hour GitHub App
    installation token and pipes it over SSH to the cluster. The SSH key is
-   bound to a forced command (`accept-runner.sh`) that can only submit one
-   SLURM runner job; a leaked key gets no shell. The runner is labeled with
+   bound to a forced command (`slice.sh`, below) that applies to SLURM for
+   a slice and runs `runner-job.sbatch` on it. The runner is labeled with
    the run id, so concurrent experiments can never swap runners.
 2. `Experiment on the cluster` waits for that runner, downloads the run's
    prebuilt runtime bundle, and runs `ci/dcs/evaluate.sh <kind>` as one job
@@ -39,12 +39,39 @@ cancelled-while-queued case; `#SBATCH --time` is the absolute backstop.
 Write-scoped jobs (`archive`, ledger) stay on GitHub-hosted runners: the
 cluster only ever holds a `contents: read` token.
 
-`accept-runner.sh` fast-forwards the repository clone and submits the
-repo's own `runner-job.sbatch`, so a push deploys cluster-side changes on
-the next provision. A runner name ending in `-c<N>` (N from 3 to 128)
-submits it with N cores and 4 GB per core instead of 2 cores and 16 GB. Jobs are self-contained: each downloads its pinned
-runner onto job-local scratch, and the home directory stays control-plane
-only (checkout, forced-command script, jitconfigs, logs - under 1 GB).
+## Slices
+
+`slice.sh` is installed once and never edited on the cluster. The SSH
+command word names a slice as `key=value` pairs (plus at most one bare
+word, the job name), and stdin carries a payload of at most 64 KiB:
+
+| Key | Meaning |
+|-----|---------|
+| `name` | SLURM job name, sanitized, cut to 64 characters |
+| `branch` | Branch of `caddyreverse/asteria` the script is taken from (default `main`) |
+| `script` | Path of the job script in that branch (default `ci/dcs/runner-job.sbatch`) |
+| `cpus`, `mem`, `time` | `--cpus-per-task` (1 to 256), `--mem` (`<n>[M\|G]`, at most 2048G), `--time` |
+| `nodes`, `ntasks` | `--nodes` (1 to 8), `--ntasks` (1 to 1024) |
+| `constraint`, `partition`, `qos`, `gres` | Passed on after a charset check |
+| `test=1` | `sbatch --test-only`: validate and estimate a start, submit nothing |
+
+It resolves the branch's head with `git ls-remote`, takes the script at
+exactly that commit from GitHub, and submits it with the payload's path as
+its first argument and `DCS_SLICE_REPO`, `DCS_SLICE_BRANCH` and
+`DCS_SLICE_SHA` in its environment, so a script can fetch the rest of the
+repository at the same commit. An option left out comes from the
+script's own `#SBATCH` lines, so the defaults change with a push too.
+Anything else is refused before SLURM sees it.
+
+What a slice runs is therefore whatever is on any branch of the pinned
+repository: push access to it, together with the deploy key, is the
+trust boundary. The key alone can only run code from those branches, and
+only within the bounds above. (A runner is no narrower: whoever holds
+the key can hand it a JIT config for any repository.)
+
+Jobs are self-contained: each downloads its pinned runner onto job-local
+scratch, and the home directory stays control-plane only (forced-command
+script, payloads, logs - under 1 GB).
 
 The multi-gigabyte runtime extraction is shared, not duplicated: before
 the wave provisions, a single seed job (`cluster-seed` in the main
@@ -63,8 +90,8 @@ bundle and extracts privately, exactly the pre-store behavior. No toolchain ever
 and `runtime-packages.txt` are consumed by the hosted `cluster-build`
 job (`ci/dcs/build.sh`), whose bundle ships the declared runtime env the
 binary resolves against (`ci/dcs/install-runtime.sh` verifies this on
-the node before the sims start). Only `accept-runner.sh` itself still
-deploys through `setup.sh`.
+the node before the sims start). Only `slice.sh` itself deploys through
+`setup.sh`.
 
 ## Cluster setup (once)
 
@@ -86,12 +113,12 @@ own, so neither side reads, reaps or sweeps the other's:
 
 | What | This repository | Defined in |
 |------|-----------------|------------|
-| Control plane (forced command, jitconfigs, job logs) | `~/asteria-ci` | `accept-runner.sh`, `setup.sh` (`DCS_CI_ROOT` overrides) |
-| Checkout the forced command submits from | `~/asteria` | `accept-runner.sh` (`DCS_CI_REPO` overrides) |
+| Control plane (forced command, payloads, job logs) | `~/asteria-ci` | `slice.sh`, `setup.sh` (`DCS_CI_ROOT` overrides) |
+| Repository a slice's script comes from | `caddyreverse/asteria` on GitHub | `slice.sh` (`DCS_SLICE_REPO` overrides) |
 | Job scratch, one tree per SLURM job | `<scratch base>/asteria/<slurm job id>` | `runner-job.sbatch` |
 | Shared runtime store | `<network scratch>/asteria/store` | `runner-job.sbatch`, `resolve-runtime.sh` |
 | Courier outbox | `<network scratch>/asteria/outbox` | `runner-job.sbatch`, `outbox.sh` |
-| SLURM job name | `asteria-gh-runner`, or the provision's runner name | `runner-job.sbatch`, `accept-runner.sh` |
+| SLURM job name | `asteria-gh-runner`, or the provision's runner name | `runner-job.sbatch`, `slice.sh` |
 
 The orphan reaper only visits numeric job directories under
 `<scratch base>/asteria/`, and the store's age sweep only its own store,

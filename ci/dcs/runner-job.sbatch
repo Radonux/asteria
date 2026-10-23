@@ -5,7 +5,7 @@
 # (The per-job LTO link that once wanted more cores is gone: jobs
 # download the prebuilt runtime bundle instead of compiling.) Two, not
 # four: allocation - not load - is what blocks other cluster users. A
-# runner name ending in -c<N> overrides this and --mem (accept-runner.sh).
+# slice's cpus= and mem= override this and --mem (slice.sh).
 #SBATCH --cpus-per-task=2
 # The simulator needs <1 GB; the rest is headroom for the last-resort
 # case where scratch selection below lands on tmpfs /tmp, whose bytes
