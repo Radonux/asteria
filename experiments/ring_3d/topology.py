@@ -1777,8 +1777,9 @@ REPS_SPINE_PARAMETERS: tuple[BalancingParameter, ...] = SELECTOR_PARAMETERS["rep
 # packets past which the destination signals a stashed head's path, 0 for
 # none; how long in ns the head must have been stashed before it signals, 0
 # for no wait; the redirected packets a signal avoids its path for, 0 for
-# none; and whether a repair goes up another path. The backend's defaults are
-# Themis's.
+# none; whether a repair goes up another path; and whether a signal avoids
+# its path for the host's every connection to the destination's leaf, not its
+# queue pair's alone. The backend's defaults are Themis's.
 THEMIS_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter("themis_paths", "SPRAY_THEMIS_PATHS", 0, _nonnegative_int),
     BalancingParameter(
@@ -1792,6 +1793,9 @@ THEMIS_PARAMETERS: tuple[BalancingParameter, ...] = (
     ),
     BalancingParameter(
         "themis_retx_reroute", "SPRAY_THEMIS_RETX_REROUTE", True, _flag, _on_off
+    ),
+    BalancingParameter(
+        "themis_leaf_avoidance", "SPRAY_THEMIS_LEAF_AVOIDANCE", False, _flag, _on_off
     ),
 )
 

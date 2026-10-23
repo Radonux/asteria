@@ -45,6 +45,7 @@ class ThemisTest(unittest.TestCase):
             "SPRAY_THEMIS_STASH_MIN_NS 0",
             "SPRAY_THEMIS_AVOIDANCE_WINDOW 2000000",
             "SPRAY_THEMIS_RETX_REROUTE on",
+            "SPRAY_THEMIS_LEAF_AVOIDANCE off",
         ):
             self.assertIn(f"\n{line}\n", config)
         self.assertEqual(manifest["load_balancing"]["selector"], "themis")
@@ -59,6 +60,7 @@ class ThemisTest(unittest.TestCase):
                 "themis_stash_min_ns": 24648,
                 "themis_avoidance_window": 0,
                 "themis_retx_reroute": False,
+                "themis_leaf_avoidance": True,
                 "path_seq": True,
                 "rack_reorder_ns": 3081,
                 "overdue_repair": "reprobe",
@@ -70,12 +72,14 @@ class ThemisTest(unittest.TestCase):
             "SPRAY_THEMIS_STASH_MIN_NS 24648",
             "SPRAY_THEMIS_AVOIDANCE_WINDOW 0",
             "SPRAY_THEMIS_RETX_REROUTE off",
+            "SPRAY_THEMIS_LEAF_AVOIDANCE on",
             "SPRAY_PATH_SEQ on",
             "SPRAY_RACK_REORDER_NS 3081",
             "SPRAY_OVERDUE_REPAIR reprobe",
         ):
             self.assertIn(f"\n{line}\n", config)
         self.assertFalse(manifest["load_balancing"]["themis_retx_reroute"])
+        self.assertTrue(manifest["load_balancing"]["themis_leaf_avoidance"])
 
     def test_refuses_loss_hold_keys(self) -> None:
         for key, value in (("loss_interval_ns", 100000), ("receiver_hold", True)):
