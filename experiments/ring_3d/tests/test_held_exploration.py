@@ -16,6 +16,7 @@ PROFILE = REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
 KEYS = (
     "held_exploration",
     "held_sentinel_interval_ns",
+    "held_sentinel_spread",
     "pool_decay_interval_ns",
     "pool_hold_propagates",
 )
@@ -186,6 +187,10 @@ class HeldExplorationTest(unittest.TestCase):
             (
                 {**policy, "held_sentinel_interval_ns": 1000},
                 "held_sentinel_interval_ns requires held_exploration 'sentinel'",
+            ),
+            (
+                {**policy, "held_sentinel_spread": 64},
+                "held_sentinel_spread requires held_exploration 'sentinel'",
             ),
             (
                 {

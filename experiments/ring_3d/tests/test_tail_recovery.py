@@ -1,4 +1,8 @@
-"""path_seq under every spray_uniform selector, tail_recovery and its delay."""
+"""path_seq under every spray_uniform selector, tail_recovery, its delay, its
+loss report guard, the receiver's count of what a tail request still misses,
+and the tail_loss_cancelled, tail_loss_delivered, tail_loss_ambiguous,
+tail_repair_rerouted, receiver_tail_missing and receiver_tail_missing_late
+counts with their breakdown by spine."""
 
 from __future__ import annotations
 
@@ -12,6 +16,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
+from experiments.ring_3d.analyze import _summarize_transport_events
 from experiments.ring_3d.generate import load_profile, materialize
 
 PROFILE = REPOSITORY_ROOT / "experiments/ring_3d/profiles/no_incast_8_zero.json"
@@ -32,6 +37,7 @@ ORACLE = {
 REDIRECT = {"mode": "spray_uniform", "selector": "ack_redirect"}
 REPS_SPINE = {"mode": "spray_uniform", "selector": "reps_spine"}
 TAIL = {"path_seq": True, "tail_recovery": True}
+RECEIVER_TAIL = {**TAIL, "receiver_hold": True, "receiver_tail_missing": True}
 
 
 class TailRecoveryTest(unittest.TestCase):
@@ -116,24 +122,18 @@ class TailRecoveryTest(unittest.TestCase):
             config,
         )
 
-    def test_tail_recovery_counts_at_most_8_spines(self) -> None:
+    def test_tail_recovery_counts_every_spine(self) -> None:
         for balancing in (UNIFORM, HOLD):
-            for spines, refused in ((8, False), (9, True)):
+            for spines, refused in ((256, False), (257, True)):
                 self.write({**balancing, **TAIL}, spines=spines)
                 with self.subTest(balancing=balancing, spines=spines):
                     if refused:
                         with self.assertRaisesRegex(
-                            ValueError, "tail_recovery counts at most 8 spines"
+                            ValueError, "spine_count must not exceed 256"
                         ):
                             load_profile(self.profile_path)
                     else:
                         load_profile(self.profile_path)
-        for balancing in (
-            {**UNIFORM, "path_seq": True},
-            {**UNIFORM, "path_seq": True, "tail_recovery": False},
-        ):
-            self.write(balancing, spines=9)
-            load_profile(self.profile_path)
 
     def test_refusals(self) -> None:
         refusals: list[tuple[dict[str, object], str]] = []
@@ -181,6 +181,7 @@ class TailRecoveryTest(unittest.TestCase):
             ("path_seq", True),
             ("tail_recovery", True),
             ("tail_recovery_delay_ns", 0),
+            ("tail_loss_rtts", 1),
         ):
             refusals += [
                 ({"mode": "ecmp", key: value}, "takes no other key"),
@@ -194,12 +195,275 @@ class TailRecoveryTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     load_profile(self.profile_path)
 
+    def test_tail_loss_rtts_is_written_after_the_delay(self) -> None:
+        manifest, config = self.generated({**UNIFORM, **TAIL, "tail_loss_rtts": 2})
+        self.assertIn(
+            "\nSPRAY_TAIL_RECOVERY on\nSPRAY_TAIL_LOSS_RTTS 2.0\n", config
+        )
+        self.assertNotIn("PATH_SELECTOR", config)
+        self.assertEqual(manifest["load_balancing"]["tail_loss_rtts"], 2.0)
+        manifest, config = self.generated(
+            {**UNIFORM, **TAIL, "tail_loss_rtts": 0, "ack_loss_rtts": 1}
+        )
+        self.assertIn(
+            "\nSPRAY_TAIL_RECOVERY on\n"
+            "SPRAY_TAIL_LOSS_RTTS 0.0\n"
+            "SPRAY_ACK_LOSS_RTTS 1.0\n",
+            config,
+        )
+        self.assertEqual(manifest["load_balancing"]["tail_loss_rtts"], 0.0)
+        for balancing in (HOLD, REPS_SPINE):
+            with self.subTest(balancing=balancing):
+                manifest, config = self.generated(
+                    {
+                        **balancing,
+                        **TAIL,
+                        "tail_recovery_delay_ns": 0,
+                        "tail_loss_rtts": 0.5,
+                    }
+                )
+                self.assertIn(f"PATH_SELECTOR {balancing['selector']}\n", config)
+                self.assertIn(
+                    "\nSPRAY_TAIL_RECOVERY on\n"
+                    "SPRAY_TAIL_RECOVERY_DELAY_NS 0\n"
+                    "SPRAY_TAIL_LOSS_RTTS 0.5\n",
+                    config,
+                )
+                self.assertEqual(manifest["load_balancing"]["tail_loss_rtts"], 0.5)
+
+    def test_tail_loss_rtts_unset_is_not_written(self) -> None:
+        for balancing in (UNIFORM, HOLD, REPS_SPINE):
+            with self.subTest(balancing=balancing):
+                manifest, config = self.generated({**balancing, **TAIL})
+                self.assertNotIn("SPRAY_TAIL_LOSS_RTTS", config)
+                self.assertNotIn("tail_loss_rtts", manifest["load_balancing"])
+
+    def test_tail_loss_rtts_refusals(self) -> None:
+        refusals: list[tuple[dict[str, object], str]] = []
+        for balancing in (UNIFORM, HOLD, REPS_SPINE):
+            refusals += [
+                (
+                    {**balancing, "tail_loss_rtts": 1},
+                    "tail_loss_rtts requires tail_recovery true",
+                ),
+                (
+                    {**balancing, "path_seq": True, "tail_loss_rtts": 0},
+                    "tail_loss_rtts requires tail_recovery true",
+                ),
+                (
+                    {**balancing, "path_seq": True, "tail_recovery": False,
+                     "tail_loss_rtts": 1},
+                    "tail_loss_rtts requires tail_recovery true",
+                ),
+            ]
+            for value in (-1, -0.5, True, "1", None, float("inf"), float("nan")):
+                refusals.append(
+                    (
+                        {**balancing, **TAIL, "tail_loss_rtts": value},
+                        "tail_loss_rtts must be a nonnegative number",
+                    )
+                )
+        for balancing, message in refusals:
+            self.write(balancing)
+            with self.subTest(balancing=balancing):
+                with self.assertRaisesRegex(ValueError, message):
+                    load_profile(self.profile_path)
+
+    def test_receiver_tail_missing_is_written_last(self) -> None:
+        for selector in ("reps_hold", "reps_flow_hold"):
+            with self.subTest(selector=selector):
+                manifest, config = self.generated(
+                    {**HOLD, "selector": selector, **RECEIVER_TAIL}
+                )
+                self.assertIn(
+                    "\nSPRAY_RECEIVER_HOLD on\n"
+                    "SPRAY_TAIL_RECOVERY on\n"
+                    "SPRAY_RECEIVER_TAIL_MISSING on\n",
+                    config,
+                )
+                self.assertIs(manifest["load_balancing"]["receiver_tail_missing"], True)
+        manifest, config = self.generated(
+            {
+                **HOLD,
+                **RECEIVER_TAIL,
+                "receiver_tail_missing": False,
+                "tail_loss_rtts": 4,
+                "ack_loss_rtts": 1,
+            }
+        )
+        self.assertIn(
+            "\nSPRAY_TAIL_LOSS_RTTS 4.0\n"
+            "SPRAY_ACK_LOSS_RTTS 1.0\n"
+            "SPRAY_RECEIVER_TAIL_MISSING off\n",
+            config,
+        )
+        self.assertIs(manifest["load_balancing"]["receiver_tail_missing"], False)
+
+    def test_receiver_tail_missing_unset_is_not_written(self) -> None:
+        manifest, config = self.generated({**HOLD, **TAIL, "receiver_hold": True})
+        self.assertNotIn("SPRAY_RECEIVER_TAIL_MISSING", config)
+        self.assertNotIn("receiver_tail_missing", manifest["load_balancing"])
+
+    def test_receiver_tail_missing_refusals(self) -> None:
+        requires = (
+            "receiver_tail_missing requires receiver_hold true and tail_recovery true"
+        )
+        refusals: list[tuple[dict[str, object], str]] = [
+            ({**HOLD, **TAIL, "receiver_tail_missing": True}, requires),
+            ({**HOLD, **RECEIVER_TAIL, "receiver_hold": False}, requires),
+            ({**HOLD, **RECEIVER_TAIL, "tail_recovery": False}, requires),
+            (
+                {**HOLD, "path_seq": True, "receiver_hold": True,
+                 "receiver_tail_missing": False},
+                requires,
+            ),
+            (
+                {**HOLD, **RECEIVER_TAIL, "receiver_tail_missing": "on"},
+                "receiver_tail_missing must be a boolean",
+            ),
+            ({**UNIFORM, **TAIL, "receiver_tail_missing": True}, "takes no other key"),
+        ]
+        for balancing in (ORACLE, REDIRECT, REPS_SPINE):
+            refusals.append(
+                ({**balancing, **TAIL, "receiver_tail_missing": True}, "does not take")
+            )
+        for balancing, message in refusals:
+            self.write(balancing)
+            with self.subTest(balancing=balancing):
+                with self.assertRaisesRegex(ValueError, message):
+                    load_profile(self.profile_path)
+
     def test_spray_uniform_requires_selective_repair(self) -> None:
         self.document["network"]["transport_recovery"]["selective_repair"] = False
         self.write({**UNIFORM, **TAIL})
         with self.assertRaisesRegex(ValueError, "requires network.transport_recovery"):
             load_profile(self.profile_path)
 
+    def test_tail_loss_cancelled_is_counted_on_the_control_plane(self) -> None:
+        ns3 = self.directory / "ns3"
+        ns3.mkdir()
+        summary = ns3 / "transport_summary.csv"
+        summary.write_text(
+            "event,plane,event_count,total_bytes\nrto_fired,control,3,0\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            _summarize_transport_events(ns3)["tail_loss_cancelled_count"], 0
+        )
+        summary.write_text(
+            "event,plane,event_count,total_bytes\n"
+            "rto_fired,control,3,0\n"
+            "ack_loss_declared,control,6,0\n"
+            "tail_loss_cancelled,control,4,0\n",
+            encoding="utf-8",
+        )
+        transport = _summarize_transport_events(ns3)
+        self.assertEqual(transport["tail_loss_cancelled_count"], 4)
+        self.assertEqual(transport["ack_loss_declared_count"], 6)
+        self.assertEqual(transport["rto_fired_count"], 3)
+
+    def test_tail_loss_delivered_and_ambiguous_are_counted_apart(self) -> None:
+        ns3 = self.directory / "ns3"
+        ns3.mkdir()
+        summary = ns3 / "transport_summary.csv"
+        summary.write_text(
+            "event,plane,event_count,total_bytes\n"
+            "tail_loss_cancelled,control,4,0\n",
+            encoding="utf-8",
+        )
+        transport = _summarize_transport_events(ns3)
+        self.assertEqual(transport["tail_loss_delivered_count"], 0)
+        self.assertEqual(transport["tail_loss_ambiguous_count"], 0)
+        summary.write_text(
+            "event,plane,event_count,total_bytes\n"
+            "tail_loss_cancelled,control,4,0\n"
+            "tail_loss_delivered,control,7,0\n"
+            "tail_loss_ambiguous,control,2,0\n",
+            encoding="utf-8",
+        )
+        transport = _summarize_transport_events(ns3)
+        self.assertEqual(transport["tail_loss_cancelled_count"], 4)
+        self.assertEqual(transport["tail_loss_delivered_count"], 7)
+        self.assertEqual(transport["tail_loss_ambiguous_count"], 2)
+
+    def test_tail_repair_rerouted_is_counted(self) -> None:
+        ns3 = self.directory / "ns3"
+        ns3.mkdir()
+        summary = ns3 / "transport_summary.csv"
+        summary.write_text(
+            "event,plane,event_count,total_bytes\n"
+            "tail_loss_delivered,control,7,0\n",
+            encoding="utf-8",
+        )
+        transport = _summarize_transport_events(ns3)
+        self.assertEqual(transport["tail_repair_rerouted_count"], 0)
+        summary.write_text(
+            "event,plane,event_count,total_bytes\n"
+            "tail_loss_delivered,control,7,0\n"
+            "tail_repair_rerouted,control,3,0\n"
+            "tail_loss_ambiguous,control,1,0\n",
+            encoding="utf-8",
+        )
+        transport = _summarize_transport_events(ns3)
+        self.assertEqual(transport["tail_repair_rerouted_count"], 3)
+        self.assertEqual(transport["tail_loss_delivered_count"], 7)
+        self.assertEqual(transport["tail_loss_ambiguous_count"], 1)
+
+    def test_receiver_tail_missing_is_counted(self) -> None:
+        ns3 = self.directory / "ns3"
+        ns3.mkdir()
+        summary = ns3 / "transport_summary.csv"
+        summary.write_text(
+            "event,plane,event_count,total_bytes\n"
+            "tail_loss_delivered,control,7,0\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            _summarize_transport_events(ns3)["receiver_tail_missing_count"], 0
+        )
+        summary.write_text(
+            "event,plane,event_count,total_bytes\n"
+            "tail_loss_delivered,control,7,0\n"
+            "receiver_tail_missing,control,12,0\n",
+            encoding="utf-8",
+        )
+        transport = _summarize_transport_events(ns3)
+        self.assertEqual(transport["receiver_tail_missing_count"], 12)
+        self.assertEqual(transport["tail_loss_delivered_count"], 7)
+        self.assertEqual(transport["receiver_tail_missing_late_count"], 0)
+        self.assertEqual(transport["receiver_tail_missing_by_spine"], {})
+
+    def test_receiver_tail_counts_break_down_by_spine(self) -> None:
+        ns3 = self.directory / "ns3"
+        ns3.mkdir()
+        summary = ns3 / "transport_summary.csv"
+        summary.write_text(
+            "event,plane,event_count,total_bytes\n"
+            "receiver_tail_missing,control,12,0\n"
+            "receiver_tail_missing_late,control,3,0\n"
+            "receiver_tail_missing_late_spine2,control,1,0\n"
+            "receiver_tail_missing_late_spine3,control,2,0\n"
+            "receiver_tail_missing_spine3,control,12,0\n",
+            encoding="utf-8",
+        )
+        transport = _summarize_transport_events(ns3)
+        self.assertEqual(transport["receiver_tail_missing_count"], 12)
+        self.assertEqual(transport["receiver_tail_missing_late_count"], 3)
+        self.assertEqual(transport["receiver_tail_missing_by_spine"], {3: 12})
+        self.assertEqual(
+            transport["receiver_tail_missing_late_by_spine"], {2: 1, 3: 2}
+        )
+        # The breakdown rows are no events of their own.
+        self.assertEqual(transport["event_count"], 15)
+        self.assertNotIn("receiver_tail_missing_spine3", transport["event_counts"])
+        for event in ("receiver_tail_missing_spinex", "tail_loss_delivered_spine3"):
+            summary.write_text(
+                f"event,plane,event_count,total_bytes\n{event},control,1,0\n",
+                encoding="utf-8",
+            )
+            with self.subTest(event=event):
+                with self.assertRaisesRegex(ValueError, "invalid transport event"):
+                    _summarize_transport_events(ns3)
 
 if __name__ == "__main__":
     unittest.main()

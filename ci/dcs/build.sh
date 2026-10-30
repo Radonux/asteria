@@ -78,13 +78,27 @@ export LD_LIBRARY_PATH="$BUILDENV/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # correctness-relevant input in the hash, which is what makes restoring an
 # entry published by a different conda solve safe: a stale entry is a miss,
 # never a wrong object file.
+#
+# The config file is written whole rather than with ccache --set-config:
+# setting the empty sloppiness value rewrites each blank line after it
+# twice, and the restored cache carries ccache.conf from build to build, so
+# the file would double per build, and every ccache call parses all of it.
 if [[ -n "${CCACHE_DIR:-}" ]]; then
-    ccache --set-config=cache_dir="$CCACHE_DIR"
-    ccache --set-config=compiler_check=content
-    ccache --set-config=sloppiness=
-    ccache --set-config=compression=true
-    ccache --set-config=max_size="${CCACHE_MAX_SIZE:-4G}"
+    mkdir -p "$CCACHE_DIR"
+    cat > "$CCACHE_DIR/ccache.conf" <<EOF
+cache_dir = $CCACHE_DIR
+compiler_check = content
+sloppiness =
+compression = true
+max_size = ${CCACHE_MAX_SIZE:-4G}
+EOF
     ccache --zero-stats
+    # Five lines, whatever ccache.conf the restored cache carried.
+    conf_lines="$(wc -l < "$CCACHE_DIR/ccache.conf")"
+    if (( conf_lines != 5 )); then
+        echo "::error::ccache.conf has ${conf_lines} lines, not the 5 written" >&2
+        exit 1
+    fi
     export CMAKE_C_COMPILER_LAUNCHER=ccache
     export CMAKE_CXX_COMPILER_LAUNCHER=ccache
 fi

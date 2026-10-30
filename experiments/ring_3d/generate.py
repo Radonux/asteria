@@ -48,7 +48,7 @@ try:
         schedule_metadata,
         write_clr_mask,
     )
-    from .switch import SwitchProfile
+    from .switch import SwitchProfile, ecn_rows
     from .topology import (
         CongestionControl,
         DataPlaneLoss,
@@ -70,7 +70,7 @@ except ImportError:
         schedule_metadata,
         write_clr_mask,
     )
-    from switch import SwitchProfile
+    from switch import SwitchProfile, ecn_rows
     from topology import (
         CongestionControl,
         DataPlaneLoss,
@@ -164,7 +164,8 @@ WORKLOAD_KINDS = frozenset(
     }
 )
 # The system layer splits every collective into this many chunks
-# (system.json preferred-dataset-splits).
+# (system.json preferred-dataset-splits) unless an all-to-all workload sets
+# workload.dataset_splits.
 PREFERRED_DATASET_SPLITS = 4
 # The native algorithm an all-to-all workload's group runs: every member sends
 # to every other member at once (CollectiveImplLookup "direct", no window).
@@ -390,19 +391,55 @@ class Incast:
 
 
 @dataclass(frozen=True)
+class Combine:
+    """A second all-to-all in every iteration: after a compute of
+    ``expert_compute_ns``, every member sends ``combine_bytes`` to every
+    other member."""
+
+    combine_bytes: int
+    expert_compute_ns: int
+
+    def collective_bytes(self, group_size: int) -> int:
+        """The combine's comm_size, as AllToAll.collective_bytes."""
+        return self.combine_bytes * group_size
+
+
+@dataclass(frozen=True)
+class Background:
+    """The background load of an all-to-all whose group is the first hosts of
+    every leaf: each other host, host i of leaf l of L, sends to host i of
+    leaf (l + 1 + i mod (L - 1)) mod L, ``leaf_shift``, so that every one
+    sends one flow and receives one, and each leaf sends evenly to the
+    others. With each of the all-to-all's collectives each sends what a
+    member sends to the members on other leaves, paced at ``rate_bps``."""
+
+    pattern: str
+    rate_bps: int
+
+
+@dataclass(frozen=True)
 class AllToAll:
     """Every member of the group runs ``iterations`` native all-to-all
     collectives, each sending ``message_bytes`` to every other member, with a
-    compute of ``compute_ns`` between consecutive iterations.
+    compute of ``compute_ns`` between consecutive iterations. With a
+    ``combine``, each iteration is that all-to-all, the combine's compute and
+    the combine's all-to-all, in a chain.
 
     ``leaves`` None is every host; otherwise the group is every host on the
-    listed leaves, in rank order.
+    listed leaves, in rank order, or with ``hosts`` the first ``hosts`` of
+    each. ``dataset_splits`` is the chunks the system layer cuts each
+    collective into, sent one after another; None is PREFERRED_DATASET_SPLITS.
+    ``background``, with ``hosts``, is the load the other hosts send.
     """
 
     message_bytes: int
     iterations: int
     compute_ns: int
     leaves: tuple[int, ...] | None = None
+    combine: Combine | None = None
+    dataset_splits: int | None = None
+    hosts: int | None = None
+    background: Background | None = None
 
     def members(self, ranks: int, hosts_per_leaf: int | None) -> tuple[int, ...]:
         if self.leaves is None:
@@ -410,7 +447,10 @@ class AllToAll:
         if hosts_per_leaf is None:
             raise ValueError("workload.group.leaves needs a Clos fabric")
         return tuple(
-            rank for rank in range(ranks) if rank // hosts_per_leaf in self.leaves
+            rank
+            for rank in range(ranks)
+            if rank // hosts_per_leaf in self.leaves
+            and (self.hosts is None or rank % hosts_per_leaf < self.hosts)
         )
 
     def collective_bytes(self, group_size: int) -> int:
@@ -418,8 +458,12 @@ class AllToAll:
         member one group_size-th of it."""
         return self.message_bytes * group_size
 
-    def manifest_group(self) -> str | dict[str, list[int]]:
-        return "all" if self.leaves is None else {"leaves": list(self.leaves)}
+    def manifest_group(self) -> str | dict[str, Any]:
+        if self.leaves is None:
+            return "all"
+        if self.hosts is None:
+            return {"leaves": list(self.leaves)}
+        return {"leaves": list(self.leaves), "hosts": self.hosts}
 
 
 @dataclass(frozen=True)
@@ -474,13 +518,26 @@ class Workload:
                 "message_bytes": self.incast.message_bytes,
             }
         if self.all_to_all is not None:
-            return {
+            manifest: dict[str, Any] = {
                 "kind": self.kind,
                 "group": self.all_to_all.manifest_group(),
                 "message_bytes": self.all_to_all.message_bytes,
                 "iterations": self.all_to_all.iterations,
                 "compute_ns": self.all_to_all.compute_ns,
             }
+            combine = self.all_to_all.combine
+            if combine is not None:
+                manifest["combine_bytes"] = combine.combine_bytes
+                manifest["expert_compute_ns"] = combine.expert_compute_ns
+            if self.all_to_all.dataset_splits is not None:
+                manifest["dataset_splits"] = self.all_to_all.dataset_splits
+            background = self.all_to_all.background
+            if background is not None:
+                manifest["background"] = {
+                    "pattern": background.pattern,
+                    "rate_bps": background.rate_bps,
+                }
+            return manifest
         return {"kind": self.kind}
 
 
@@ -733,22 +790,46 @@ def _load_incast(value: dict[str, Any]) -> Incast:
     )
 
 
+def _compute_duration_ns(value: Any, field: str) -> int:
+    duration = _require_nonnegative_int(value, field)
+    # A Chakra compute node's duration is whole microseconds.
+    if duration % 1_000:
+        raise ValueError(f"{field} must be a multiple of 1000")
+    return duration
+
+
 def _load_all_to_all(value: dict[str, Any]) -> AllToAll:
     """The all-to-all's keys; the group and the sizes are bounded by the
     fabric later."""
-    if set(value) != {"kind", "group", "message_bytes", "iterations", "compute_ns"}:
+    required = {"kind", "group", "message_bytes", "iterations", "compute_ns"}
+    combine_keys = {"combine_bytes", "expert_compute_ns"}
+    # The combine's two keys come together: the compute is what separates
+    # the iteration's two all-to-alls.
+    if set(value) - {"dataset_splits", "background"} not in (
+        required,
+        required | combine_keys,
+    ):
         raise ValueError(
             "workload.kind 'all_to_all' must contain exactly "
-            "['compute_ns', 'group', 'iterations', 'kind', 'message_bytes']"
+            "['compute_ns', 'group', 'iterations', 'kind', 'message_bytes'], "
+            "and may contain ['combine_bytes', 'expert_compute_ns'] together, "
+            "'dataset_splits' and 'background'"
         )
     group = value["group"]
+    hosts = None
     if group == "all":
         leaves = None
     else:
-        if not isinstance(group, dict) or set(group) != {"leaves"}:
+        if not isinstance(group, dict) or set(group) not in (
+            {"leaves"},
+            {"leaves", "hosts"},
+        ):
             raise ValueError(
-                "workload.group must be 'all' or an object of exactly ['leaves']"
+                "workload.group must be 'all' or an object of ['leaves'] and "
+                "optionally 'hosts'"
             )
+        if "hosts" in group:
+            hosts = _require_positive_int(group["hosts"], "workload.group.hosts")
         listed = group["leaves"]
         if not isinstance(listed, list) or not listed:
             raise ValueError("workload.group.leaves must be a nonempty array")
@@ -758,18 +839,57 @@ def _load_all_to_all(value: dict[str, Any]) -> AllToAll:
         )
         if len(set(leaves)) != len(leaves):
             raise ValueError("workload.group.leaves must be distinct")
-    compute_ns = _require_nonnegative_int(value["compute_ns"], "workload.compute_ns")
-    # A Chakra compute node's duration is whole microseconds.
-    if compute_ns % 1_000:
-        raise ValueError("workload.compute_ns must be a multiple of 1000")
     return AllToAll(
         message_bytes=_require_positive_int(
             value["message_bytes"], "workload.message_bytes"
         ),
         iterations=_require_positive_int(value["iterations"], "workload.iterations"),
-        compute_ns=compute_ns,
+        compute_ns=_compute_duration_ns(value["compute_ns"], "workload.compute_ns"),
         leaves=leaves,
+        combine=(
+            Combine(
+                combine_bytes=_require_positive_int(
+                    value["combine_bytes"], "workload.combine_bytes"
+                ),
+                expert_compute_ns=_compute_duration_ns(
+                    value["expert_compute_ns"], "workload.expert_compute_ns"
+                ),
+            )
+            if "combine_bytes" in value
+            else None
+        ),
+        dataset_splits=(
+            _require_positive_int(value["dataset_splits"], "workload.dataset_splits")
+            if "dataset_splits" in value
+            else None
+        ),
+        hosts=hosts,
+        background=(
+            _load_background(value["background"]) if "background" in value else None
+        ),
     )
+
+
+def _load_background(value: Any) -> Background:
+    """workload.background: its pattern, leaf_shift, and its pacing rate."""
+    if not isinstance(value, dict) or set(value) != {"pattern", "rate"}:
+        raise ValueError(
+            "workload.background must be an object of exactly ['pattern', 'rate']"
+        )
+    if value["pattern"] != "leaf_shift":
+        raise ValueError("workload.background.pattern must be 'leaf_shift'")
+    rate = value["rate"]
+    if not isinstance(rate, str) or not rate.endswith("Gbps"):
+        raise ValueError("workload.background.rate must be a rate such as 350Gbps")
+    try:
+        rate_bps = round(float(rate[: -len("Gbps")]) * 1_000_000_000)
+    except ValueError:
+        raise ValueError(
+            "workload.background.rate must be a rate such as 350Gbps"
+        ) from None
+    if rate_bps <= 0:
+        raise ValueError("workload.background.rate must be above 0")
+    return Background(pattern="leaf_shift", rate_bps=rate_bps)
 
 
 def _load_explicit_clr_schedule(
@@ -1200,6 +1320,27 @@ def _check_all_to_all(all_to_all: AllToAll, profile: Profile) -> None:
             raise ValueError(
                 "each of workload.group.leaves must be below the leaf count"
             )
+        if (
+            all_to_all.hosts is not None
+            and all_to_all.hosts > profile.network.hosts_per_leaf
+        ):
+            raise ValueError(
+                "workload.group.hosts must be at most network.hosts_per_leaf"
+            )
+    if all_to_all.background is not None:
+        if all_to_all.hosts is None or all_to_all.hosts == profile.network.hosts_per_leaf:
+            raise ValueError(
+                "workload.background needs workload.group.hosts below "
+                "network.hosts_per_leaf, whose other hosts send it"
+            )
+        if sorted(all_to_all.leaves or ()) != list(
+            range(profile.ranks // profile.network.hosts_per_leaf)
+        ):
+            raise ValueError("workload.background needs workload.group.leaves to be every leaf")
+        if profile.ranks // profile.network.hosts_per_leaf < 2:
+            raise ValueError("workload.background needs two leaves or more")
+        if all_to_all.background.rate_bps > _link_bits_per_second(profile.network.link_rate):
+            raise ValueError("workload.background.rate must be at most network.link_rate")
     group_size = len(all_to_all_members(profile))
     if group_size < 2:
         raise ValueError(
@@ -1212,21 +1353,37 @@ def _check_all_to_all(all_to_all: AllToAll, profile: Profile) -> None:
             "workload.kind 'all_to_all' runs one iteration per step and needs "
             "steps equal to workload.iterations"
         )
-    # The system layer cuts the collective into PREFERRED_DATASET_SPLITS
+    # The system layer cuts each collective into dataset_splits(profile)
     # chunks and each chunk into group_size messages, one per member, with
     # integer division; a chunk below the rank count is resized. Either would
-    # send a pair other than message_bytes.
-    if all_to_all.message_bytes % PREFERRED_DATASET_SPLITS:
-        raise ValueError(
-            "workload.message_bytes must be a multiple of "
-            f"{PREFERRED_DATASET_SPLITS} for 'all_to_all'"
+    # send a pair other than its bytes per pair.
+    splits = dataset_splits(profile)
+    collectives = [
+        (
+            "message_bytes",
+            all_to_all.message_bytes,
+            all_to_all.collective_bytes(group_size),
         )
-    chunk_bytes = all_to_all.collective_bytes(group_size) // PREFERRED_DATASET_SPLITS
-    if chunk_bytes < profile.ranks:
-        raise ValueError(
-            "workload.message_bytes times the group size must be at least "
-            f"{PREFERRED_DATASET_SPLITS} times the rank count for 'all_to_all'"
+    ]
+    combine = all_to_all.combine
+    if combine is not None:
+        collectives.append(
+            (
+                "combine_bytes",
+                combine.combine_bytes,
+                combine.collective_bytes(group_size),
+            )
         )
+    for field, pair_bytes, comm_size in collectives:
+        if pair_bytes % splits:
+            raise ValueError(
+                f"workload.{field} must be a multiple of {splits} for 'all_to_all'"
+            )
+        if comm_size // splits < profile.ranks:
+            raise ValueError(
+                f"workload.{field} times the group size must be at least "
+                f"{splits} times the rank count for 'all_to_all'"
+            )
 
 
 def all_to_all_members(profile: Profile) -> tuple[int, ...]:
@@ -1240,6 +1397,48 @@ def all_to_all_members(profile: Profile) -> tuple[int, ...]:
     )
 
 
+def _link_bits_per_second(link_rate: str) -> int:
+    return round(float(link_rate[: -len("Gbps")]) * 1_000_000_000)
+
+
+def background_flows(profile: Profile) -> list[dict[str, int]]:
+    """The background load's flows, sent with each of the all-to-all's
+    collectives (Background): one per host outside the group, its size what a
+    member sends to the members on other leaves; none without it."""
+    all_to_all = profile.workload.all_to_all
+    if all_to_all is None or all_to_all.background is None:
+        return []
+    hosts_per_leaf = profile.network.hosts_per_leaf
+    leaves = profile.ranks // hosts_per_leaf
+    members = set(all_to_all_members(profile))
+    size = all_to_all.message_bytes * (len(members) - all_to_all.hosts)
+    flows = []
+    for rank in range(profile.ranks):
+        if rank in members:
+            continue
+        leaf, index = divmod(rank, hosts_per_leaf)
+        destination = ((leaf + 1 + index % (leaves - 1)) % leaves) * hosts_per_leaf + index
+        flows.append(
+            {
+                "src": rank,
+                "dst": destination,
+                "size_bytes": size,
+                "rate_bps": all_to_all.background.rate_bps,
+                "priority_group": 3,
+            }
+        )
+    return flows
+
+
+def hold_trace_hosts(profile: Profile) -> tuple[int, ...] | None:
+    """The hosts whose hold traces a run writes: the all-to-all's members
+    where its group names the hosts of each leaf; every host otherwise."""
+    all_to_all = profile.workload.all_to_all
+    if all_to_all is None or all_to_all.hosts is None:
+        return None
+    return all_to_all_members(profile)
+
+
 def all_to_all_group_id(profile: Profile) -> int | None:
     """The communicator group of the all-to-all, numbered after every TP, PP
     and DP group; None for every other workload."""
@@ -1247,6 +1446,16 @@ def all_to_all_group_id(profile: Profile) -> int | None:
         return None
     tp, pp, dp = profile.tp, profile.pp, profile.dp
     return dp * pp + dp * tp + pp * tp + 1
+
+
+def dataset_splits(profile: Profile) -> int:
+    """The chunks the system layer cuts each collective into: the
+    all-to-all's workload.dataset_splits when set, PREFERRED_DATASET_SPLITS
+    for every other profile."""
+    all_to_all = profile.workload.all_to_all
+    if all_to_all is None or all_to_all.dataset_splits is None:
+        return PREFERRED_DATASET_SPLITS
+    return all_to_all.dataset_splits
 
 
 def rank_for(tp_rank: int, pp_rank: int, dp_rank: int, profile: Profile) -> int:
@@ -1841,14 +2050,18 @@ class TraceWriter:
         """A member's chain of all-to-all collectives over the group, the i-th
         carrying training step i and no domain, each after the previous one
         and, when compute_ns is positive, a compute of that length between
-        them. A rank outside the group gets one compute node of zero
-        duration with no dependencies, as an idle incast rank does."""
+        them. A combine adds, after each, its compute when positive and its
+        all-to-all, which carries the same training step, so the step's
+        collective rows span the whole iteration. A rank outside the group
+        gets one compute node of zero duration with no dependencies, as an
+        idle incast rank does."""
         members = all_to_all_members(self.profile)
         if self.rank not in members:
             self.compute("all_to_all_idle", [])
             return
         group_id = all_to_all_group_id(self.profile)
         assert group_id is not None
+        combine = all_to_all.combine
         predecessor: int | None = None
         for iteration in range(1, all_to_all.iterations + 1):
             if predecessor is not None and all_to_all.compute_ns:
@@ -1863,6 +2076,23 @@ class TraceWriter:
                 ALL_TO_ALL,
                 group_id,
                 all_to_all.collective_bytes(len(members)),
+                iteration,
+                None,
+            )
+            if combine is None:
+                continue
+            if combine.expert_compute_ns:
+                predecessor = self.compute(
+                    f"iteration_{iteration}_expert_compute",
+                    [predecessor],
+                    combine.expert_compute_ns // 1_000,
+                )
+            predecessor = self.collective(
+                f"iteration_{iteration}_combine_all_to_all",
+                [predecessor],
+                ALL_TO_ALL,
+                group_id,
+                combine.collective_bytes(len(members)),
                 iteration,
                 None,
             )
@@ -1907,6 +2137,11 @@ def write_network_config(
     load_balancing: LoadBalancing,
     switch: SwitchProfile,
     link_failure_settings: str,
+    link_rates_bps: frozenset[int] = frozenset(),
+    pair_bandwidth: str | None = None,
+    trace_hosts: tuple[int, ...] | None = None,
+    port_counter_interval_ns: int | None = None,
+    sparse_hold_trace: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     # The bundled ns-3 setup unconditionally opens these legacy input files,
@@ -1990,6 +2225,12 @@ def write_network_config(
         f"RATE_HAI {rate_hai_bps}bps\n"
         f"MIN_RATE {min_rate_bps}bps\n"
     )
+    if congestion_control.window_state is not None:
+        congestion_settings += (
+            f"NSCC_WINDOW_STATE {congestion_control.window_state}\n"
+        )
+    if congestion_control.rtt_sample is not None:
+        congestion_settings += f"NSCC_RTT_SAMPLE {congestion_control.rtt_sample}\n"
     if packet_trimming is None:
         trim_settings = "PACKET_TRIM_MODE disabled\n"
     else:
@@ -2013,6 +2254,46 @@ def write_network_config(
     )
     for key, counter_file in counter_files(load_balancing, output_dir).items():
         load_balancing_settings += f"{key} {counter_file}\n"
+    # Written only when the profile sets it, after the load balancing it
+    # needs (network.pair_bandwidth).
+    if pair_bandwidth is not None:
+        load_balancing_settings += f"PAIR_BANDWIDTH {pair_bandwidth}\n"
+    # Written only when set, after the counter files it reads
+    # (network.port_counter_interval_ns), with the switch queues' maxima.
+    if port_counter_interval_ns is not None:
+        load_balancing_settings += (
+            f"PORT_COUNTER_INTERVAL_NS {port_counter_interval_ns}\n"
+            f"SWITCH_QUEUE_OUTPUT_FILE {output_dir / 'switch_queues.csv'}\n"
+        )
+    # Written only when set (network.sparse_hold_trace), for each hold trace
+    # the run writes.
+    if sparse_hold_trace and load_balancing.traces_spine_loss():
+        load_balancing_settings += "SPINE_LOSS_SPARSE on\n"
+    if sparse_hold_trace and load_balancing.traces_receiver_hold():
+        load_balancing_settings += "RECEIVER_HOLD_SPARSE on\n"
+    # The hold traces of the listed hosts alone, where they are written.
+    hold_trace_settings = ""
+    if trace_hosts is not None and (
+        load_balancing.traces_spine_loss() or load_balancing.traces_receiver_hold()
+    ):
+        hold_trace_settings = (
+            f"HOLD_TRACE_HOSTS {len(trace_hosts)} "
+            + " ".join(str(host) for host in trace_hosts)
+            + "\n"
+        )
+    # The transport event rows of the packets from or to the listed hosts
+    # alone; the summary still counts every packet.
+    if trace_hosts is not None:
+        hold_trace_settings += (
+            f"TRANSPORT_EVENT_HOSTS {len(trace_hosts)} "
+            + " ".join(str(host) for host in trace_hosts)
+            + "\n"
+        )
+    # The ECN maps cover every link speed of the fabric (link_rates_bps).
+    rows = ecn_rows(link_rates_bps)
+    ecn_maps = switch.ecn_threshold_maps(
+        congestion_control.ecn_threshold_maps(rows), rows
+    )
     with path.open("w", encoding="utf-8") as config:
         config.write(
             "ENABLE_QCN 1\nUSE_DYNAMIC_PFC_THRESHOLD 1\n\n"
@@ -2038,10 +2319,12 @@ def write_network_config(
             "SAMPLE_FEEDBACK 0\nPINT_LOG_BASE 1.05\nPINT_PROB 1.0\n"
             "NIC_TOTAL_PAUSE_TIME 0\n\nRATE_BOUND 1\nACK_HIGH_PRIO 1\n"
             "LINK_DOWN 0 0 0\nENABLE_TRACE 1\n\n"
-            f"{switch.ecn_threshold_maps(congestion_control.ecn_threshold_maps())}"
-            f"{switch.probability_map()}"
+            f"{ecn_maps}"
+            f"{switch.probability_map(rows)}"
             f"{fabric_settings}"
+            f"{switch.queue_maps(rows)}"
             f"{link_failure_settings}"
+            f"{hold_trace_settings}"
         )
 
 
@@ -2060,6 +2343,8 @@ def counter_files(load_balancing: LoadBalancing, output_dir: Path) -> dict[str, 
         files["RECEIVER_HOLD_OUTPUT_FILE"] = output_dir / "receiver_holds.csv"
     # The backend writes a row per retransmission timeout under every mode.
     files["RTO_EVENT_OUTPUT_FILE"] = output_dir / "rto_events.csv"
+    if load_balancing.traces_answer_hold():
+        files["ANSWER_HOLD_OUTPUT_FILE"] = output_dir / "answer_holds.csv"
     return files
 
 
@@ -2228,6 +2513,9 @@ def write_experiment_config(
             "flows": microburst_flows,
         },
     }
+    background = background_flows(profile)
+    if background:
+        policy["background"] = {"flows": background}
     path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
 
 
@@ -2251,12 +2539,13 @@ def write_system_config(
     dp_all_reduce_implementation: str = "ring",
     comm_ops_in_flight: int = 1,
     all_to_all_group_id: int | None = None,
+    preferred_dataset_splits: int = PREFERRED_DATASET_SPLITS,
 ) -> None:
     configuration: dict[str, Any] = {
         "scheduling-policy": "LIFO",
         "endpoint-delay": 10,
         "active-chunks-per-dimension": 1,
-        "preferred-dataset-splits": PREFERRED_DATASET_SPLITS,
+        "preferred-dataset-splits": preferred_dataset_splits,
         "all-reduce-implementation": ["ring"],
         "all-gather-implementation": ["ring"],
         "reduce-scatter-implementation": ["ring"],
@@ -2445,6 +2734,11 @@ def materialize(
         profile.network.load_balancing,
         profile.network.switch,
         profile.network.link_failure_config(profile.ranks),
+        frozenset(link.rate_bps for link in physical_topology.links),
+        getattr(profile.network, "pair_bandwidth", None),
+        hold_trace_hosts(profile),
+        getattr(profile.network, "port_counter_interval_ns", None),
+        getattr(profile.network, "sparse_hold_trace", False),
     )
     experiment_config = output_dir / "experiment.json"
     write_experiment_config(
@@ -2457,6 +2751,7 @@ def materialize(
         dp_all_reduce_implementation=profile.dp_all_reduce_implementation,
         comm_ops_in_flight=sends_per_rank(profile),
         all_to_all_group_id=all_to_all_group_id(profile),
+        preferred_dataset_splits=dataset_splits(profile),
     )
     (output_dir / "communicator_groups.json").write_text(
         json.dumps(groups, indent=2) + "\n", encoding="utf-8"
@@ -2525,7 +2820,8 @@ def materialize(
             override.manifest() for override in profile.network.link_overrides
         ],
         "link_failures": [
-            failure.manifest() for failure in profile.network.link_failures
+            failure.manifest(profile.network.data_frame_bytes())
+            for failure in profile.network.link_failures
         ],
         "switch": profile.network.switch.manifest(),
         "fabric": (
@@ -2572,6 +2868,11 @@ def materialize(
             ).items()
         },
     }
+    # The raw stream holds the rows of the packets from or to these hosts
+    # alone (TRANSPORT_EVENT_HOSTS); the summary still counts every packet.
+    event_hosts = hold_trace_hosts(profile)
+    if event_hosts is not None:
+        manifest["transport_event_hosts"] = list(event_hosts)
     if model_metadata is not None:
         manifest["model_trace"] = model_metadata
     (output_dir / "manifest.json").write_text(

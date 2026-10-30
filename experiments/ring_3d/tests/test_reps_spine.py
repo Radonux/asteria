@@ -112,6 +112,7 @@ class RepsSpineTest(unittest.TestCase):
             ("loss_hold_clean_sentinels", 4),
             ("held_exploration", "sentinel"),
             ("held_sentinel_interval_ns", 1000),
+            ("held_sentinel_spread", 64),
             ("hold_scope", "host"),
             ("hold_auto_leaves", 2),
             ("hold_rule", "llr"),
@@ -120,6 +121,9 @@ class RepsSpineTest(unittest.TestCase):
             ("held_loss_rtts", 2),
             ("receiver_hold", True),
             ("receiver_hold_clean", 8),
+            ("receiver_hold_slots", 8),
+            ("receiver_hold_widen", 2),
+            ("receiver_hold_auto_leaves", 1),
             ("grade_cost_source", "switch_queue"),
             ("ev_set_size", 8),
         ):
@@ -130,16 +134,13 @@ class RepsSpineTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     load_profile(self.profile_path)
 
-    def test_tail_recovery_counts_at_most_8_spines(self) -> None:
+    def test_tail_recovery_counts_every_spine(self) -> None:
         balancing = {**SPINE, "path_seq": True, "tail_recovery": True}
-        self.write(balancing, spines=8)
+        self.write(balancing, spines=256)
         load_profile(self.profile_path)
-        self.write(balancing, spines=9)
-        with self.assertRaisesRegex(ValueError, "8 spines"):
+        self.write(balancing, spines=257)
+        with self.assertRaisesRegex(ValueError, "spine_count must not exceed 256"):
             load_profile(self.profile_path)
-        # Without tail recovery nothing is held or counted per spine.
-        self.write(SPINE, spines=33)
-        load_profile(self.profile_path)
 
     def test_reorder_tolerance_is_required(self) -> None:
         self.document["network"]["transport_recovery"]["selective_repair"] = False

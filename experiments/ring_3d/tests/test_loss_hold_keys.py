@@ -160,6 +160,77 @@ class LossHoldKeysTest(unittest.TestCase):
         self.assertNotIn("SPRAY_HELD_LOSS_RTTS", config)
         self.assertNotIn("held_loss_rtts", manifest["load_balancing"])
 
+    def test_overdue_repair_is_written_only_when_set(self) -> None:
+        for selector in ("reps_hold", "reps_flow_hold", "mrc_hold"):
+            for value, written in (("evidence", "evidence"), ("probe", "probe"), ("reprobe", "reprobe"),
+                                   (False, "off")):
+                with self.subTest(selector=selector, value=value):
+                    manifest, config, _ = self.generated(
+                        {**HOLD, "selector": selector, "held_loss_rtts": 1, "overdue_repair": value}
+                    )
+                    self.assertIn(
+                        f"\nSPRAY_HELD_LOSS_RTTS 1\nSPRAY_OVERDUE_REPAIR {written}\n",
+                        config,
+                    )
+                    self.assertEqual(manifest["load_balancing"]["overdue_repair"], value)
+        manifest, config, _ = self.generated(HOLD)
+        self.assertNotIn("SPRAY_OVERDUE_REPAIR", config)
+        self.assertNotIn("overdue_repair", manifest["load_balancing"])
+        with self.assertRaisesRegex(ValueError, "overdue_repair requires held_loss_rtts above 0"):
+            self.generated({**HOLD, "held_loss_rtts": 0, "overdue_repair": "probe"})
+        with self.assertRaisesRegex(ValueError, "must be 'evidence', 'probe', 'reprobe' or false"):
+            self.generated({**HOLD, "overdue_repair": True})
+        # Under reprobe the repairs per send, written after it when set.
+        manifest, config, _ = self.generated(
+            {**HOLD, "held_loss_rtts": 1, "overdue_repair": "reprobe", "overdue_repair_limit": 3}
+        )
+        self.assertIn(
+            "\nSPRAY_HELD_LOSS_RTTS 1\nSPRAY_OVERDUE_REPAIR reprobe\nSPRAY_OVERDUE_REPAIR_LIMIT 3\n", config
+        )
+        self.assertEqual(manifest["load_balancing"]["overdue_repair_limit"], 3)
+        manifest, config, _ = self.generated({**HOLD, "held_loss_rtts": 1, "overdue_repair": "reprobe"})
+        self.assertNotIn("SPRAY_OVERDUE_REPAIR_LIMIT", config)
+        for value in ("probe", False):
+            with self.assertRaisesRegex(ValueError, "overdue_repair_limit requires overdue_repair 'reprobe'"):
+                self.generated({**HOLD, "overdue_repair": value, "overdue_repair_limit": 2})
+        with self.assertRaisesRegex(ValueError, "overdue_repair_limit"):
+            self.generated({**HOLD, "overdue_repair": "reprobe", "overdue_repair_limit": 0})
+        with self.assertRaisesRegex(ValueError, "must be 'evidence', 'probe', 'reprobe' or false"):
+            self.generated({"mode": "spray_uniform", "overdue_repair": True})
+
+    def test_overdue_reprobe_without_a_loss_hold(self) -> None:
+        # reps_spine, reps_oracle and the uniform draw read reprobe and its
+        # limit, written last and only when set, after the backend's wait.
+        for balancing in (
+            {"mode": "spray_uniform", "selector": "reps_spine"},
+            {"mode": "spray_uniform", "selector": "reps_oracle", "grade_cost_source": "switch_queue"},
+            {"mode": "spray_uniform"},
+        ):
+            with self.subTest(balancing=balancing):
+                manifest, config, _ = self.generated(
+                    {**balancing, "path_seq": True, "overdue_repair": "reprobe", "overdue_repair_limit": 3}
+                )
+                written = config.index("\nSPRAY_OVERDUE_REPAIR reprobe\nSPRAY_OVERDUE_REPAIR_LIMIT 3\n")
+                self.assertLess(config.index("\nSPRAY_PATH_SEQ on\n"), written)
+                self.assertNotIn("SPRAY_HELD_LOSS_RTTS", config)
+                self.assertEqual(
+                    (manifest["load_balancing"]["overdue_repair"], manifest["load_balancing"]["overdue_repair_limit"]),
+                    ("reprobe", 3),
+                )
+                self.assertEqual(list(manifest["load_balancing"])[-2:], ["overdue_repair", "overdue_repair_limit"])
+                manifest, config, _ = self.generated(balancing)
+                self.assertNotIn("SPRAY_OVERDUE_REPAIR", config)
+                self.assertNotIn("overdue_repair", manifest["load_balancing"])
+                manifest, config, _ = self.generated({**balancing, "overdue_repair": False})
+                self.assertIn("\nSPRAY_OVERDUE_REPAIR off\n", config)
+                for value in ("evidence", "probe"):
+                    with self.assertRaisesRegex(ValueError, "must be 'reprobe' or false without a loss hold selector"):
+                        self.generated({**balancing, "overdue_repair": value})
+                with self.assertRaisesRegex(ValueError, "overdue_repair_limit requires overdue_repair 'reprobe'"):
+                    self.generated({**balancing, "overdue_repair_limit": 3})
+        with self.assertRaisesRegex(ValueError, "does not take"):
+            self.generated({"mode": "spray_uniform", "selector": "ack_redirect", "overdue_repair": "reprobe"})
+
     def test_receiver_hold_writes_its_trace(self) -> None:
         for selector in ("reps_hold", "reps_flow_hold", "mrc_hold"):
             with self.subTest(selector=selector):
@@ -194,6 +265,30 @@ class LossHoldKeysTest(unittest.TestCase):
         self.assertIn("\nSPRAY_PATH_SEQ off\nSPRAY_RECEIVER_HOLD off\n", config)
         self.assertNotIn("RECEIVER_HOLD_OUTPUT_FILE", config)
 
+    def test_receiver_hold_auto_leaves_is_written_only_when_set(self) -> None:
+        manifest, config, _ = self.generated({**RECEIVER, "receiver_hold_auto_leaves": 1})
+        self.assertIn("\nSPRAY_RECEIVER_HOLD on\nSPRAY_RECEIVER_HOLD_AUTO_LEAVES 1\n", config)
+        self.assertEqual(manifest["load_balancing"]["receiver_hold_auto_leaves"], 1)
+        manifest, config, _ = self.generated(RECEIVER)
+        self.assertNotIn("SPRAY_RECEIVER_HOLD_AUTO_LEAVES", config)
+        self.assertNotIn("receiver_hold_auto_leaves", manifest["load_balancing"])
+
+    def test_receiver_hold_widen_is_written_only_when_set(self) -> None:
+        manifest, config, _ = self.generated({**RECEIVER, "receiver_hold_widen": 2})
+        self.assertIn("\nSPRAY_RECEIVER_HOLD on\nSPRAY_RECEIVER_HOLD_WIDEN 2\n", config)
+        self.assertEqual(manifest["load_balancing"]["receiver_hold_widen"], 2)
+        manifest, config, _ = self.generated(RECEIVER)
+        self.assertNotIn("SPRAY_RECEIVER_HOLD_WIDEN", config)
+        self.assertNotIn("receiver_hold_widen", manifest["load_balancing"])
+
+    def test_receiver_hold_slots_is_written_only_when_set(self) -> None:
+        manifest, config, _ = self.generated({**RECEIVER, "receiver_hold_slots": 8})
+        self.assertIn("\nSPRAY_RECEIVER_HOLD on\nSPRAY_RECEIVER_HOLD_SLOTS 8\n", config)
+        self.assertEqual(manifest["load_balancing"]["receiver_hold_slots"], 8)
+        manifest, config, _ = self.generated(RECEIVER)
+        self.assertNotIn("SPRAY_RECEIVER_HOLD_SLOTS", config)
+        self.assertNotIn("receiver_hold_slots", manifest["load_balancing"])
+
     def test_every_run_writes_the_rto_trace(self) -> None:
         for balancing in ({"mode": "ecmp"}, {"mode": "spray_uniform"}, HOLD, MRC_HOLD):
             with self.subTest(balancing=balancing):
@@ -202,19 +297,17 @@ class LossHoldKeysTest(unittest.TestCase):
                 self.assertIn(f"\nRTO_EVENT_OUTPUT_FILE {trace}\n", config)
                 self.assertEqual(manifest["counter_files"]["RTO_EVENT_OUTPUT_FILE"], trace)
 
-    def test_receiver_hold_names_at_most_8_spines(self) -> None:
-        for spines, refused in ((8, False), (9, True)):
+    def test_receiver_hold_names_every_spine(self) -> None:
+        for spines, refused in ((256, False), (257, True)):
             self.write(RECEIVER, spines=spines)
             with self.subTest(spines=spines):
                 if refused:
                     with self.assertRaisesRegex(
-                        ValueError, "receiver_hold holds at most 8 spines"
+                        ValueError, "spine_count must not exceed 256"
                     ):
                         load_profile(self.profile_path)
                 else:
                     load_profile(self.profile_path)
-        self.write({**HOLD, "path_seq": True}, spines=9)
-        load_profile(self.profile_path)
 
     def test_refusals(self) -> None:
         refusals: list[tuple[dict[str, object], str]] = [
@@ -280,6 +373,28 @@ class LossHoldKeysTest(unittest.TestCase):
             ),
             ({**RECEIVER, "receiver_hold_clean": 0}, "receiver_hold_clean must be a positive"),
             (
+                {**HOLD, "path_seq": True, "receiver_hold_slots": 8},
+                "receiver_hold_slots requires receiver_hold true",
+            ),
+            ({**RECEIVER, "receiver_hold_slots": 0}, "receiver_hold_slots must be an integer from 1"),
+            ({**RECEIVER, "receiver_hold_slots": 128}, "receiver_hold_slots must be an integer from 1"),
+            ({**RECEIVER, "receiver_hold_slots": True}, "receiver_hold_slots must be an integer from 1"),
+            (
+                {**HOLD, "path_seq": True, "receiver_hold_widen": 2},
+                "receiver_hold_widen requires receiver_hold true",
+            ),
+            ({**RECEIVER, "receiver_hold_widen": 1}, "receiver_hold_widen must be an integer of at least 2"),
+            (
+                {**HOLD, "path_seq": True, "receiver_hold_auto_leaves": 1},
+                "receiver_hold_auto_leaves requires receiver_hold true",
+            ),
+            ({**RECEIVER, "receiver_hold_auto_leaves": 0}, "receiver_hold_auto_leaves must be a positive integer"),
+            ({**RECEIVER, "receiver_hold_widen": True}, "receiver_hold_widen must be an integer of at least 2"),
+            (
+                {**FLOW_HOLD, "path_seq": True, "receiver_hold": True, "receiver_hold_widen": 2},
+                "'reps_flow_hold' does not take",
+            ),
+            (
                 {**HOLD, "hold_scope": "host", "hold_auto_leaves": 2},
                 "hold_auto_leaves requires hold_scope 'auto' or receiver_hold true",
             ),
@@ -294,6 +409,9 @@ class LossHoldKeysTest(unittest.TestCase):
             ("held_loss_rtts", 2),
             ("receiver_hold", True),
             ("receiver_hold_clean", 8),
+            ("receiver_hold_slots", 8),
+            ("receiver_hold_widen", 2),
+            ("receiver_hold_auto_leaves", 1),
             ("loss_p0", 0.0),
         ):
             refusals += [

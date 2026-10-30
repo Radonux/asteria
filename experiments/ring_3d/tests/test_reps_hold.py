@@ -22,6 +22,7 @@ HOLD = {
     "held_exploration": "sentinel",
 }
 FLOW_HOLD = {**HOLD, "selector": "reps_flow_hold"}
+MRC_HOLD = {**HOLD, "selector": "mrc_hold"}
 ORACLE = {
     "mode": "spray_uniform",
     "selector": "reps_oracle",
@@ -113,11 +114,40 @@ class RepsSpineSelectorTest(unittest.TestCase):
         self.assertEqual(balancing["hold_scope"], "host")
         self.assertIn("SPINE_LOSS_OUTPUT_FILE", manifest["counter_files"])
 
+    def test_reps_hold_sentinel_spread_is_written_only_when_set(self) -> None:
+        manifest, config, _ = self.generated({**HOLD, "held_sentinel_spread": 64})
+        self.assertIn(
+            "\nSPRAY_HELD_EXPLORATION sentinel\nSPRAY_HELD_SENTINEL_SPREAD 64\n", config
+        )
+        self.assertEqual(manifest["load_balancing"]["held_sentinel_spread"], 64)
+        manifest, config, _ = self.generated(HOLD)
+        self.assertNotIn("SPRAY_HELD_SENTINEL_SPREAD", config)
+        self.assertNotIn("held_sentinel_spread", manifest["load_balancing"])
+
     def test_reps_hold_leaf_scope_is_written_when_set(self) -> None:
         manifest, config, _ = self.generated({**HOLD, "hold_scope": "leaf"})
         self.assertIn("\nSPRAY_HOLD_SCOPE leaf\n", config)
         self.assertEqual(manifest["load_balancing"]["hold_scope"], "leaf")
         self.assertIn("SPINE_LOSS_OUTPUT_FILE", manifest["counter_files"])
+
+    def test_pair_scope_is_written_when_set(self) -> None:
+        for hold in (HOLD, MRC_HOLD):
+            with self.subTest(selector=hold["selector"]):
+                manifest, config, _ = self.generated({**hold, "hold_scope": "pair"})
+                self.assertIn("\nSPRAY_HOLD_SCOPE pair\n", config)
+                self.assertNotIn("SPRAY_HOLD_AUTO_LEAVES", config)
+                self.assertEqual(manifest["load_balancing"]["hold_scope"], "pair")
+                self.assertIn("SPINE_LOSS_OUTPUT_FILE", manifest["counter_files"])
+        manifest, config, _ = self.generated(
+            {
+                **HOLD,
+                "hold_scope": "pair",
+                "path_seq": True,
+                "receiver_hold": True,
+                "hold_auto_leaves": 3,
+            }
+        )
+        self.assertIn("\nSPRAY_HOLD_SCOPE pair\nSPRAY_HOLD_AUTO_LEAVES 3\n", config)
 
     def test_reps_hold_auto_scope_is_written_when_set(self) -> None:
         manifest, config, _ = self.generated(
@@ -225,6 +255,10 @@ class RepsSpineSelectorTest(unittest.TestCase):
                     {**hold, "held_sentinel_interval_ns": -1},
                     "held_sentinel_interval_ns must be a nonnegative integer",
                 ),
+                (
+                    {**hold, "held_sentinel_spread": 0},
+                    "held_sentinel_spread must be a positive integer",
+                ),
                 ({**hold, "buffer_size": 256}, "buffer_size must be at most 255"),
                 (
                     {**hold, "freezing_timeout_ns": 0},
@@ -242,11 +276,12 @@ class RepsSpineSelectorTest(unittest.TestCase):
         refusals += [
             (
                 {**HOLD, "hold_scope": "rack"},
-                "hold_scope must be 'host', 'leaf' or 'auto'",
+                "hold_scope must be 'host', 'leaf', 'auto' or 'pair'",
             ),
             ({**FLOW_HOLD, "hold_scope": "host"}, "'reps_flow_hold' does not take"),
             ({**FLOW_HOLD, "hold_scope": "leaf"}, "'reps_flow_hold' does not take"),
             ({**FLOW_HOLD, "hold_scope": "auto"}, "'reps_flow_hold' does not take"),
+            ({**FLOW_HOLD, "hold_scope": "pair"}, "'reps_flow_hold' does not take"),
             (
                 {**FLOW_HOLD, "hold_auto_leaves": 2},
                 "'reps_flow_hold' does not take",
@@ -256,7 +291,7 @@ class RepsSpineSelectorTest(unittest.TestCase):
                     {**HOLD, "hold_scope": scope, "hold_auto_leaves": 2},
                     "hold_auto_leaves requires hold_scope 'auto'",
                 )
-                for scope in ("host", "leaf")
+                for scope in ("host", "leaf", "pair")
             ),
             *(
                 (
@@ -285,6 +320,7 @@ class RepsSpineSelectorTest(unittest.TestCase):
             ("loss_hold_clean_sentinels", 4),
             ("held_exploration", "sentinel"),
             ("held_sentinel_interval_ns", 0),
+            ("held_sentinel_spread", 64),
             ("hold_scope", "leaf"),
             ("hold_auto_leaves", 2),
             ("congestion_grade_floor", 1),
@@ -314,22 +350,18 @@ class RepsSpineSelectorTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     load_profile(self.profile_path)
 
-    def test_loss_hold_holds_at_most_32_spines(self) -> None:
+    def test_loss_hold_holds_every_spine(self) -> None:
         for balancing in (HOLD, FLOW_HOLD):
-            for spines, refused in ((32, False), (33, True)):
+            for spines, refused in ((256, False), (257, True)):
                 self.write(balancing, spines=spines)
                 with self.subTest(selector=balancing["selector"], spines=spines):
                     if refused:
                         with self.assertRaisesRegex(
-                            ValueError,
-                            f"'{balancing['selector']}' holds at most 32 spines",
+                            ValueError, "spine_count must not exceed 256"
                         ):
                             load_profile(self.profile_path)
                     else:
                         load_profile(self.profile_path)
-        # reps_oracle keeps no per-spine report or hold.
-        self.write(ORACLE, spines=33)
-        load_profile(self.profile_path)
 
     def test_reorder_tolerance_is_required(self) -> None:
         for balancing in (HOLD, FLOW_HOLD, ORACLE):

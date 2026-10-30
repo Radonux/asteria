@@ -85,6 +85,8 @@ map<MsgEventKey, MsgEvent> sim_recv_waiting_hash;
 map<MsgEventKey, uint64_t> received_msg_standby_hash;
 map<FlowKey, AstraSimNs3::FlowRecord> active_flow_registry;
 uint64_t pending_background_flows = 0;
+// Flows of the background load still active: no completion waits for them.
+uint64_t active_background_load_flows = 0;
 uint64_t completed_qps = 0;
 bool transport_failure = false;
 string transport_failure_message;
@@ -149,8 +151,10 @@ uint64_t completed_qp_count() {
     return completed_qps;
 }
 
+// The active flows completion waits for: every one but the background
+// load's.
 size_t active_qp_count() {
-    return active_flow_registry.size();
+    return active_flow_registry.size() - active_background_load_flows;
 }
 
 bool has_transport_failure() {
@@ -365,7 +369,8 @@ void start_rdma_flow(AstraSimNs3::FlowRecord flow,
     const uint16_t port = acquire_source_port(flow.src, flow.dst);
     flow.source_port = port;
     flow.start_time_ns = Simulator::Now().GetNanoSeconds();
-    if (flow.kind != AstraSimNs3::FlowKind::BackgroundMicroburst) {
+    if (flow.kind != AstraSimNs3::FlowKind::BackgroundMicroburst &&
+        flow.kind != AstraSimNs3::FlowKind::BackgroundLoad) {
         sender_src_port_map.emplace(make_pair(port, make_pair(flow.src, flow.dst)),
                                     flow.tag);
         register_logical_send_event(flow.src, flow.dst, flow.logical_bytes,
@@ -376,6 +381,9 @@ void start_rdma_flow(AstraSimNs3::FlowRecord flow,
     if (!active_flow_registry.emplace(key, flow).second) {
         throw runtime_error("Duplicate active RDMA flow key");
     }
+    if (flow.kind == AstraSimNs3::FlowKind::BackgroundLoad) {
+        ++active_background_load_flows;
+    }
     flow_input.idx++;
 
     RdmaClientHelper client_helper(
@@ -385,6 +393,9 @@ void start_rdma_flow(AstraSimNs3::FlowRecord flow,
                 : 0,
         global_t == 1 ? maxRtt : pairRtt[flow.src][flow.dst], msg_handler,
         fun_arg, flow.tag, flow.src, flow.dst);
+    if (flow.rate_bps > 0) {
+        client_helper.SetAttribute("MaxRate", DataRateValue(DataRate(flow.rate_bps)));
+    }
     ApplicationContainer applications = client_helper.Install(n.Get(flow.src));
     // Node::AddApplication schedules initialization at the current simulated
     // time. Application::DoInitialize then treats the configured start time as
@@ -416,6 +427,42 @@ void start_background_flow(AstraSimNs3::MicroburstFlow* background) {
     delete background;
 }
 
+// The background load's flows, once per all-to-all collective of the
+// workload, from that collective's first flow on any rank.
+void maybe_start_background(const AstraSim::sim_request& request) {
+    auto& config = AstraSimNs3::experiment_config;
+    if (!config.enabled || config.background_flows.empty() ||
+        request.operation.transport_role !=
+            AstraSim::TransportRole::CollectivePayload ||
+        request.operation.collective_type != AstraSim::ComType::All_to_All ||
+        !config.background_started
+             .emplace(request.operation.training_step,
+                      request.operation.workload_node_id)
+             .second) {
+        return;
+    }
+    for (const auto& background : config.background_flows) {
+        try {
+            AstraSimNs3::FlowRecord flow;
+            flow.kind = AstraSimNs3::FlowKind::BackgroundLoad;
+            flow.operation.transport_role = AstraSim::TransportRole::BackgroundTraffic;
+            flow.origin_transport_role = AstraSim::TransportRole::BackgroundTraffic;
+            flow.operation.training_step = request.operation.training_step;
+            flow.src = static_cast<int>(background.src);
+            flow.dst = static_cast<int>(background.dst);
+            flow.priority_group = background.priority_group;
+            flow.logical_bytes = background.size_bytes;
+            flow.physical_bytes = background.size_bytes;
+            flow.rate_bps = background.rate_bps;
+            start_rdma_flow(flow);
+        } catch (const exception& error) {
+            cerr << "Unable to start background load flow: " << error.what()
+                 << "\n";
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
 void maybe_trigger_microburst(const AstraSim::sim_request& request) {
     const auto& config = AstraSimNs3::experiment_config;
     if (!config.enabled || !config.microburst_enabled ||
@@ -442,6 +489,7 @@ void send_flow(int src_id,
                int tag,
                const AstraSim::sim_request& request) {
     maybe_trigger_microburst(request);
+    maybe_start_background(request);
     const auto decision =
         AstraSimNs3::evaluate_shedding(request, src_id, dst_id, tag);
 
@@ -660,6 +708,9 @@ void qp_finish(FILE* fout, Ptr<RdmaQueuePair> q) {
             throw runtime_error("Background flow completion accounting underflow");
         }
         --pending_background_flows;
+    } else if (flow.kind == AstraSimNs3::FlowKind::BackgroundLoad) {
+        account_physical_bytes(sid, did, q->m_size);
+        --active_background_load_flows;
     } else {
         const SenderKey sender_key =
             make_pair(static_cast<int>(q->sport), make_pair(sid, did));
@@ -720,6 +771,8 @@ void qp_fail(FILE* fout, Ptr<RdmaQueuePair> q, uint32_t reason) {
             throw runtime_error("Background flow failure accounting underflow");
         }
         --pending_background_flows;
+    } else if (flow.kind == AstraSimNs3::FlowKind::BackgroundLoad) {
+        --active_background_load_flows;
     } else {
         const SenderKey sender_key =
             make_pair(static_cast<int>(q->sport), make_pair(sid, did));

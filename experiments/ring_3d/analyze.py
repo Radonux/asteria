@@ -797,8 +797,44 @@ _HOST_TRANSPORT_EVENTS: Final = frozenset(
         "cc_exempt_granted",
         "cc_transition",
         "path_probe",
+        "ack_loss_declared",
+        "tail_loss_cancelled",
+        "tail_loss_delivered",
+        "tail_loss_ambiguous",
+        "tail_repair_rerouted",
+        "receiver_tail_missing",
+        "receiver_tail_missing_late",
     }
 )
+
+# The receiver's tail counts, which the backend also breaks down by the
+# requested spine of each send, in a row per spine named after the event
+# with _spine<k> appended.
+_RECEIVER_TAIL_EVENTS: Final = ("receiver_tail_missing", "receiver_tail_missing_late")
+
+
+# The answers a receiver sends back to a sender, acknowledgements, NACKs and
+# repair requests, that a link error or a black hole dropped on a leaf-spine
+# link, which the backend counts by the link's direction, up from a leaf to a
+# spine or down, and breaks down by spine in a row per spine named after the
+# count with _spine<k> appended. Every one of them is also a link_error_drop or
+# a switch_blackhole_drop.
+_ANSWER_DROP_EVENTS: Final = ("answer_drop_up", "answer_drop_down")
+
+
+def _spine_row(event: str, counts: tuple[str, ...]) -> tuple[str, int] | None:
+    """The count and spine of a breakdown row of one of counts, or None for
+    any other row."""
+    base, separator, spine = event.rpartition("_spine")
+    if separator and base in counts and spine.isdigit():
+        return base, int(spine)
+    return None
+
+
+def _receiver_tail_spine_row(event: str) -> tuple[str, int] | None:
+    """The event and spine of a breakdown row of a receiver tail count, or
+    None for any other row."""
+    return _spine_row(event, _RECEIVER_TAIL_EVENTS)
 
 _FORGIVEN_PAYLOAD_EVENTS: Final = frozenset(
     {"trim_forgiven", "remainder_forgiven"}
@@ -819,6 +855,8 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
     event_plane_counts: dict[str, dict[str, int]] = defaultdict(
         lambda: defaultdict(int)
     )
+    by_spine: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    answer_drops: dict[str, int] = defaultdict(int)
     valid_events = {
         "data_arrival",
         "data_deliver",
@@ -876,6 +914,31 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
         # A path selector's probe of a path it no longer sends data on. It
         # carries no payload, so it is a count on the control plane.
         "path_probe",
+        # A send whose own acknowledgement never came, declared lost on its
+        # spine under ack_loss_rtts once a later cumulative acknowledgement
+        # covered it. Nothing is repaired, so it is a count on the control
+        # plane.
+        "ack_loss_declared",
+        # A tail repair request's deferred loss report under tail_loss_rtts
+        # that a later trim notification for the same send cancelled. The
+        # repair already went out, so it is a count on the control plane.
+        "tail_loss_cancelled",
+        # The same report cancelled by the acknowledgement of the send along
+        # its declared path: the send arrived after the request.
+        "tail_loss_delivered",
+        # The same, where a repair of the send had already gone out along the
+        # declared path, so the acknowledgement may be the repair's.
+        "tail_loss_ambiguous",
+        # A repair of such a send the path selector chose again because its
+        # first choice was the declared send's path, sent along another path.
+        "tail_repair_rerouted",
+        # A send a tail repair request named that the receiver's hold counted
+        # missing under receiver_tail_missing, still missing tail_loss_rtts
+        # after the request. No packet goes with it, so it is a count on the
+        # control plane.
+        "receiver_tail_missing",
+        # Such a send whose data packet or trimmed header arrived after all.
+        "receiver_tail_missing_late",
     }
     # Switch conversions only: trim_forgiven is the receiver's answer to one,
     # not a second conversion, and adding it would double-count the payload.
@@ -890,6 +953,31 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
     for row in iter_csv(path):
         event = row.get("event")
         plane = row.get("plane")
+        # A breakdown of events counted in their own rows, so no event of its
+        # own.
+        spine_row = _receiver_tail_spine_row(event or "")
+        if spine_row is not None:
+            if plane != "control":
+                raise ValueError("host transport reaction must ride the control plane")
+            spine_events = _as_int(row, "event_count")
+            if spine_events < 0:
+                raise ValueError("transport event totals must be nonnegative")
+            by_spine[spine_row[0]][spine_row[1]] += spine_events
+            continue
+        # A breakdown of the drops counted in link_error_drop and
+        # switch_blackhole_drop, so no event of its own either.
+        answer_row = _spine_row(event or "", _ANSWER_DROP_EVENTS)
+        if answer_row is not None or event in _ANSWER_DROP_EVENTS:
+            if plane != "control":
+                raise ValueError("a dropped answer must ride the control plane")
+            answer_events = _as_int(row, "event_count")
+            if answer_events < 0:
+                raise ValueError("transport event totals must be nonnegative")
+            if answer_row is None:
+                answer_drops[event] += answer_events
+            else:
+                by_spine[answer_row[0]][answer_row[1]] += answer_events
+            continue
         if event not in valid_events or plane not in {"data", "control"}:
             raise ValueError("invalid transport event plane or event")
         if event.startswith("data_") and plane != "data":
@@ -977,6 +1065,26 @@ def _summarize_transport_events(ns3_dir: Path) -> dict[str, Any]:
             "trimmed_queue_drop_count": events["switch_trimmed_queue_drop"],
         },
         "rto_fired_count": events["rto_fired"],
+        "ack_loss_declared_count": events["ack_loss_declared"],
+        "tail_loss_cancelled_count": events["tail_loss_cancelled"],
+        "tail_loss_delivered_count": events["tail_loss_delivered"],
+        "tail_loss_ambiguous_count": events["tail_loss_ambiguous"],
+        "tail_repair_rerouted_count": events["tail_repair_rerouted"],
+        "receiver_tail_missing_count": events["receiver_tail_missing"],
+        "receiver_tail_missing_late_count": events["receiver_tail_missing_late"],
+        "receiver_tail_missing_by_spine": dict(
+            sorted(by_spine["receiver_tail_missing"].items())
+        ),
+        "receiver_tail_missing_late_by_spine": dict(
+            sorted(by_spine["receiver_tail_missing_late"].items())
+        ),
+        **{
+            f"{event}_count": answer_drops[event] for event in _ANSWER_DROP_EVENTS
+        },
+        **{
+            f"{event}_by_spine": dict(sorted(by_spine[event].items()))
+            for event in _ANSWER_DROP_EVENTS
+        },
         "cnp_taken_count": events["cnp_taken"],
         "clipped_trim_count": events["clipped_trim"],
         "trim_forgiven_count": events["trim_forgiven"],

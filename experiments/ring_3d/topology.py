@@ -22,6 +22,7 @@ try:
         load_link_overrides,
     )
     from .switch import (
+        ECN_RATES_BPS,
         ECN_THRESHOLDS_KB,
         DefaultSwitch,
         SwitchProfile,
@@ -37,6 +38,7 @@ except ImportError:
         load_link_overrides,
     )
     from switch import (
+        ECN_RATES_BPS,
         ECN_THRESHOLDS_KB,
         DefaultSwitch,
         SwitchProfile,
@@ -60,8 +62,12 @@ PACKET_TRIM_MODES = {"ftd", "bts"}
 LOAD_BALANCING_MODES = {"ecmp", "ev_hash", "spray_uniform", "spray_policy"}
 # The modes whose identification names the spine a packet goes up.
 SPINE_NAMING_MODES = {"spray_uniform", "spray_policy"}
-# The most spines a spray_policy report grades.
-MAX_REPORTED_SPINES = 32
+# network.pair_bandwidth's values (ClosNetwork).
+PAIR_BANDWIDTHS = ("path", "spines")
+# The most spines a fabric names: the backend names a data packet's spines
+# in a byte each of its identification, and sizes every spine field, bitmap,
+# report and per-spine count to the fabric's spines, up to this many.
+MAX_SPINE_COUNT = 256
 # What chooses each data packet's entropy value under ev_hash.
 PATH_SELECTORS = ("ops", "reps", "ue_oblivious", "ue_aware", "mrc")
 # What chooses each data packet's spine under spray_uniform instead of the
@@ -73,25 +79,38 @@ SPINE_SELECTORS = (
     "reps_oracle",
     "mrc_hold",
     "reps_spine",
+    "themis",
+    "themis_hold",
+    "mrc_spine",
+    "ue_aware_spine",
 )
 # The spine selectors that keep a loss hold: per host, per destination leaf,
-# or per spine either of the two under hold_scope, for reps_hold and
-# mrc_hold; per queue pair for reps_flow_hold.
-LOSS_HOLD_SELECTORS = ("reps_hold", "reps_flow_hold", "mrc_hold")
+# per spine either of the two, or per destination host under hold_scope, for
+# reps_hold, mrc_hold and themis_hold; per queue pair for reps_flow_hold.
+LOSS_HOLD_SELECTORS = ("reps_hold", "reps_flow_hold", "mrc_hold", "themis_hold")
 # The loss hold selectors that read hold_scope and write the host's loss
 # trace.
-HOLD_SCOPE_SELECTORS = ("reps_hold", "mrc_hold")
-# The most spines a receiver's hold names in an acknowledgement's bitmap.
-MAX_RECEIVER_HOLD_SPINES = 8
-# The most spines a closing packet's per-spine counts name under
-# tail_recovery.
-MAX_TAIL_RECOVERY_SPINES = 8
+HOLD_SCOPE_SELECTORS = ("reps_hold", "mrc_hold", "themis_hold")
+# The bytes the backend puts before a data packet's payload as a device
+# receives it, in the plain configuration: the PPP header (2), the IPv4
+# header (20), the UDP header (8) and the data header's priority group (2)
+# and sequence (4). The INT header's send time, the path sequence, the
+# answer_hold bitmap and the tail counts add theirs where set
+# (ClosNetwork.data_frame_bytes).
+DATA_FRAME_HEADER_BYTES = 36
+INT_SEND_TIME_BYTES = 8
+PATH_SEQ_BYTES = 2
+TAIL_COUNT_BYTES = 2
+# The spines a byte of a spine bitmap names, as the answer_hold bitmap of a
+# data header under answer_path_seq does.
+SPINES_PER_BITMAP_BYTE = 8
+# The most spines over which every data header carries the per-spine counts
+# under tail_recovery (the backend's kFixedTailCounts); over more only a
+# header that closes its spine does, and every other one the flags byte.
+FIXED_TAIL_COUNT_SPINES = 8
 # The backend's tail recovery delay value for its default, the fabric's
 # largest base RTT, which it refuses as a given value.
 TAIL_RECOVERY_DELAY_DEFAULT_SENTINEL = 2**64 - 1
-# The value an acknowledgement's redirect field names no spine with, so
-# ack_redirect names at most this many spines.
-MAX_REDIRECT_SPINES = 255
 # The ns-3 CC_MODE number of each congestion_control.mode. 12 is no sender
 # reaction at all: a queue pair is set to link rate at creation and nothing ever
 # changes it. 1 is Mellanox DCQCN. 11 is UEC NSCC, a window per queue pair
@@ -170,7 +189,14 @@ class CongestionControl:
     The three rates are DCQCN's and are fractions of the link rate rather than
     absolute literals, so a profile keeps its intended aggressiveness at any
     link speed. ``ecn_threshold_scale`` multiplies every switch KMIN and KMAX
-    threshold and leaves the marking probability alone.
+    threshold and leaves the marking probability alone. ``window_state``,
+    under ``nscc`` alone, keeps NSCC's window per queue pair, ``message``, or
+    per destination and priority group across the queue pairs to it,
+    ``connection``; None when the profile leaves it out. ``rtt_sample``,
+    under ``nscc`` alone, gives NSCC the round trip of every answer but a
+    first resend's after a declared loss, ``any``, or follows Karn's rule and
+    floors every sample at the queue pair's base RTT, ``karn``; None when the
+    profile leaves it out.
     """
 
     mode: str
@@ -178,6 +204,8 @@ class CongestionControl:
     rate_hai_fraction: float = DEFAULT_RATE_HAI_FRACTION
     min_rate_fraction: float = DEFAULT_MIN_RATE_FRACTION
     ecn_threshold_scale: float = 1.0
+    window_state: str | None = None
+    rtt_sample: str | None = None
 
     @property
     def cc_mode(self) -> int:
@@ -192,22 +220,25 @@ class CongestionControl:
             round(link_bps * self.min_rate_fraction),
         )
 
-    def ecn_threshold_maps(self) -> str:
-        """The KMAX_MAP and KMIN_MAP lines, thresholds scaled, rates not."""
+    def ecn_threshold_maps(
+        self, rows: tuple[tuple[int, int, int], ...] = ECN_THRESHOLDS_KB
+    ) -> str:
+        """The KMAX_MAP and KMIN_MAP lines of rows (switch.ecn_rows),
+        thresholds scaled, rates not."""
         kmax = " ".join(
             f"{rate} {round(high * self.ecn_threshold_scale)}"
-            for rate, _, high in ECN_THRESHOLDS_KB
+            for rate, _, high in rows
         )
         kmin = " ".join(
             f"{rate} {round(low * self.ecn_threshold_scale)}"
-            for rate, low, _ in ECN_THRESHOLDS_KB
+            for rate, low, _ in rows
         )
-        count = len(ECN_THRESHOLDS_KB)
+        count = len(rows)
         return f"KMAX_MAP {count} {kmax}\nKMIN_MAP {count} {kmin}\n"
 
     def manifest(self, link_rate: str) -> dict[str, str | int | float]:
         rate_ai, rate_hai, min_rate = self.rates_bps(link_rate)
-        return {
+        recorded: dict[str, str | int | float] = {
             "mode": self.mode,
             "cc_mode": self.cc_mode,
             "rate_ai_fraction": self.rate_ai_fraction,
@@ -218,6 +249,11 @@ class CongestionControl:
             "rate_hai_bps": rate_hai,
             "min_rate_bps": min_rate,
         }
+        if self.window_state is not None:
+            recorded["window_state"] = self.window_state
+        if self.rtt_sample is not None:
+            recorded["rtt_sample"] = self.rtt_sample
+        return recorded
 
 
 @dataclass(frozen=True)
@@ -238,8 +274,10 @@ class LoadBalancing:
     the spines, leaving out those its loss hold holds, with ``mrc_hold`` by
     MRC over the spines with the same loss hold, and with
     ``reps_oracle`` by REPS over the spines, leaving out those the switches'
-    state shows a fault on, and with ``reps_spine`` by REPS over the spines,
-    leaving out none. ``spray_policy`` names a spine per packet the same
+    state shows a fault on, with ``reps_spine``, ``mrc_spine`` and
+    ``ue_aware_spine`` by REPS, MRC and UEC path-aware spraying over the
+    spines, leaving out none, and with ``themis`` by packet sequence number with
+    Themis's path avoidance (Liu et al., EuroSys 2026). ``spray_policy`` names a spine per packet the same
     way, drawn from scores the sender builds out of the grades the receiver
     reports in every acknowledgement. Every mode but ``ecmp`` reorders a
     flow's packets on the way.
@@ -279,6 +317,15 @@ class LoadBalancing:
         return (
             self.selector in LOSS_HOLD_SELECTORS
             and dict(self.parameters).get("receiver_hold") is True
+        )
+
+    def traces_answer_hold(self) -> bool:
+        """Whether the run traces both ends' answer route holds: under a
+        loss hold selector with answer_path_seq, the only configuration in
+        which the backend reads the trace."""
+        return (
+            self.selector in LOSS_HOLD_SELECTORS
+            and dict(self.parameters).get("answer_path_seq") is True
         )
 
     def recovers_tail(self) -> bool:
@@ -407,6 +454,20 @@ class ClosNetwork:
     by leaving that many designed spines dark. A rail-optimized 1:1 fabric
     with failed spines is how production AI clusters actually experience
     sustained oversubscription; it is an operating condition, not a design.
+    ``spine_link_rate`` is the leaf-spine links' rate, None for
+    ``link_rate``. ``pair_bandwidth``, under a load balancing mode that names
+    spines, is the bandwidth the backend gives a pair of hosts, whose BDP
+    sizes its window: ``path``, the backend's default, the best shortest
+    path's bottleneck, or ``spines``, for hosts on two leaves the sum over the
+    spines of each spine's path, at most either host's link, as a sprayed
+    pair's packets cross every spine; None when the profile leaves it out.
+    ``port_counter_interval_ns``, under a load balancing mode that writes the
+    switch port counters, also writes them at every multiple of it; None
+    writes them at the link events and the end alone. ``sparse_hold_trace``,
+    under a load balancing that writes ns3/spine_losses.csv or
+    ns3/receiver_holds.csv, writes a row of each only where its series sends
+    or receives, loses or changes grade or hold (and one row of an interval
+    that would write none); False writes every row.
     """
 
     link_rate: str
@@ -420,6 +481,10 @@ class ClosNetwork:
     switch_link_delay_ns: int = DEFAULT_SWITCH_LINK_DELAY_NS
     link_overrides: tuple[LinkOverride, ...] = ()
     link_failures: tuple[LinkFailure, ...] = ()
+    spine_link_rate: str | None = None
+    pair_bandwidth: str | None = None
+    port_counter_interval_ns: int | None = None
+    sparse_hold_trace: bool = False
 
     @property
     def live_spine_count(self) -> int:
@@ -433,13 +498,40 @@ class ClosNetwork:
             spine_count=self.live_spine_count,
         )
 
+    def data_frame_bytes(self) -> int:
+        """A full data frame's bytes as the backend's devices receive it
+        (RdmaHw::DataFrameBytes), which a loss_unit byte failure's rate per
+        byte is derived at and the backend checks: the payload and
+        DATA_FRAME_HEADER_BYTES, with the INT header's send time where
+        ack_redirect or one_way_delay asks for it, the path sequence under
+        path_seq, with a bit per spine of the answer_hold bitmap under
+        answer_path_seq, and the flags under tail_recovery with a count per
+        spine over at most FIXED_TAIL_COUNT_SPINES spines, which over more
+        only a closing header carries."""
+        balancing = dict(self.load_balancing.parameters)
+        header = DATA_FRAME_HEADER_BYTES
+        if (
+            self.load_balancing.selector == "ack_redirect"
+            or balancing.get("one_way_delay") is True
+        ):
+            header += INT_SEND_TIME_BYTES
+        if balancing.get("path_seq") is True:
+            header += PATH_SEQ_BYTES
+        if balancing.get("answer_path_seq") is True:
+            header += -(-self.live_spine_count // SPINES_PER_BITMAP_BYTE)
+        if balancing.get("tail_recovery") is True:
+            header += 1
+            if self.live_spine_count <= FIXED_TAIL_COUNT_SPINES:
+                header += TAIL_COUNT_BYTES * self.live_spine_count
+        return self.packet_payload_bytes + header
+
     def link_failure_config(self, host_count: int) -> str:
         """The LINK_FAILURE lines of every failure, in profile order."""
         index = self.clos_index(host_count)
         return "".join(
             line
             for failure in self.link_failures
-            for line in failure.config_lines(index)
+            for line in failure.config_lines(index, self.data_frame_bytes())
         )
     data_loss: DataPlaneLoss | None = None
     transport_recovery: TransportRecovery | None = None
@@ -526,7 +618,7 @@ class TopologyLayout:
     switch_ids: tuple[int, ...]
     links: tuple[TopologyLink, ...]
     link_rate: str
-    details: tuple[tuple[str, int], ...] = ()
+    details: tuple[tuple[str, int | str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.host_count <= 0 or self.node_count <= 0:
@@ -592,6 +684,18 @@ def _positive_int(value: Any, field: str) -> int:
     return value
 
 
+def _receiver_hold_slots(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 127:
+        raise ValueError(f"{field} must be an integer from 1 to 127")
+    return value
+
+
+def _receiver_hold_widen(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 2:
+        raise ValueError(f"{field} must be an integer of at least 2")
+    return value
+
+
 def _nonnegative_int(value: Any, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field} must be a nonnegative integer")
@@ -628,6 +732,8 @@ def _load_congestion_control(document: dict[str, Any]) -> CongestionControl:
         "rate_hai_fraction",
         "min_rate_fraction",
         "ecn_threshold_scale",
+        "window_state",
+        "rtt_sample",
     }
     if not isinstance(control, dict) or not {"mode"} <= set(control) <= (
         {"mode"} | optional
@@ -672,6 +778,28 @@ def _load_congestion_control(document: dict[str, Any]) -> CongestionControl:
             "network.congestion_control.ecn_threshold_scale must be a positive "
             "number that keeps every threshold at least 1 KB"
         )
+    window_state = control.get("window_state")
+    if "window_state" in control:
+        if window_state not in ("message", "connection"):
+            raise ValueError(
+                "network.congestion_control.window_state must be 'message' or "
+                "'connection'"
+            )
+        # The backend keeps the other modes' state per queue pair.
+        if mode != "nscc":
+            raise ValueError(
+                "network.congestion_control.window_state requires mode 'nscc'"
+            )
+    rtt_sample = control.get("rtt_sample")
+    if "rtt_sample" in control:
+        if rtt_sample not in ("any", "karn"):
+            raise ValueError(
+                "network.congestion_control.rtt_sample must be 'any' or 'karn'"
+            )
+        if mode != "nscc":
+            raise ValueError(
+                "network.congestion_control.rtt_sample requires mode 'nscc'"
+            )
     return CongestionControl(
         mode=mode,
         rate_ai_fraction=rate_ai,
@@ -681,6 +809,8 @@ def _load_congestion_control(document: dict[str, Any]) -> CongestionControl:
             "network.congestion_control.min_rate_fraction",
         ),
         ecn_threshold_scale=float(scale),
+        window_state=window_state,
+        rtt_sample=rtt_sample,
     )
 
 
@@ -861,8 +991,46 @@ def _held_exploration(value: Any, field: str) -> str:
 
 
 def _hold_scope(value: Any, field: str) -> str:
-    if value not in ("host", "leaf", "auto"):
-        raise ValueError(f"{field} must be 'host', 'leaf' or 'auto'")
+    if value not in ("host", "leaf", "auto", "pair"):
+        raise ValueError(f"{field} must be 'host', 'leaf', 'auto' or 'pair'")
+    return value
+
+
+def _path_state(value: Any, field: str) -> str:
+    if value not in ("message", "connection"):
+        raise ValueError(f"{field} must be 'message' or 'connection'")
+    return value
+
+
+def _ack_route(value: Any, field: str) -> str:
+    if value not in ("data_spine", "spray", "reverse_set", "repath"):
+        raise ValueError(
+            f"{field} must be 'data_spine', 'spray', 'reverse_set' or 'repath'"
+        )
+    return value
+
+
+def _ack_route_set_reply(value: Any, field: str) -> str:
+    if value not in ("data", "answer"):
+        raise ValueError(f"{field} must be 'data' or 'answer'")
+    return value
+
+
+def _copy_expiry(value: Any, field: str) -> str:
+    if value not in ("data_ack", "deadline"):
+        raise ValueError(f"{field} must be 'data_ack' or 'deadline'")
+    return value
+
+
+def _stray_path_seq(value: Any, field: str) -> str:
+    if value not in ("fresh", "closed"):
+        raise ValueError(f"{field} must be 'fresh' or 'closed'")
+    return value
+
+
+def _oracle_hops(value: Any, field: str) -> str:
+    if value not in ("round_trip", "forward"):
+        raise ValueError(f"{field} must be 'round_trip' or 'forward'")
     return value
 
 
@@ -910,6 +1078,31 @@ def _number_in(
 def _on_off(value: ParameterValue) -> str:
     """A switch as the backend's on and off keys read it."""
     return "on" if value else "off"
+
+
+def _duplicate_report(value: Any, field: str) -> bool | str:
+    if not isinstance(value, bool) and value != "retract":
+        raise ValueError(f"{field} must be a boolean or 'retract'")
+    return value
+
+
+def _duplicate_report_value(value: ParameterValue) -> str:
+    """SPRAY_DUPLICATE_REPORT's on, off or retract."""
+    return "retract" if value == "retract" else _on_off(value)
+
+
+OVERDUE_REPAIRS = ("evidence", "probe", "reprobe")
+
+
+def _overdue_repair(value: Any, field: str) -> bool | str:
+    if value is not False and value not in OVERDUE_REPAIRS:
+        raise ValueError(f"{field} must be 'evidence', 'probe', 'reprobe' or false")
+    return value
+
+
+def _overdue_repair_value(value: ParameterValue) -> str:
+    """SPRAY_OVERDUE_REPAIR's evidence, probe, reprobe or off."""
+    return value if value in OVERDUE_REPAIRS else "off"
 
 
 def _hold_auto_leaves(value: Any, field: str) -> int:
@@ -1084,12 +1277,17 @@ POLICY_PARAMETERS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "held_exploration", "SPRAY_HELD_EXPLORATION", "epsilon", _held_exploration
     ),
-    # Read only with held_exploration sentinel.
+    # Read only with held_exploration sentinel, as is held_sentinel_spread:
+    # a sentinel once due rides one send in that many, drawn per host, in
+    # place of the first send.
     BalancingParameter(
         "held_sentinel_interval_ns",
         "SPRAY_HELD_SENTINEL_INTERVAL_NS",
         0,
         _nonnegative_int,
+    ),
+    BalancingParameter(
+        "held_sentinel_spread", "SPRAY_HELD_SENTINEL_SPREAD", 1, _positive_int
     ),
     BalancingParameter("candidates", "SPRAY_CANDIDATES", 1, _positive_int),
     BalancingParameter(
@@ -1128,6 +1326,7 @@ WRITTEN_WHEN_SET_PARAMETERS = {
     "loss_hold_clean_sentinels",
     "held_exploration",
     "held_sentinel_interval_ns",
+    "held_sentinel_spread",
     "pool_decay_interval_ns",
     "pool_hold_propagates",
 }
@@ -1183,7 +1382,12 @@ def _tail_recovery_delay_ns(value: Any, field: str) -> int:
 # its requested spine; tail_recovery, which requires path_seq true, a
 # message's closing packets' per-spine sent counts and the receiver's repair
 # requests from them; tail_recovery_delay_ns, read only with tail_recovery,
-# the delay before such a request, absent the fabric's largest base RTT.
+# the delay before such a request, absent the fabric's largest base RTT;
+# tail_loss_rtts, read only with tail_recovery, the base RTTs a send a repair
+# request declares lost waits before its loss is reported to the path
+# selector, a trim of it or an acknowledgement of it along its path in that
+# time cancelling the report, its repair chosen again off its path where the
+# selector offers another, absent 1.
 PATH_SEQ_KEY = BalancingParameter("path_seq", "SPRAY_PATH_SEQ", False, _flag, _on_off)
 TAIL_RECOVERY_KEYS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
@@ -1195,10 +1399,153 @@ TAIL_RECOVERY_KEYS: tuple[BalancingParameter, ...] = (
         0,
         _tail_recovery_delay_ns,
     ),
+    BalancingParameter(
+        "tail_loss_rtts", "SPRAY_TAIL_LOSS_RTTS", 1.0, _nonnegative_number
+    ),
+)
+# ack_loss_rtts, after tail recovery's: the base RTTs after a later
+# cumulative acknowledgement covers a send whose own acknowledgement never
+# arrived at which that send is declared an acknowledgement loss on its spine,
+# to the path selector and the loss hold, with no repair; absent, none is.
+ACK_LOSS_KEY = BalancingParameter(
+    "ack_loss_rtts", "SPRAY_ACK_LOSS_RTTS", 0.0, _positive_number
+)
+# path_state, last, after receiver_tail_missing under the loss hold
+# selectors: how long a host keeps a queue pair's path selector, for its one
+# message, or for the connection to its destination, shared by the queue pairs
+# to it and kept past them, connection; absent, message.
+PATH_STATE_KEY = BalancingParameter(
+    "path_state", "SPRAY_PATH_STATE", "message", _path_state
+)
+# ack_route and ack_route_oracle, after path_state: the spine each answer a
+# receiver sends back to a sender is routed over, an acknowledgement, a NACK or
+# a repair request, the spine that carried the data packet it answers,
+# data_spine, or one the receiver draws uniformly per answer, spray; absent,
+# data_spine; or per connection, a sending host and priority group, a member
+# drawn per answer of a set of ack_route_set_size spines the receiver probes
+# once per ack_route_set_probe_rtts base RTTs and renews, reverse_set, or one
+# spine the receiver draws
+# again at each duplicate data arrival, repath. ack_route_oracle, read only
+# under spray, leaves out of the draw the spines over which an answer toward
+# the sender's leaf crosses a fault the switches' state shows, from its onset;
+# absent, false. ack_route_set_size and ack_route_set_probe_rtts, read only
+# under reverse_set; absent, 2 and 1. ack_route_set_reply, read only under
+# reverse_set: how the switches queue the sender's return of a probe, data,
+# in its priority group's queue as a path probe, or answer, as the answers;
+# absent, data.
+ACK_ROUTE_KEYS: tuple[BalancingParameter, ...] = (
+    BalancingParameter("ack_route", "ACK_ROUTE", "data_spine", _ack_route),
+    BalancingParameter(
+        "ack_route_oracle", "ACK_ROUTE_ORACLE", False, _flag, _on_off
+    ),
+    BalancingParameter(
+        "ack_route_set_size", "ACK_ROUTE_SET_SIZE", 2, _positive_int
+    ),
+    BalancingParameter(
+        "ack_route_set_probe_rtts", "ACK_ROUTE_SET_PROBE_RTTS", 1.0, _positive_number
+    ),
+    BalancingParameter(
+        "ack_route_set_reply", "ACK_ROUTE_SET_REPLY", "data", _ack_route_set_reply
+    ),
+)
+# stray_path_seq, after ack_route_oracle, read only with path_seq true: how
+# the receiver reads the path sequences of a packet arriving after its flow's
+# receive queue pair was removed at the flow's completion (a copy, a repaired
+# send or a repair still in flight), as a new flow's, fresh, or against the
+# removed queue pair, closed, so that it counts no gap, asks no tail repair
+# and counts nothing in the receiver's hold, and only takes its sequence out
+# of that queue pair's waiting tail runs; absent, fresh.
+STRAY_PATH_SEQ_KEY = BalancingParameter(
+    "stray_path_seq", "SPRAY_STRAY_PATH_SEQ", "fresh", _stray_path_seq
+)
+# coverage_first, after stray_path_seq: whether the per-path rule, the
+# held-loss rule, a tail repair request, a copy's expiry and ack_loss_rtts first
+# apply the queue pair's coverage (the cumulative acknowledgement, and for a
+# copy its data send's answer), a send it covers being an answer loss that
+# counts toward no spine's losses, no hold and no copy's; absent, false.
+COVERAGE_FIRST_KEY = BalancingParameter(
+    "coverage_first", "SPRAY_COVERAGE_FIRST", False, _flag, _on_off
+)
+# duplicate_report, after coverage_first and read only with it true: whether
+# a receiver flags its answer to a data packet it held already, and what a
+# sender makes of the flag on a timed-out send's resend's answer: true tells
+# the loss only at that answer, none where it is flagged; "retract" tells
+# each timed-out send's loss at once and takes it back where the answer is
+# flagged, the hold it began graded again without it, under reps_hold or
+# mrc_hold with hold_scope auto and hold_rule count; absent, false.
+DUPLICATE_REPORT_KEY = BalancingParameter(
+    "duplicate_report",
+    "SPRAY_DUPLICATE_REPORT",
+    False,
+    _duplicate_report,
+    _duplicate_report_value,
+)
+# rack_reorder_ns, after duplicate_report: the reorder window, in ns, of the
+# sender's loss rule across paths, an answer to a send made at t declaring
+# lost every outstanding send of the queue pair made at or before t less the
+# window, along any path (RACK, RFC 8985 section 6.2, without its reorder
+# timer); absent, off.
+RACK_REORDER_KEY = BalancingParameter(
+    "rack_reorder_ns", "SPRAY_RACK_REORDER_NS", 0, _positive_int
+)
+# rack_defer_loss, after rack_reorder_ns and read only with it set and
+# tail_loss_rtts above zero: whether the sends that rule declares lost, still
+# repaired at once, are told to the path selector as a tail repair request's
+# declarations are, tail_loss_rtts base RTTs later unless the declared send's
+# answer arrives first; absent, false.
+RACK_DEFER_KEY = BalancingParameter(
+    "rack_defer_loss", "SPRAY_RACK_DEFER_LOSS", False, _flag, _on_off
 )
 SPRAY_UNIFORM_KEYS: tuple[BalancingParameter, ...] = (
     PATH_SEQ_KEY,
     *TAIL_RECOVERY_KEYS,
+    ACK_LOSS_KEY,
+    PATH_STATE_KEY,
+    *ACK_ROUTE_KEYS,
+    STRAY_PATH_SEQ_KEY,
+    COVERAGE_FIRST_KEY,
+    DUPLICATE_REPORT_KEY,
+    RACK_REORDER_KEY,
+    RACK_DEFER_KEY,
+)
+# answer_path_seq with answer_probe_interval_ns and answer_hold_clean, last,
+# read only by the loss hold selectors under ack_route spray with path_seq
+# true: whether answers are numbered per route spine, the sender holds the
+# routes of a receiver leaf its answers are found lost on, at the top of
+# loss_thresholds over loss_interval_ns, until answer_hold_clean clean answers
+# in a row release them, its data packets carry those routes, and the
+# receiver leaves them out of its draw of its answers' routes but for one probe
+# answer per held spine every answer_probe_interval_ns; absent, false, with
+# 1,000,000 ns and 3.
+ANSWER_PATH_SEQ_KEYS: tuple[BalancingParameter, ...] = (
+    BalancingParameter(
+        "answer_path_seq", "SPRAY_ANSWER_PATH_SEQ", False, _flag, _on_off
+    ),
+    BalancingParameter(
+        "answer_probe_interval_ns",
+        "SPRAY_ANSWER_PROBE_INTERVAL_NS",
+        1000000,
+        _positive_int,
+    ),
+    BalancingParameter(
+        "answer_hold_clean", "SPRAY_ANSWER_HOLD_CLEAN", 3, _positive_int
+    ),
+)
+# copy_expiry, last, read only by the loss hold selectors under
+# sentinel_mode duplicate: when a copy its own acknowledgement has not
+# answered is declared lost, once its data send is acknowledged past one base
+# RTT, data_ack, or past tail_loss_rtts base RTTs since it was sent whatever
+# its data's acknowledgement, deadline; absent, data_ack.
+COPY_EXPIRY_KEY = BalancingParameter(
+    "copy_expiry", "SPRAY_COPY_EXPIRY", "data_ack", _copy_expiry
+)
+# receiver_tail_missing, after ack_loss_rtts, read only by the loss hold
+# selectors with receiver_hold and tail_recovery true: whether the receiver's
+# hold also counts missing the sends a tail repair request names that are
+# still missing tail_loss_rtts base RTTs after the request, which holds a
+# spine on which nothing arrives; absent, false.
+RECEIVER_TAIL_MISSING_KEY = BalancingParameter(
+    "receiver_tail_missing", "SPRAY_RECEIVER_TAIL_MISSING", False, _flag, _on_off
 )
 
 
@@ -1207,15 +1554,36 @@ SPRAY_UNIFORM_KEYS: tuple[BalancingParameter, ...] = (
 # held exploration the backend requires, and the clean sentinels it requires
 # under hold_release sentinels; then the keys written only when set.
 # hold_scope, read by reps_hold and mrc_hold, keys the hold by host, by
-# destination leaf, or per spine by either, auto, the backend's default;
+# destination leaf, per spine by either, auto, the backend's default, or by
+# destination host, pair;
 # hold_auto_leaves, read only under auto or with receiver_hold, is the
 # destination leaves (the sender leaves at the receiver) with a loss on a
 # spine from which the hold covers every one. hold_rule, the hold test's
 # probabilities, hold_release with hold_trickle, sentinel_mode,
-# held_loss_rtts, path_seq and receiver_hold with receiver_hold_clean take the
-# backend's defaults when absent; the backend reads loss_p0, loss_p1 and
+# held_loss_rtts with overdue_repair and overdue_repair_limit, path_seq and
+# receiver_hold with receiver_hold_clean, receiver_hold_slots (the spine
+# list that replaces the per-spine bitmap on acknowledgements) and
+# receiver_hold_widen (a sender holding a spine toward every leaf once
+# receivers on that many destination leaves hold it, not under
+# reps_flow_hold) and receiver_hold_auto_leaves (the sender leaves losing on
+# a spine from which a receiver holds it for every sender leaf, in place of
+# hold_auto_leaves; 1 at its first loss) take the backend's defaults when
+# absent; the backend reads loss_p0, loss_p1 and
 # hold_alpha only under hold_rule llr or hold_release trickle, hold_beta only
 # under llr.
+# overdue_repair and overdue_repair_limit, in LOSS_HOLD_KEYS, are also read
+# by reps_spine, reps_oracle and the uniform draw, whose sends no hold holds,
+# last and only when set: overdue_repair "reprobe" or false alone there, its
+# repair counting no loss, after the backend's held_loss_rtts wait, which
+# they do not set.
+OVERDUE_REPAIR_KEYS: tuple[BalancingParameter, ...] = (
+    BalancingParameter(
+        "overdue_repair", "SPRAY_OVERDUE_REPAIR", False, _overdue_repair, _overdue_repair_value
+    ),
+    BalancingParameter(
+        "overdue_repair_limit", "SPRAY_OVERDUE_REPAIR_LIMIT", 2, _positive_int
+    ),
+)
 LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
     _policy_parameter("loss_thresholds"),
     BalancingParameter("loss_interval_ns", "SPRAY_LOSS_INTERVAL_NS", 0, _positive_int),
@@ -1227,6 +1595,7 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
     ),
     _policy_parameter("held_exploration"),
     _policy_parameter("held_sentinel_interval_ns"),
+    _policy_parameter("held_sentinel_spread"),
     BalancingParameter("hold_scope", "SPRAY_HOLD_SCOPE", "auto", _hold_scope),
     BalancingParameter(
         "hold_auto_leaves", "SPRAY_HOLD_AUTO_LEAVES", 2, _hold_auto_leaves
@@ -1250,21 +1619,63 @@ LOSS_HOLD_KEYS: tuple[BalancingParameter, ...] = (
     BalancingParameter(
         "held_loss_rtts", "SPRAY_HELD_LOSS_RTTS", 2, _nonnegative_int
     ),
+    *OVERDUE_REPAIR_KEYS,
     PATH_SEQ_KEY,
     BalancingParameter("receiver_hold", "SPRAY_RECEIVER_HOLD", False, _flag, _on_off),
     BalancingParameter(
         "receiver_hold_clean", "SPRAY_RECEIVER_HOLD_CLEAN", 1024, _positive_int
     ),
+    BalancingParameter(
+        "receiver_hold_slots", "SPRAY_RECEIVER_HOLD_SLOTS", 0, _receiver_hold_slots
+    ),
+    BalancingParameter(
+        "receiver_hold_widen", "SPRAY_RECEIVER_HOLD_WIDEN", 0, _receiver_hold_widen
+    ),
+    BalancingParameter(
+        "receiver_hold_auto_leaves",
+        "SPRAY_RECEIVER_HOLD_AUTO_LEAVES",
+        0,
+        _positive_int,
+    ),
 )
 # Each loss hold selector's parameters: REPS's, or MRC's but its set, which
 # is the spines, defaults filled in; then the loss hold's, path_seq among
-# them, and tail recovery's.
+# them, tail recovery's, ack_loss_rtts, receiver_tail_missing, path_state,
+# ack_route, ack_route_oracle, copy_expiry, stray_path_seq, coverage_first,
+# duplicate_report, rack_reorder_ns, rack_defer_loss and the answer path
+# sequences' keys.
 LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
-    "reps_hold": (*SELECTOR_PARAMETERS["reps"], *LOSS_HOLD_KEYS, *TAIL_RECOVERY_KEYS),
+    "reps_hold": (
+        *SELECTOR_PARAMETERS["reps"],
+        *LOSS_HOLD_KEYS,
+        *TAIL_RECOVERY_KEYS,
+        ACK_LOSS_KEY,
+        RECEIVER_TAIL_MISSING_KEY,
+        PATH_STATE_KEY,
+        *ACK_ROUTE_KEYS,
+        COPY_EXPIRY_KEY,
+        STRAY_PATH_SEQ_KEY,
+        COVERAGE_FIRST_KEY,
+        DUPLICATE_REPORT_KEY,
+        RACK_REORDER_KEY,
+        RACK_DEFER_KEY,
+        *ANSWER_PATH_SEQ_KEYS,
+    ),
     "reps_flow_hold": (
         *SELECTOR_PARAMETERS["reps"],
         *LOSS_HOLD_KEYS,
         *TAIL_RECOVERY_KEYS,
+        ACK_LOSS_KEY,
+        RECEIVER_TAIL_MISSING_KEY,
+        PATH_STATE_KEY,
+        *ACK_ROUTE_KEYS,
+        COPY_EXPIRY_KEY,
+        STRAY_PATH_SEQ_KEY,
+        COVERAGE_FIRST_KEY,
+        DUPLICATE_REPORT_KEY,
+        RACK_REORDER_KEY,
+        RACK_DEFER_KEY,
+        *ANSWER_PATH_SEQ_KEYS,
     ),
     "mrc_hold": (
         *(
@@ -1274,6 +1685,17 @@ LOSS_HOLD_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
         ),
         *LOSS_HOLD_KEYS,
         *TAIL_RECOVERY_KEYS,
+        ACK_LOSS_KEY,
+        RECEIVER_TAIL_MISSING_KEY,
+        PATH_STATE_KEY,
+        *ACK_ROUTE_KEYS,
+        COPY_EXPIRY_KEY,
+        STRAY_PATH_SEQ_KEY,
+        COVERAGE_FIRST_KEY,
+        DUPLICATE_REPORT_KEY,
+        RACK_REORDER_KEY,
+        RACK_DEFER_KEY,
+        *ANSWER_PATH_SEQ_KEYS,
     ),
 }
 LOSS_HOLD_REQUIRED_PARAMETERS = (
@@ -1286,10 +1708,12 @@ LOSS_HOLD_REQUIRED_PARAMETERS = (
 SENTINEL_RELEASE_PARAMETERS = (
     "loss_hold_clean_sentinels",
     "held_sentinel_interval_ns",
+    "held_sentinel_spread",
 )
 LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "loss_hold_clean_sentinels",
     "held_sentinel_interval_ns",
+    "held_sentinel_spread",
     "hold_scope",
     "hold_auto_leaves",
     "hold_rule",
@@ -1301,11 +1725,34 @@ LOSS_HOLD_WRITTEN_WHEN_SET_PARAMETERS = {
     "hold_trickle",
     "sentinel_mode",
     "held_loss_rtts",
+    "overdue_repair",
+    "overdue_repair_limit",
     "path_seq",
     "receiver_hold",
     "receiver_hold_clean",
+    "receiver_hold_slots",
+    "receiver_hold_widen",
+    "receiver_hold_auto_leaves",
     "tail_recovery",
     "tail_recovery_delay_ns",
+    "tail_loss_rtts",
+    "ack_loss_rtts",
+    "receiver_tail_missing",
+    "path_state",
+    "ack_route",
+    "ack_route_oracle",
+    "ack_route_set_size",
+    "ack_route_set_probe_rtts",
+    "ack_route_set_reply",
+    "copy_expiry",
+    "stray_path_seq",
+    "coverage_first",
+    "duplicate_report",
+    "rack_reorder_ns",
+    "rack_defer_loss",
+    "answer_path_seq",
+    "answer_probe_interval_ns",
+    "answer_hold_clean",
 }
 # reps_oracle: REPS's parameters, defaults filled in, and the cost source the
 # backend requires, switch_queue, which builds the switches' state it reads.
@@ -1315,9 +1762,72 @@ REPS_ORACLE_PARAMETERS: tuple[BalancingParameter, ...] = (
 )
 
 
+# oracle_hops, last, read only by reps_oracle: the hops over which a spine
+# toward the destination's leaf is read as faulted, the data's two and the two
+# its acknowledgement returns over through the same spine, round_trip, or the
+# data's two alone, the source leaf's uplink to the spine and the spine's
+# downlink to the destination's leaf, forward, for answers that do not return
+# over the data's spine, as under ack_route spray; absent, round_trip.
+ORACLE_HOPS_KEY = BalancingParameter(
+    "oracle_hops", "REPS_ORACLE_HOPS", "round_trip", _oracle_hops
+)
+
+
 # reps_spine: REPS's parameters, defaults filled in; no loss hold, no
 # sentinel, and none of the loss hold's keys.
 REPS_SPINE_PARAMETERS: tuple[BalancingParameter, ...] = SELECTOR_PARAMETERS["reps"]
+# themis, defaults filled in: the paths a queue pair's packets are sprayed
+# over by sequence number, 0 for every spine; the out-of-order degree in
+# packets past which the destination signals a stashed head's path, 0 for
+# none; how long in ns the head must have been stashed before it signals, 0
+# for no wait; the redirected packets a signal avoids its path for, 0 for
+# none; whether a repair goes up another path; and whether a signal avoids
+# its path for the host's every connection to the destination's leaf, not its
+# queue pair's alone. The backend's defaults are Themis's.
+THEMIS_PARAMETERS: tuple[BalancingParameter, ...] = (
+    BalancingParameter("themis_paths", "SPRAY_THEMIS_PATHS", 0, _nonnegative_int),
+    BalancingParameter(
+        "themis_ooo_threshold", "SPRAY_THEMIS_OOO_THRESHOLD", 448, _nonnegative_int
+    ),
+    BalancingParameter(
+        "themis_stash_min_ns", "SPRAY_THEMIS_STASH_MIN_NS", 0, _nonnegative_int
+    ),
+    BalancingParameter(
+        "themis_avoidance_window", "SPRAY_THEMIS_AVOIDANCE_WINDOW", 2000000, _nonnegative_int
+    ),
+    BalancingParameter(
+        "themis_retx_reroute", "SPRAY_THEMIS_RETX_REROUTE", True, _flag, _on_off
+    ),
+    BalancingParameter(
+        "themis_leaf_avoidance", "SPRAY_THEMIS_LEAF_AVOIDANCE", False, _flag, _on_off
+    ),
+)
+# The selectors over named spines without a loss hold, each with its own
+# parameters, defaults filled in: reps_spine REPS's, themis THEMIS_PARAMETERS,
+# and mrc_spine and ue_aware_spine MRC's and UEC path-aware spraying's but the
+# entropy space's size, which is the spine count.
+NAMED_SPINE_PARAMETERS: dict[str, tuple[BalancingParameter, ...]] = {
+    "reps_spine": REPS_SPINE_PARAMETERS,
+    "themis": THEMIS_PARAMETERS,
+    **{
+        f"{selector}_spine": tuple(
+            parameter
+            for parameter in SELECTOR_PARAMETERS[selector]
+            if parameter.name != "ev_set_size"
+        )
+        for selector in ("mrc", "ue_aware")
+    },
+}
+# themis_hold, themis leaving out the spines the loss hold holds: Themis's
+# parameters, then mrc_hold's but MRC's own.
+LOSS_HOLD_PARAMETERS["themis_hold"] = (
+    *THEMIS_PARAMETERS,
+    *(
+        parameter
+        for parameter in LOSS_HOLD_PARAMETERS["mrc_hold"]
+        if parameter not in SELECTOR_PARAMETERS["mrc"]
+    ),
+)
 
 
 def _parameters_of(mode: str, selector: str) -> tuple[BalancingParameter, ...]:
@@ -1330,11 +1840,13 @@ def _parameters_of(mode: str, selector: str) -> tuple[BalancingParameter, ...]:
     if selector in LOSS_HOLD_SELECTORS:
         return LOSS_HOLD_PARAMETERS[selector]
     if selector == "reps_oracle":
-        return REPS_ORACLE_PARAMETERS + SPRAY_UNIFORM_KEYS
-    if selector == "reps_spine":
-        return REPS_SPINE_PARAMETERS + SPRAY_UNIFORM_KEYS
+        return (
+            REPS_ORACLE_PARAMETERS + SPRAY_UNIFORM_KEYS + (ORACLE_HOPS_KEY,) + OVERDUE_REPAIR_KEYS
+        )
+    if selector in NAMED_SPINE_PARAMETERS:
+        return NAMED_SPINE_PARAMETERS[selector] + SPRAY_UNIFORM_KEYS + OVERDUE_REPAIR_KEYS
     if mode == "spray_uniform":
-        return SPRAY_UNIFORM_KEYS
+        return SPRAY_UNIFORM_KEYS + OVERDUE_REPAIR_KEYS
     return ()
 
 
@@ -1361,8 +1873,8 @@ def _load_load_balancing(
         return _load_loss_hold_selector(balancing, recovery, trimming)
     if mode == "spray_uniform" and balancing.get("selector") == "reps_oracle":
         return _load_reps_oracle(balancing, recovery, trimming)
-    if mode == "spray_uniform" and balancing.get("selector") == "reps_spine":
-        return _load_reps_spine(balancing, recovery, trimming)
+    if mode == "spray_uniform" and balancing.get("selector") in NAMED_SPINE_PARAMETERS:
+        return _load_named_spine(balancing, recovery, trimming)
     if mode == "spray_uniform" and balancing.get("selector") in SPINE_SELECTORS:
         return _load_spine_selector(balancing, recovery, trimming)
     if mode == "spray_uniform" and "selector" not in balancing:
@@ -1440,48 +1952,179 @@ def _load_uniform_draw(
     trimming: PacketTrimming | None,
 ) -> LoadBalancing:
     """spray_uniform without a selector, the uniform draw, which reads only
-    the keys spray_uniform reads under every selector."""
-    unknown = set(balancing) - {"mode"} - {p.name for p in SPRAY_UNIFORM_KEYS}
+    the keys spray_uniform reads under every selector and
+    OVERDUE_REPAIR_KEYS."""
+    unknown = (
+        set(balancing) - {"mode"} - {p.name for p in SPRAY_UNIFORM_KEYS + OVERDUE_REPAIR_KEYS}
+    )
     if unknown:
         raise ValueError(
             "network.load_balancing.mode 'spray_uniform' without a selector "
-            "takes no other key than path_seq, tail_recovery and "
-            "tail_recovery_delay_ns; a selector "
+            "takes no other key than path_seq, tail_recovery, "
+            "tail_recovery_delay_ns, tail_loss_rtts, ack_loss_rtts, "
+            "path_state, ack_route, ack_route_oracle, ack_route_set_size, "
+            "ack_route_set_probe_rtts, ack_route_set_reply, "
+            "stray_path_seq, coverage_first, duplicate_report, overdue_repair "
+            "and overdue_repair_limit; a selector "
             "and its parameters require mode 'ev_hash', or mode 'spray_uniform' "
             f"for a selector in {list(SPINE_SELECTORS)}"
         )
     _require_reorder_tolerance("spray_uniform", recovery, trimming)
     return LoadBalancing(
-        mode="spray_uniform", parameters=_spray_uniform_keys(balancing)
+        mode="spray_uniform",
+        parameters=_spray_uniform_keys(balancing) + _spray_overdue_keys(balancing),
     )
+
+
+def _spray_overdue_keys(
+    balancing: dict[str, Any],
+) -> tuple[tuple[str, ParameterValue], ...]:
+    """overdue_repair and overdue_repair_limit as given, each only when set,
+    under a selector without a loss hold (OVERDUE_REPAIR_KEYS): overdue_repair
+    "reprobe" or false alone, and the limit under "reprobe", as the backend
+    reads them."""
+    parsed = _parsed(
+        balancing,
+        tuple(parameter for parameter in OVERDUE_REPAIR_KEYS if parameter.name in balancing),
+    )
+    values = dict(parsed)
+    if values.get("overdue_repair") not in (None, False, "reprobe"):
+        raise ValueError(
+            "network.load_balancing.overdue_repair must be 'reprobe' or false "
+            "without a loss hold selector"
+        )
+    if "overdue_repair_limit" in balancing and values.get("overdue_repair") != "reprobe":
+        raise ValueError(
+            "network.load_balancing.overdue_repair_limit requires overdue_repair 'reprobe'"
+        )
+    return parsed
 
 
 def _spray_uniform_keys(
     balancing: dict[str, Any],
 ) -> tuple[tuple[str, ParameterValue], ...]:
-    """path_seq, tail_recovery and tail_recovery_delay_ns as given, each only
-    when set, refused where the backend refuses them."""
+    """path_seq, tail_recovery, tail_recovery_delay_ns, tail_loss_rtts,
+    ack_loss_rtts, path_state, ack_route, ack_route_oracle, ack_route_set_size,
+    ack_route_set_probe_rtts, ack_route_set_reply, stray_path_seq,
+    coverage_first, duplicate_report, rack_reorder_ns and rack_defer_loss as
+    given, each only when set, refused where the backend refuses them."""
     parsed = _parsed(
         balancing,
         tuple(parameter for parameter in SPRAY_UNIFORM_KEYS if parameter.name in balancing),
     )
     _require_tail_recovery(balancing, dict(parsed))
+    _require_ack_route(balancing, dict(parsed))
+    _require_duplicate_report(balancing, dict(parsed))
+    _require_rack_defer_loss(balancing, dict(parsed))
+    _require_stray_path_seq(balancing, dict(parsed))
     return parsed
 
 
 def _require_tail_recovery(
     balancing: dict[str, Any], values: dict[str, ParameterValue]
 ) -> None:
-    """tail_recovery requires path_seq true, and tail_recovery_delay_ns is read
-    only with tail_recovery true, as the backend reads them."""
+    """tail_recovery requires path_seq true, and tail_recovery_delay_ns and
+    tail_loss_rtts are read only with tail_recovery true, as the backend reads
+    them."""
     tail_recovery = values.get("tail_recovery") is True
     if tail_recovery and values.get("path_seq") is not True:
         raise ValueError("network.load_balancing.tail_recovery requires path_seq true")
-    if "tail_recovery_delay_ns" in balancing and not tail_recovery:
+    for name in ("tail_recovery_delay_ns", "tail_loss_rtts"):
+        if name in balancing and not tail_recovery:
+            raise ValueError(
+                f"network.load_balancing.{name} requires tail_recovery true"
+            )
+
+
+def _require_ack_route(
+    balancing: dict[str, Any], values: dict[str, ParameterValue]
+) -> None:
+    """ack_route_oracle is read only under ack_route spray and
+    ack_route_set_size, ack_route_set_probe_rtts and ack_route_set_reply only
+    under reverse_set, and repath tells a copied send
+    by the tail flags tail_recovery puts on the wire, as the backend reads
+    them."""
+    if "ack_route_oracle" in balancing and values.get("ack_route") != "spray":
         raise ValueError(
-            "network.load_balancing.tail_recovery_delay_ns requires "
-            "tail_recovery true"
+            "network.load_balancing.ack_route_oracle requires ack_route 'spray'"
         )
+    for name in ("ack_route_set_size", "ack_route_set_probe_rtts", "ack_route_set_reply"):
+        if name in balancing and values.get("ack_route") != "reverse_set":
+            raise ValueError(
+                f"network.load_balancing.{name} requires ack_route 'reverse_set'"
+            )
+    if values.get("ack_route") == "repath" and values.get("tail_recovery") is not True:
+        raise ValueError(
+            "network.load_balancing.ack_route 'repath' requires tail_recovery true"
+        )
+
+
+def _require_stray_path_seq(
+    balancing: dict[str, Any], values: dict[str, ParameterValue]
+) -> None:
+    """stray_path_seq is read only with path_seq true, as the backend reads
+    it."""
+    if "stray_path_seq" in balancing and values.get("path_seq") is not True:
+        raise ValueError(
+            "network.load_balancing.stray_path_seq requires path_seq true"
+        )
+
+
+def _require_duplicate_report(
+    balancing: dict[str, Any], values: dict[str, ParameterValue]
+) -> None:
+    """duplicate_report is read only with coverage_first true, and its
+    "retract" takes a loss back from the host's auto loss hold alone, as the
+    backend does."""
+    if "duplicate_report" in balancing and values.get("coverage_first") is not True:
+        raise ValueError(
+            "network.load_balancing.duplicate_report requires coverage_first true"
+        )
+    if values.get("duplicate_report") == "retract" and (
+        balancing.get("selector") not in HOLD_SCOPE_SELECTORS
+        or balancing.get("hold_scope", "auto") != "auto"
+        or balancing.get("hold_rule", "count") != "count"
+    ):
+        raise ValueError(
+            "network.load_balancing.duplicate_report 'retract' requires selector "
+            "'reps_hold', 'mrc_hold' or 'themis_hold' with hold_scope 'auto' and "
+            "hold_rule 'count'"
+        )
+
+
+def _require_rack_defer_loss(
+    balancing: dict[str, Any], values: dict[str, ParameterValue]
+) -> None:
+    """rack_defer_loss is read only with rack_reorder_ns set and tail_loss_rtts
+    above zero, as the backend reads it."""
+    if "rack_defer_loss" in balancing and (
+        "rack_reorder_ns" not in balancing or values.get("tail_loss_rtts", 1.0) == 0
+    ):
+        raise ValueError(
+            "network.load_balancing.rack_defer_loss requires rack_reorder_ns and "
+            "tail_loss_rtts above zero"
+        )
+
+
+def _require_answer_path_seq(
+    balancing: dict[str, Any], values: dict[str, ParameterValue]
+) -> None:
+    """answer_path_seq needs ack_route spray and path_seq true, and its probe
+    interval and clean count are read only with it true, as the backend reads
+    them."""
+    on = values.get("answer_path_seq") is True
+    if "answer_path_seq" in balancing and (
+        values.get("ack_route") != "spray" or values.get("path_seq") is not True
+    ):
+        raise ValueError(
+            "network.load_balancing.answer_path_seq requires ack_route 'spray' "
+            "and path_seq true"
+        )
+    for name in ("answer_probe_interval_ns", "answer_hold_clean"):
+        if name in balancing and not on:
+            raise ValueError(
+                f"network.load_balancing.{name} requires answer_path_seq true"
+            )
 
 
 def _load_loss_hold_selector(
@@ -1489,7 +2132,7 @@ def _load_loss_hold_selector(
     recovery: TransportRecovery | None,
     trimming: PacketTrimming | None,
 ) -> LoadBalancing:
-    """spray_uniform with reps_hold, reps_flow_hold or mrc_hold, which
+    """spray_uniform with reps_hold, reps_flow_hold, mrc_hold or themis_hold, which
     require the loss hold's keys and held_exploration sentinel, and read the
     keys of its rule, its release, its exploration sends and the receiver's
     hold where the backend reads them."""
@@ -1509,6 +2152,10 @@ def _load_loss_hold_selector(
             )
         )
     )
+    # reps_flow_hold keeps each queue pair's receiver hold apart, so there
+    # is nothing to widen across leaves.
+    if selector == "reps_flow_hold":
+        parameters = tuple(p for p in parameters if p.name != "receiver_hold_widen")
     unknown = set(balancing) - {"mode", "selector"} - {p.name for p in parameters}
     if unknown:
         raise ValueError(
@@ -1560,13 +2207,58 @@ def _load_loss_hold_selector(
             "held_exploration 'sentinel'"
         )
     _require_hold_test(balancing, values, trickle)
+    if values.get("overdue_repair") in OVERDUE_REPAIRS and not (
+        values.get("held_loss_rtts", 2) > 0
+    ):
+        raise ValueError(
+            "network.load_balancing.overdue_repair requires held_loss_rtts above 0"
+        )
+    if "overdue_repair_limit" in balancing and values.get("overdue_repair") != "reprobe":
+        raise ValueError(
+            "network.load_balancing.overdue_repair_limit requires overdue_repair 'reprobe'"
+        )
     receiver_hold = values.get("receiver_hold") is True
     if receiver_hold and values.get("path_seq") is not True:
         raise ValueError("network.load_balancing.receiver_hold requires path_seq true")
     _require_tail_recovery(balancing, values)
+    _require_ack_route(balancing, values)
+    _require_stray_path_seq(balancing, values)
+    _require_answer_path_seq(balancing, values)
+    _require_duplicate_report(balancing, values)
+    _require_rack_defer_loss(balancing, values)
+    if "copy_expiry" in balancing and values.get("sentinel_mode", "data") != "duplicate":
+        raise ValueError(
+            "network.load_balancing.copy_expiry requires sentinel_mode 'duplicate'"
+        )
+    if values.get("copy_expiry") == "deadline" and not float(
+        values.get("tail_loss_rtts", 1.0)
+    ) > 0:
+        raise ValueError(
+            "network.load_balancing.copy_expiry 'deadline' requires tail_loss_rtts "
+            "above 0"
+        )
     if "receiver_hold_clean" in balancing and not receiver_hold:
         raise ValueError(
             "network.load_balancing.receiver_hold_clean requires receiver_hold true"
+        )
+    if "receiver_hold_auto_leaves" in balancing and not receiver_hold:
+        raise ValueError(
+            "network.load_balancing.receiver_hold_auto_leaves requires receiver_hold true"
+        )
+    if "receiver_hold_widen" in balancing and not receiver_hold:
+        raise ValueError(
+            "network.load_balancing.receiver_hold_widen requires receiver_hold true"
+        )
+    if "receiver_hold_slots" in balancing and not receiver_hold:
+        raise ValueError(
+            "network.load_balancing.receiver_hold_slots requires receiver_hold true"
+        )
+    if "receiver_tail_missing" in balancing and not (
+        receiver_hold and values.get("tail_recovery") is True
+    ):
+        raise ValueError(
+            "network.load_balancing.receiver_tail_missing requires receiver_hold "
+            "true and tail_recovery true"
         )
     # As the backend reads it: under auto, given or by default, or by the
     # receiver's hold.
@@ -1617,8 +2309,15 @@ def _load_reps_oracle(
     trimming: PacketTrimming | None,
 ) -> LoadBalancing:
     """spray_uniform with reps_oracle, which reads the switches' state and so
-    requires grade_cost_source switch_queue, as the backend does."""
-    names = {parameter.name for parameter in REPS_ORACLE_PARAMETERS + SPRAY_UNIFORM_KEYS}
+    requires grade_cost_source switch_queue, as the backend does, and
+    oracle_hops and OVERDUE_REPAIR_KEYS only when set."""
+    names = {
+        parameter.name
+        for parameter in REPS_ORACLE_PARAMETERS
+        + SPRAY_UNIFORM_KEYS
+        + (ORACLE_HOPS_KEY,)
+        + OVERDUE_REPAIR_KEYS
+    }
     unknown = set(balancing) - {"mode", "selector"} - names
     if unknown:
         raise ValueError(
@@ -1634,34 +2333,48 @@ def _load_reps_oracle(
             "grade_cost_source 'switch_queue'"
         )
     _require_reorder_tolerance("spray_uniform", recovery, trimming)
+    oracle_hops = _parsed(
+        balancing,
+        (ORACLE_HOPS_KEY,) if ORACLE_HOPS_KEY.name in balancing else (),
+    )
     return LoadBalancing(
         mode="spray_uniform",
         selector="reps_oracle",
-        parameters=parsed + _spray_uniform_keys(balancing),
+        parameters=parsed
+        + _spray_uniform_keys(balancing)
+        + oracle_hops
+        + _spray_overdue_keys(balancing),
     )
 
 
-def _load_reps_spine(
+def _load_named_spine(
     balancing: dict[str, Any],
     recovery: TransportRecovery | None,
     trimming: PacketTrimming | None,
 ) -> LoadBalancing:
-    """spray_uniform with reps_spine, which reads REPS's parameters and the
-    keys spray_uniform reads under every selector, and refuses the loss
-    hold's keys and every spray_policy key, as the backend does."""
-    names = {parameter.name for parameter in REPS_SPINE_PARAMETERS + SPRAY_UNIFORM_KEYS}
+    """spray_uniform with a selector of NAMED_SPINE_PARAMETERS, which reads
+    its parameters there, the keys spray_uniform reads under every selector
+    and OVERDUE_REPAIR_KEYS, and refuses every loss hold and spray_policy
+    key, as the backend does."""
+    selector = balancing["selector"]
+    parameters = NAMED_SPINE_PARAMETERS[selector]
+    names = {
+        parameter.name
+        for parameter in parameters + SPRAY_UNIFORM_KEYS + OVERDUE_REPAIR_KEYS
+    }
     unknown = set(balancing) - {"mode", "selector"} - names
     if unknown:
         raise ValueError(
-            "network.load_balancing.selector 'reps_spine' does not take "
+            f"network.load_balancing.selector '{selector}' does not take "
             f"{sorted(unknown)}"
         )
     _require_reorder_tolerance("spray_uniform", recovery, trimming)
     return LoadBalancing(
         mode="spray_uniform",
-        selector="reps_spine",
-        parameters=_parsed(balancing, REPS_SPINE_PARAMETERS)
-        + _spray_uniform_keys(balancing),
+        selector=selector,
+        parameters=_parsed(balancing, parameters)
+        + _spray_uniform_keys(balancing)
+        + _spray_overdue_keys(balancing),
     )
 
 
@@ -1698,14 +2411,11 @@ def _load_spray_policy(
             "network.load_balancing.held_exploration 'none' requires "
             "grade_cost_source 'switch_queue'"
         )
-    if (
-        "held_sentinel_interval_ns" in balancing
-        and balancing.get("held_exploration") != "sentinel"
-    ):
-        raise ValueError(
-            "network.load_balancing.held_sentinel_interval_ns requires "
-            "held_exploration 'sentinel'"
-        )
+    for key in ("held_sentinel_interval_ns", "held_sentinel_spread"):
+        if key in balancing and balancing.get("held_exploration") != "sentinel":
+            raise ValueError(
+                f"network.load_balancing.{key} requires held_exploration 'sentinel'"
+            )
     for key in ("pool_decay_interval_ns", "pool_hold_propagates"):
         if key in balancing and not (
             _probability(
@@ -2082,7 +2792,15 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
     }
     topology_keys = {"hosts_per_leaf", "spine_count"} if topology == "clos" else set()
     optional_topology_keys = (
-        {"failed_spine_count", "load_balancing", "link_failures"}
+        {
+            "failed_spine_count",
+            "load_balancing",
+            "link_failures",
+            "spine_link_rate",
+            "pair_bandwidth",
+            "port_counter_interval_ns",
+            "sparse_hold_trace",
+        }
         if topology == "clos"
         else set()
     )
@@ -2159,7 +2877,34 @@ def load_network(document: Any, host_count: int) -> PhysicalNetwork:
                 document, transport_recovery, packet_trimming
             ),
         )
-        _require_reported_spines(network)
+    if (
+        isinstance(network, ClosNetwork)
+        and network.pair_bandwidth == "spines"
+        and network.load_balancing.mode not in SPINE_NAMING_MODES
+    ):
+        raise ValueError(
+            "network.pair_bandwidth 'spines' requires a load_balancing mode "
+            f"that names spines: {sorted(SPINE_NAMING_MODES)}"
+        )
+    if (
+        isinstance(network, ClosNetwork)
+        and network.port_counter_interval_ns is not None
+        and network.load_balancing.mode == "ecmp"
+    ):
+        raise ValueError(
+            "network.port_counter_interval_ns requires a load_balancing mode "
+            "that writes the port counters, any but ecmp"
+        )
+    if (
+        isinstance(network, ClosNetwork)
+        and network.sparse_hold_trace
+        and not network.load_balancing.traces_spine_loss()
+        and not network.load_balancing.traces_receiver_hold()
+    ):
+        raise ValueError(
+            "network.sparse_hold_trace requires a load_balancing that writes "
+            "ns3/spine_losses.csv or ns3/receiver_holds.csv"
+        )
     _require_acknowledged_packets(network)
     return network
 
@@ -2203,8 +2948,8 @@ def _load_geometry(
         raise ValueError(
             "parallelism product must be divisible by network.hosts_per_leaf"
         )
-    if spine_count > 255:
-        raise ValueError("network.spine_count must not exceed 255")
+    if spine_count > MAX_SPINE_COUNT:
+        raise ValueError(f"network.spine_count must not exceed {MAX_SPINE_COUNT}")
     failed_value = document.get("failed_spine_count", 0)
     if isinstance(failed_value, bool) or not isinstance(failed_value, int):
         raise ValueError("network.failed_spine_count must be an integer")
@@ -2224,6 +2969,19 @@ def _load_geometry(
         failed_spine_count=failed_value,
         host_link_delay_ns=host_link_delay_ns,
         switch_link_delay_ns=switch_link_delay_ns,
+        spine_link_rate=_spine_link_rate(document),
+        pair_bandwidth=_pair_bandwidth(document),
+        port_counter_interval_ns=(
+            _positive_int(
+                document["port_counter_interval_ns"],
+                "network.port_counter_interval_ns",
+            )
+            if "port_counter_interval_ns" in document
+            else None
+        ),
+        sparse_hold_trace=_flag(
+            document.get("sparse_hold_trace", False), "network.sparse_hold_trace"
+        ),
     )
     index = clos.clos_index(host_count)
     return replace(
@@ -2231,6 +2989,40 @@ def _load_geometry(
         link_overrides=_load_link_overrides(document, clos, host_count, index),
         link_failures=load_link_failures(document, index),
     )
+
+
+def _pair_bandwidth(document: dict[str, Any]) -> str | None:
+    """network.pair_bandwidth as given, None when the profile leaves it out."""
+    if "pair_bandwidth" not in document:
+        return None
+    value = document["pair_bandwidth"]
+    if value not in PAIR_BANDWIDTHS:
+        raise ValueError(
+            f"network.pair_bandwidth must be one of {list(PAIR_BANDWIDTHS)}"
+        )
+    return value
+
+
+def _spine_link_rate(document: dict[str, Any]) -> str | None:
+    """network.spine_link_rate, the leaf-spine links' rate, None when the
+    profile leaves it out: a rate the switch ECN maps cover."""
+    if "spine_link_rate" not in document:
+        return None
+    value = document["spine_link_rate"]
+    if not isinstance(value, str) or not value.endswith("Gbps"):
+        raise ValueError("network.spine_link_rate must be a rate such as 100Gbps")
+    try:
+        bps = link_rate_bits_per_second(value)
+    except ValueError as error:
+        raise ValueError(
+            "network.spine_link_rate must be a rate such as 100Gbps"
+        ) from error
+    if bps not in ECN_RATES_BPS:
+        raise ValueError(
+            "network.spine_link_rate must be a link speed the switch ECN table "
+            f"covers: {sorted(ECN_RATES_BPS)} bps"
+        )
+    return value
 
 
 def _load_link_overrides(
@@ -2245,7 +3037,7 @@ def _load_link_overrides(
         document,
         ((link.source, link.destination) for link in links),
         index,
-        (rate for rate, _, _ in ECN_THRESHOLDS_KB),
+        ECN_RATES_BPS,
     )
 
 
@@ -2290,60 +3082,6 @@ def _require_acknowledged_packets(network: PhysicalNetwork) -> None:
         )
 
 
-def _require_reported_spines(network: ClosNetwork) -> None:
-    """Refuse a spray_policy report over more spines than it can grade, and an
-    ack_redirect field over more spines than it can name."""
-    if (
-        network.load_balancing.mode == "spray_policy"
-        and network.live_spine_count > MAX_REPORTED_SPINES
-    ):
-        raise ValueError(
-            "network.load_balancing.mode 'spray_policy' grades at most "
-            f"{MAX_REPORTED_SPINES} spines"
-        )
-    if (
-        network.load_balancing.selector == "ack_redirect"
-        and dict(network.load_balancing.parameters).get("scope") == "per_receiver"
-        and network.live_spine_count > MAX_REPORTED_SPINES
-    ):
-        raise ValueError(
-            "network.load_balancing.selector 'ack_redirect' with scope "
-            f"'per_receiver' grades at most {MAX_REPORTED_SPINES} spines"
-        )
-    if (
-        network.load_balancing.selector in LOSS_HOLD_SELECTORS
-        and network.live_spine_count > MAX_REPORTED_SPINES
-    ):
-        raise ValueError(
-            f"network.load_balancing.selector '{network.load_balancing.selector}' "
-            f"holds at most {MAX_REPORTED_SPINES} spines"
-        )
-    if (
-        network.load_balancing.traces_receiver_hold()
-        and network.live_spine_count > MAX_RECEIVER_HOLD_SPINES
-    ):
-        raise ValueError(
-            "network.load_balancing.receiver_hold holds at most "
-            f"{MAX_RECEIVER_HOLD_SPINES} spines"
-        )
-    if (
-        network.load_balancing.recovers_tail()
-        and network.live_spine_count > MAX_TAIL_RECOVERY_SPINES
-    ):
-        raise ValueError(
-            "network.load_balancing.tail_recovery counts at most "
-            f"{MAX_TAIL_RECOVERY_SPINES} spines"
-        )
-    if (
-        network.load_balancing.selector == "ack_redirect"
-        and network.live_spine_count >= MAX_REDIRECT_SPINES
-    ):
-        raise ValueError(
-            "network.load_balancing.selector 'ack_redirect' names at most "
-            f"{MAX_REDIRECT_SPINES - 1} spines"
-        )
-
-
 def build_topology(network: PhysicalNetwork, host_count: int) -> TopologyLayout:
     """Build a validated physical layout for the requested network variant."""
     if isinstance(network, ClosNetwork):
@@ -2384,7 +3122,7 @@ def _build_clos_topology(network: ClosNetwork, host_count: int) -> TopologyLayou
             source=leaf,
             destination=spine,
             delay_ns=network.switch_link_delay_ns,
-            rate=network.link_rate,
+            rate=network.spine_link_rate or network.link_rate,
         )
         for leaf in range(leaf_start, spine_start)
         for spine in range(spine_start, node_count)
@@ -2409,6 +3147,22 @@ def _build_clos_topology(network: ClosNetwork, host_count: int) -> TopologyLayou
             ("hosts_per_leaf", network.hosts_per_leaf),
             ("host_link_delay_ns", network.host_link_delay_ns),
             ("switch_link_delay_ns", network.switch_link_delay_ns),
+            *(
+                ()
+                if network.spine_link_rate is None
+                else (("spine_link_rate", network.spine_link_rate),)
+            ),
+            *(
+                ()
+                if network.pair_bandwidth is None
+                else (("pair_bandwidth", network.pair_bandwidth),)
+            ),
+            *(
+                ()
+                if network.port_counter_interval_ns is None
+                else (("port_counter_interval_ns", network.port_counter_interval_ns),)
+            ),
+            *((("sparse_hold_trace", True),) if network.sparse_hold_trace else ()),
         ),
     )
 
